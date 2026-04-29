@@ -1,12 +1,4 @@
 # aisbench_auto_tools_prefix
-上一世：[aisbench性能测试小工具--支持传参](https://wiki.huawei.com/domains/81873/wiki/137614/WIKI202506127115339)
-
-# 工具获取
-
-codehub路径（**建议**）【2026.4.28更新】：[aisbench_auto_tools_prefix-master](https://codehub-y.huawei.com/z00912940/aisbench_auto_tools_prefix-master/files?ref=master)
-
-压缩包【2026.4.28更新】：[aisbench_auto_tools_prefix-master.rar](/vision-file-storage/api/file/download/attachment-v2/WIKI202511048896614/42905046/20260428T112051Z_cb0624e501144c39ab4c463cfbb70e26.rar?attachment_id=42905046)
-
 # 适用场景
 
 1、模型性能测试
