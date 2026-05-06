@@ -11,7 +11,7 @@ def get_prefix_queries_total(ip_address, port):
     try:
         # 构建并执行命令
         url = f"http://{ip_address}:{port}/metrics"
-        command = f"sleep 3s && curl -s {url} | grep 'prefix_cache_queries_total' | grep 'model_name'"
+        command = f"unset http_proxy && unset https_proxy && sleep 3s && curl -s {url} | grep 'prefix_cache_queries_total' | grep 'model_name'"
         # os.system(command)
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
         
@@ -62,7 +62,7 @@ def get_prefix_hits_total(ip_address, port):
     try:
         # 构建并执行命令
         url = f"http://{ip_address}:{port}/metrics"
-        command = f"sleep 3s && curl -s {url} | grep 'prefix_cache_hits_total' | grep 'model_name'"
+        command = f"unset http_proxy && unset https_proxy && sleep 3s && curl -s {url} | grep 'prefix_cache_hits_total' | grep 'model_name'"
         # os.system(command)
         
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
