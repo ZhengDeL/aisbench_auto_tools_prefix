@@ -181,3 +181,13 @@ python3 aisbench_test.py --dataset "/mnt/path_to_dataset/precision_dataset.jsonl
 解决方案：修改aisbench_test.py第76行，删除 `--num-warmups 0`
 
 ※ `--num-warmups`参数为aisbench最新版本功能，使用时需配置为0，详情参考[aisbench github](https://github.com/AISBench/benchmark)官网，文档路径：docs/source_zh_cn/base_tutorials/all_params/cli_args.md
+
+## 4、常用shell固定并发测试脚本
+
+```
+bs=(1 8 16 24 32 40 48 56)
+for i in ${bs[@]}
+do
+        python3 aisbench_test.py --input_len 8192 --output_len 1 --data_num $(($i * 4)) --concurrency $i --request_rate 0 --dataset_type prefix_cache --repeat_rate 0.5  --seed $i --prefix_num 1 --prefix_test
+done
+```
