@@ -13,7 +13,7 @@
 
 # 使用方法
 
-进入带[aisbench](https://github.com/AISBench/benchmark)工具的容器（mindie/vllm镜像均已打包aisbench） -> 修改config.py -> 运行python命令
+进入带[aisbench](https://github.com/AISBench/benchmark)的环境，下载本工具（mindie/vllm镜像均已打包aisbench） -> 修改本工具的config.py -> 运行python命令
 
 ## 一、修改config.py
 
