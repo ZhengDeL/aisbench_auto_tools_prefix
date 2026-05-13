@@ -14,3 +14,6 @@ HOST_PORT = "8004"
 
 # 如果使用稳态测试请将该字段设置为 "stable_stage"
 DEFAULT_PERFORMANCE_TEST = "default_perf"
+
+# aisbench输出日志保存路径
+OUTPUT_DIR = "./outputs/default"
