@@ -279,7 +279,7 @@ if __name__ == '__main__':
                 pod_info = [HOST_IP+":"+HOST_PORT]
             else:
                 pod_info = POD_INFO
-            print(pod_info)
+            logging.info("pod_info:",pod_info)
             
             logging.info(f"[开始] 前缀数据集测试")
             modify_aisbench_api(str(dp),"1")
