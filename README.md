@@ -1,4 +1,10 @@
 # aisbench_auto_tools_prefix
+
+# 最新更新（2026/5/14）
+1、支持自定义aisbench日志保存路径
+
+2、支持PD分离场景配置各节点ip:port，用于查询vllm metrics计算各dp域的prefix cache命中率
+
 # 适用场景
 
 1、模型性能测试
