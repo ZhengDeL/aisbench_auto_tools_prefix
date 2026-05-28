@@ -132,10 +132,21 @@ def generate_unique_tokens(tokenizer_path, seed, n, number):
 
     return all_lines
 
-def write_data(path,dataset):
+def write_data(path, dataset, num):
+    if num is not None:
+        if len(dataset) < num:
+            # 重复数据
+            repeats = num // len(dataset)
+            remainder = num % len(dataset)
+            dataset = dataset * repeats + dataset[:remainder]
+        else:
+            # 截取数据
+            dataset = dataset[:num]
+    
+    # 写入文件
     with open(path, "w", encoding="utf-8") as f:
-        for i in range(len(dataset)):
-            f.write(json.dumps({"question": dataset[i], "answer": "none"}, ensure_ascii=False))
+        for item in dataset:
+            f.write(json.dumps({"question": item, "answer": "none"}, ensure_ascii=False))
             f.write("\n")
 
 def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int, save_path, prefix_flag, dp, repeat_rate, seed, prefix_num):
@@ -145,7 +156,7 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
     if prefix_flag == 0:
         dataset = create_dataset(tokenizer_path, input_len, number, 0)
         dataset_path = os.path.join(save_path, f'GSM8K-in{input_len}-num{number}-{base_name}.jsonl')
-        write_data(dataset_path, dataset)
+        write_data(dataset_path, dataset, number)
         return "", dataset_path
 
     # 生成前缀数据集
@@ -164,10 +175,10 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
             prefix_dataset.append(prefix_data[i])
 
     prefix_path = os.path.join(save_path, f'prefix-GSM8K-in{prefix_len}-num{dp*prefix_num}-{base_name}.jsonl')
-    write_data(prefix_path, prefix_dataset)
+    write_data(prefix_path, prefix_dataset, dp*prefix_num)
     if repeat_rate >= 1:
-        dataset_path = os.path.join(save_path, f'GSM8K-in{prefix_len}-num{dp*prefix_num}-{base_name}-repeatRate{repeat_rate}.jsonl')
-        write_data(dataset_path, prefix_dataset)
+        dataset_path = os.path.join(save_path, f'GSM8K-in{prefix_len}-num{number}-{base_name}-repeatRate{repeat_rate}.jsonl')
+        write_data(dataset_path, prefix_dataset, number)
         return prefix_path, dataset_path
 
     # 前缀后插入3个随机token
@@ -185,7 +196,7 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
         data_len += 1
 
     dataset_path = os.path.join(save_path, f'GSM8K-in{input_len}-num{number}-{base_name}-repeatRate{repeat_rate}.jsonl')
-    write_data(dataset_path, dataset)
+    write_data(dataset_path, dataset, number)
 
     return prefix_path, dataset_path
 
