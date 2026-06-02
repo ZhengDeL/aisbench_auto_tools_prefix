@@ -1,9 +1,9 @@
 # aisbench_auto_tools_prefix
 
-# 最新更新（2026/5/18）
-1、支持自定义aisbench日志保存路径
+# 最新更新（2026/6/2）
+1、支持变长数据集
 
-2、支持PD分离场景配置各节点ip:port，用于查询vllm metrics计算各dp域的prefix cache命中率
+2、bug修复repeat_rate 1场景
 
 # 适用场景
 
@@ -72,12 +72,16 @@ POD_INFO = []
 | --enable_think | bool | DeepSeek V3.1模型开启think功能，默认值false |
 | --test_accuracy | bool | 测试精度，仅支持gsm8k数据集，默认值false |
 | --npu_num | int | npu卡数，用于计算单卡吞吐，默认值1 |
-|--dataset_type| str | normal or prefix_cache，一般数据集or带前缀数据集，默认值normal|
+| --dataset_type| str | normal or prefix_cache，一般数据集or带前缀数据集，默认值normal|
 | --prefix_num | int | 前缀个数，默认值1 |
 | --repeat_rate| str | 数据集前缀重复率，默认值0.5，支持格式：百分比如 "50%" 或小数如 "0.5" |
-|--prefix_test| bool | 是否在全量数据集测试前，先测试一遍前缀，默认值false|
-|--seed| int | 随机种子，仅适用生成带前缀数据集，不同seed生成的随机token不重复，默认值1 |
-|--dp| int | dp域数量，默认值1 ，保证模型推理时前缀会预热到每个dp域上|
+| --prefix_test| bool | 是否在全量数据集测试前，先测试一遍前缀，默认值false|
+| --seed| int | 随机种子，仅适用生成带前缀数据集，不同seed生成的随机token不重复，默认值1 |
+| --dp| int | dp域数量，默认值1 ，保证模型推理时前缀会预热到每个dp域上|
+| --length_mean | int|输入长度均值|
+| --length_std | int|输入长度标准差|
+| --length_min | int|输入长度最小值|
+| --length_max | int|输入长度最大值|
 
 ### ※ 数据集生成逻辑
 
@@ -154,13 +158,19 @@ python3 aisbench_test.py --input_len 2048 --output_len 2048 --data_num 160 --con
 python3 aisbench_test.py --input_len 2048 --output_len 2048 --data_num 160 --concurrency 40 --request_rate 10 --dataset_type prefix_cache --repeat_rate 73% --seed 200 --prefix_num 3
 ```
 
-5、测试指定数据集性能（仅限**gsm8k**格式）
+5、测试8k~128k**不定长**，平均32k，带前缀的gsm8k数据集性能，数据集前缀重复率90%，dp 2，**先预热前缀**
+
+```
+python3 aisbench_test.py --input_len 32768 --output_len 300 --data_num 32 --concurrency 8 --request_rate 0 --dataset_type prefix_cache --repeat_rate 90% --prefix_test --dp_size 2 --length_mean 32768 --length_std 49152 --length_min 8192 --length_max 131072
+```
+
+6、测试指定数据集性能（仅限**gsm8k**格式）
 
 ```
 python3 aisbench_test.py --dataset "/mnt/path_to_dataset/medium2.jsonl" --output_len 20 --concurrency 1024
 ```
 
-6、测试指定数据集精度（仅限**gsm8k**格式）
+7、测试指定数据集精度（仅限**gsm8k**格式）
 
 ```
 python3 aisbench_test.py --dataset "/mnt/path_to_dataset/precision_dataset.jsonl" --output_len 1024 --concurrency 64 --request_rate 4 --test_accuracy
