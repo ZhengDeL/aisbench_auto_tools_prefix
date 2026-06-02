@@ -145,10 +145,19 @@ def generate_unique_tokens(tokenizer_path, seed, n, number):
         pbar.close()
     return all_lines
 
-def write_data(path,dataset):
+def write_data(path, dataset, num):
+    if num is not None:
+        if len(dataset) < num:
+            # 重复数据
+            repeats = num // len(dataset)
+            remainder = num % len(dataset)
+            dataset = dataset * repeats + dataset[:remainder]
+        else:
+            # 截取数据
+            dataset = dataset[:num]
     with open(path, "w", encoding="utf-8") as f:
-        for i in range(len(dataset)):
-            f.write(json.dumps({"question": dataset[i], "answer": "none"}, ensure_ascii=False))
+        for item in dataset:
+            f.write(json.dumps({"question": item, "answer": "none"}, ensure_ascii=False))
             f.write("\n")
 
 def sample_target_length(rng, fixed_length, length_mean=None, length_std=None, length_min=None, length_max=None):
@@ -230,12 +239,12 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
                 pbar.close()
             length_tag = _build_length_tag(input_len, length_mean, length_std, length_min, length_max)
             dataset_path = os.path.join(save_path, f'GSM8K-{length_tag}-num{number}-{base_name}.jsonl')
-            write_data(dataset_path, dataset)
+            write_data(dataset_path, dataset, number)
             return "", dataset_path
         else:
             dataset = create_dataset(tokenizer_path, input_len, number, 0)
             dataset_path = os.path.join(save_path, f'GSM8K-in{input_len}-num{number}-{base_name}.jsonl')
-            write_data(dataset_path, dataset)
+            write_data(dataset_path, dataset, number)
             return "", dataset_path
 
     # ========== 前缀数据集 ==========
@@ -257,10 +266,10 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
             prefix_dataset.append(prefix_data[i])
 
     prefix_path = os.path.join(save_path, f'prefix-GSM8K-in{prefix_len}-num{dp*prefix_num}-{base_name}.jsonl')
-    write_data(prefix_path, prefix_dataset)
+    write_data(prefix_path, prefix_dataset, dp*prefix_num)
     if repeat_rate >= 1:
-        dataset_path = os.path.join(save_path, f'GSM8K-in{prefix_len}-num{dp*prefix_num}-{base_name}-repeatRate{repeat_rate}.jsonl')
-        write_data(dataset_path, prefix_dataset)
+        dataset_path = os.path.join(save_path, f'GSM8K-in{prefix_len}-num{number}-{base_name}-repeatRate{repeat_rate}.jsonl')
+        write_data(dataset_path, prefix_dataset, number)
         return prefix_path, dataset_path
 
     # 前缀后插入3个随机token
@@ -283,7 +292,7 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
         pbar.close()
 
     dataset_path = os.path.join(save_path, f'GSM8K-in{input_len}-num{number}-{base_name}-repeatRate{repeat_rate}.jsonl')
-    write_data(dataset_path, dataset)
+    write_data(dataset_path, dataset, number)
 
     return prefix_path, dataset_path
 
@@ -314,10 +323,10 @@ def _create_prefix_dataset_variable(tokenizer_path, input_len, number, save_path
         for j in range(dp):
             prefix_dataset.append(prefix_data[i])
     prefix_path = os.path.join(save_path, f'prefix-GSM8K-in{max_common_len}-num{dp*prefix_num}-{base_name}.jsonl')
-    write_data(prefix_path, prefix_dataset)
+    write_data(prefix_path, prefix_dataset, dp*prefix_num)
     if repeat_rate >= 1:
-        dataset_path = os.path.join(save_path, f'GSM8K-in{max_common_len}-num{dp*prefix_num}-{base_name}-repeatRate{repeat_rate}.jsonl')
-        write_data(dataset_path, prefix_dataset)
+        dataset_path = os.path.join(save_path, f'GSM8K-in{max_common_len}-num{number}-{base_name}-repeatRate{repeat_rate}.jsonl')
+        write_data(dataset_path, prefix_dataset, number)
         return prefix_path, dataset_path
 
     # 生成唯一 token 集合（每组3个不同token）
@@ -366,7 +375,7 @@ def _create_prefix_dataset_variable(tokenizer_path, input_len, number, save_path
 
     length_tag = _build_length_tag(input_len, length_mean, length_std, length_min, length_max)
     dataset_path = os.path.join(save_path, f'GSM8K-{length_tag}-num{number}-{base_name}-repeatRate{repeat_rate}.jsonl')
-    write_data(dataset_path, dataset)
+    write_data(dataset_path, dataset, number)
 
     logging.info(f"  max_common_len={max_common_len}, max_suffix_len={max_suffix_len}")
     logging.info(f"  avg_hit_ratio={sum(c / r for c, r in zip(common_lens, real_lens)) / len(real_lens):.2%}")
