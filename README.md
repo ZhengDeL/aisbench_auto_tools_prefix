@@ -230,7 +230,7 @@ hit rate = (第二次查询prefix_cache_hits - 第一次查询prefix_cache_hits)
 
 PD混部：配置主节点的IP和PORT。
 
-PD分离：单开prefix cache时，配置P节点的IP和对应DP域的PORT；开启池化时，配置每个节点的IP和对应DP域的PORT
+PD分离：配置P节点的IP和对应DP域的PORT
 
 2）按照以下步骤手动验证是否能正确获取vllm metrics信息
 
