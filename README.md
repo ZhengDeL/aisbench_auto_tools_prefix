@@ -28,7 +28,7 @@ pr合入联系张睿滢
 **注：脚本会自动生成数据集，需先创建存放生成数据集的文件夹，eg：mkdir /mnt/path_to_store_dataset**
 
 ```
-# 数据集文件夹路径，需可访问
+# 数据集文件夹路径，需可访问(请使用绝对路径)
 DATASET_PATH = "/home/dataset"
 
 # aisbench 工作路径, 为 git clone aisbench 后得到的 benchmark 目录的绝对路径
@@ -43,6 +43,9 @@ MODEL_PATH = "/home/weights/model_weights"
 HOST_IP = "192.168.1.10"
 # 请求目的端口
 HOST_PORT = "8004"
+
+# 鉴权信息
+API_KEY = ""
 
 # 如果使用稳态测试请将该字段设置为 "stable_stage"
 DEFAULT_PERFORMANCE_TEST = "default_perf"
