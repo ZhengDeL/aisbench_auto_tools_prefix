@@ -63,6 +63,8 @@ PEAK_DATA_MULTIPLIER="${PEAK_DATA_MULTIPLIER:-4}"     # 搜索步长
 PEAK_WAIT_SECONDS="${PEAK_WAIT_SECONDS:-10}"          # 每轮等待秒数
 PEAK_TTFT_LIMIT="${PEAK_TTFT_LIMIT:-5}"               # 默认 TTFT 阈值 (s)
 PEAK_TPOT_LIMIT="${PEAK_TPOT_LIMIT:-50}"              # 默认 TPOT 阈值 (ms)
+# 摸高硬顶开关: 0=允许通过初始上界后继续扩容, 1=以场景 peak_max_cc 为硬上限
+PEAK_HARD_CAP="${PEAK_HARD_CAP:-0}"
 
 # -------------------- 场景定义（直接修改这个 JSON） --------------------
 # 必填: name, input_len, output_len, concurrency(并发值数组), request_rate
@@ -119,6 +121,22 @@ SCENARIOS_JSON="${SCENARIOS_JSON_OVERRIDE:-$SCENARIOS_JSON}"
 ######################## 配置区（按需修改） ########################
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 fail() { log "ERROR: $*"; exit 1; }
+
+append_empty_result() {
+    python3 - "$RESULTS_CSV" "$CSV_HEADER" "$@" <<'PY'
+import csv
+import sys
+
+columns = next(csv.reader([sys.argv[2]]))
+metadata = ["scenario", "current_time", "input_len", "output_len", "max_cc", "cc", "rr", "repeat_rate", "status"]
+if len(columns) != 23 or len(columns) != len(set(columns)) or len(sys.argv[3:]) != len(metadata):
+    raise ValueError("invalid empty-result schema or argument count")
+row = dict.fromkeys(columns, "")
+row.update(zip(metadata, sys.argv[3:]))
+with open(sys.argv[1], "a", encoding="utf-8", newline="") as handle:
+    csv.DictWriter(handle, fieldnames=columns).writerow(row)
+PY
+}
 
 ######################## 0. 初始化结果保存目录 ########################
 RUN_TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
@@ -437,8 +455,7 @@ while IFS='|' read -r ARCHIVE_NAME CMD_PARAMS; do
     if [ $PERF_PIPE_RC -ne 0 ]; then
         FAILED_COUNT=$((FAILED_COUNT + 1))
         log "[$TEST_INDEX/$TOTAL_TESTS] 失败: $ARCHIVE_NAME (退出码: $PERF_PIPE_RC)"
-        FAIL_ROW="${ARCHIVE_NAME},,${SCENARIO_INPUT_LEN},${SCENARIO_OUTPUT_LEN},,,${SCENARIO_CONCURRENCY},${SCENARIO_REQUEST_RATE},,,,,,,,,,,,,,,${SCENARIO_REPEAT_RATE},failed"
-        echo "$FAIL_ROW" >> "$RESULTS_CSV"
+        append_empty_result "$ARCHIVE_NAME" "" "$SCENARIO_INPUT_LEN" "$SCENARIO_OUTPUT_LEN" "" "$SCENARIO_CONCURRENCY" "$SCENARIO_REQUEST_RATE" "$SCENARIO_REPEAT_RATE" "failed"
         continue
     fi
 
@@ -470,8 +487,7 @@ while IFS='|' read -r ARCHIVE_NAME CMD_PARAMS; do
         if [ -n "$RESULT_ROW" ]; then
             echo "${ARCHIVE_NAME},${RESULT_ROW},${SCENARIO_REPEAT_RATE},failed" >> "$RESULTS_CSV"
         else
-            FAIL_ROW="${ARCHIVE_NAME},,${SCENARIO_INPUT_LEN},${SCENARIO_OUTPUT_LEN},,,${SCENARIO_CONCURRENCY},${SCENARIO_REQUEST_RATE},,,,,,,,,,,,,,,${SCENARIO_REPEAT_RATE},failed"
-            echo "$FAIL_ROW" >> "$RESULTS_CSV"
+            append_empty_result "$ARCHIVE_NAME" "" "$SCENARIO_INPUT_LEN" "$SCENARIO_OUTPUT_LEN" "" "$SCENARIO_CONCURRENCY" "$SCENARIO_REQUEST_RATE" "$SCENARIO_REPEAT_RATE" "failed"
         fi
         continue
     fi
@@ -483,8 +499,7 @@ while IFS='|' read -r ARCHIVE_NAME CMD_PARAMS; do
         echo "${ARCHIVE_NAME},${RESULT_ROW},${SCENARIO_REPEAT_RATE},passed" >> "$RESULTS_CSV"
     else
         log "警告: 无法提取 $ARCHIVE_NAME 的结果行"
-        FAIL_ROW="${ARCHIVE_NAME},,${SCENARIO_INPUT_LEN},${SCENARIO_OUTPUT_LEN},,,${SCENARIO_CONCURRENCY},${SCENARIO_REQUEST_RATE},,,,,,,,,,,,,,,${SCENARIO_REPEAT_RATE},no_result"
-        echo "$FAIL_ROW" >> "$RESULTS_CSV"
+        append_empty_result "$ARCHIVE_NAME" "" "$SCENARIO_INPUT_LEN" "$SCENARIO_OUTPUT_LEN" "" "$SCENARIO_CONCURRENCY" "$SCENARIO_REQUEST_RATE" "$SCENARIO_REPEAT_RATE" "no_result"
     fi
 
 done <<< "$COMBOS"
@@ -526,6 +541,14 @@ while IFS='|' read -r ARCHIVE_NAME PEAK_INPUT_LEN PEAK_OUTPUT_LEN PEAK_MIN_CC PE
         --live-results-csv '$CONTAINER_OUTPUT_DIR/scenario_results/$RUN_TIMESTAMP/all_results.csv' \
         --repeat-rate '$PEAK_REPEAT_RATE'"
     [ -n "$PEAK_FORWARD" ] && PEAK_CMD+=" $PEAK_FORWARD"
+    if [ "$PEAK_HARD_CAP" = "1" ]; then
+        # cases-json 会绕过单场景的并发参数；硬顶模式拒绝该额外覆盖。
+        case " $PEAK_FORWARD " in
+            *" --cases"*) fail "PEAK_HARD_CAP=1 does not accept cases-json overrides" ;;
+        esac
+        # 放在透传参数之后，同时锁住初始上界和向上扩容，避免同名参数覆盖。
+        PEAK_CMD+=" --max-concurrency $PEAK_MAX_CC --auto-expand-max-concurrency $PEAK_MAX_CC"
+    fi
 
     CONTAINER_LOG_TMP=$(mktemp /tmp/container_output_XXXXXX.log)
     docker exec "$CONTAINER_NAME" bash -lc "
@@ -554,17 +577,16 @@ while IFS='|' read -r ARCHIVE_NAME PEAK_INPUT_LEN PEAK_OUTPUT_LEN PEAK_MIN_CC PE
     if [ $PEAK_RC -ne 0 ]; then
         FAILED_COUNT=$((FAILED_COUNT + 1))
         log "摸高失败: $ARCHIVE_NAME (退出码: $PEAK_RC)"
-        echo "${ARCHIVE_NAME},,${PEAK_INPUT_LEN},${PEAK_OUTPUT_LEN},,,,${PEAK_REQUEST_RATE},,,,,,,,,,,,,,,${PEAK_REPEAT_RATE},failed" >> "$RESULTS_CSV"
+        append_empty_result "$ARCHIVE_NAME" "" "$PEAK_INPUT_LEN" "$PEAK_OUTPUT_LEN" "" "" "$PEAK_REQUEST_RATE" "$PEAK_REPEAT_RATE" "failed"
         continue
     fi
 
     PASSED_COUNT=$((PASSED_COUNT + 1))
 
-    # 解析摸高结果：从 peak_search_report.json 提取 best 行    # CSV_HEADER 22列: scenario(1),current_time(2),input_len(3),output_len(4),total_req(5),max_cc(6),
-    #   cc(7),rr(8),TTFT avg(9),TTFT P90(10),TPOT avg(11),TPOT SLO_P90(12),E2E_time(13),
-    #   output_tp(14),single_output_tp(15),E2E_tp(16),single_E2E_tp(17),qps(18),qpm(19),input_tp(20),prefill_tp(21),status(22)
+    # 从 best 行分别提取搜索配置并发和20个源指标；配置并发只用于提示，不加入23列汇总。
     PEAK_METRICS=""
     PEAK_TOTAL_REQ=""
+    PEAK_CONFIG_CC=""
     PEAK_REPORT_PATH=""
     if echo "$CONTAINER_OUTPUT" | grep -q '===PEAK_REPORT_PATH==='; then
         PEAK_REPORT_PATH=$(echo "$CONTAINER_OUTPUT" | awk 'BEGIN{c=0} /===PEAK_REPORT_PATH===/{c=1; next} c==1{print; exit}' | tr -d '\r')
@@ -606,6 +628,7 @@ if best:
         + str(row.get("output_len", "")) + "|"
         + str(row.get("total_req", "")) + "|"
         + str(row.get("max_cc", "")) + "|"
+        + str(row.get("concurrency", "")) + "|"
         + ",".join(str(v) for v in vals)
     )
 PY
@@ -620,6 +643,8 @@ PY
             PEAK_TOTAL_REQ="${PEAK_RAW%%|*}"
             PEAK_RAW="${PEAK_RAW#*|}"
             PEAK_MAX_CC="${PEAK_RAW%%|*}"
+            PEAK_RAW="${PEAK_RAW#*|}"
+            PEAK_CONFIG_CC="${PEAK_RAW%%|*}"
             PEAK_METRICS="${PEAK_RAW#*|}"
         fi
         rm -f "$PEAK_METRICS_FILE"
@@ -628,13 +653,13 @@ PY
 
     if [ -n "$PEAK_METRICS" ]; then
         # PEAK_METRICS: cc,rr,ttft_avg,ttft_p90,tpot_avg,tpot_p90,e2e_time,out_tp,single_out_tp,e2e_tp,single_e2e_tp,qps,qpm,input_tp,prefill_tp (15列)
-        # 拼接: scenario(1),current_time(2=空),input(3),output(4),total_req(5=空),max_cc(6=空),[15列](7~21),status(22)
+        # 拼接23列：scenario、5个源元数据、15个源指标、repeat_rate、status。
         echo "${ARCHIVE_NAME},${PEAK_CURRENT_TIME},${PEAK_INPUT_LEN},${PEAK_OUTPUT_LEN},${PEAK_TOTAL_REQ},${PEAK_MAX_CC},${PEAK_METRICS},${PEAK_REPEAT_RATE},peak" >> "$RESULTS_CSV"
         PEAK_CC=$(echo "$PEAK_METRICS" | cut -d',' -f1)
-        log "摸高完成: $ARCHIVE_NAME → 最优并发=$PEAK_CC"
+        log "摸高完成: $ARCHIVE_NAME → 最优并发=${PEAK_CONFIG_CC:-未知}（实测cc=$PEAK_CC）"
     else
         log "警告: 无法解析摸高结果 $ARCHIVE_NAME"
-        echo "${ARCHIVE_NAME},${PEAK_CURRENT_TIME},${PEAK_INPUT_LEN},${PEAK_OUTPUT_LEN},,${PEAK_MAX_CC},,,,,,,,,,,,,,,,,,,${PEAK_REPEAT_RATE},no_result" >> "$RESULTS_CSV"
+        append_empty_result "$ARCHIVE_NAME" "$PEAK_CURRENT_TIME" "$PEAK_INPUT_LEN" "$PEAK_OUTPUT_LEN" "$PEAK_MAX_CC" "" "$PEAK_REQUEST_RATE" "$PEAK_REPEAT_RATE" "no_result"
     fi
 
 done <<< "$PEAK_COMBOS"

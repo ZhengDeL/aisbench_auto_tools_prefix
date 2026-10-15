@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -240,6 +241,7 @@ def check_run_script() -> None:
         "PEAK_WAIT_SECONDS",
         "PEAK_TTFT_LIMIT",
         "PEAK_TPOT_LIMIT",
+        "PEAK_HARD_CAP",
     ]
     for var in variables:
         defined = re.search(rf"^{re.escape(var)}=", text, flags=re.M) is not None
@@ -695,14 +697,28 @@ def simulate_fixed_result_extraction() -> None:
             add_check(f"{name}: live peak round matches all fixed fields", live_header == integrity.CSV_COLUMNS and live_row == expected_live, f"summary_columns={len(live_row)}")
             if peak_source is not None:
                 report = root / f"{name}_peak.json"
-                report.write_text(json.dumps({"best": [matrix_row]}), encoding="utf-8")
+                report.write_text(json.dumps({"best": [{**matrix_row, "concurrency": 99}]}), encoding="utf-8")
                 peak = subprocess.run(
                     [sys.executable, "-c", peak_source.group(1), "0.5", str(report)],
                     text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
-                parts = peak.stdout.strip().split("|", 5)
-                peak_values = [*parts[:5], *next(csv.reader(parts[5:]))] if len(parts) == 6 else []
+                parts = peak.stdout.strip().split("|", 6)
+                peak_values = [*parts[:5], *next(csv.reader(parts[6:]))] if len(parts) == 7 else []
                 add_check(f"{name}: actual peak summary matches all fixed fields", peak.returncode == 0 and peak_values == projected, f"projected_columns={len(peak_values)}")
+
+        for prefill, expected_prefill in (("9999", ""), ("9999.0", ""), ("6034.4525", "6034.4525")):
+            path = root / "prefill_optional.csv"
+            write_source(path, new_columns, {**source, "prefill_token_throughput": prefill})
+            cli = run_adapter(path)
+            cli_rows = list(csv.reader(io.StringIO(cli.stdout)))
+            fixed_value = cli_rows[0][columns.index("prefill_token_throughput")] if len(cli_rows) == 1 else None
+            matrix_value = matrix.read_last_csv_row(path).get("prefill_token_throughput")
+            archived_value = integrity.read_last_source_result(path).get("prefill_token_throughput")
+            add_check(
+                f"optional prefill source={prefill} shared across fixed/peak/integrity",
+                cli.returncode == 0 and fixed_value == matrix_value == archived_value == expected_prefill,
+                "unavailable global throughput stays empty; real throughput stays unchanged",
+            )
 
         for name, headers in (
             ("missing_metric", [column for column in new_columns if column != "TTFT avg"]),
@@ -793,6 +809,216 @@ def simulate_perf_matrix_command() -> None:
     add_check("sim perf matrix sets concurrency/data_num", "--concurrency 3" in command_text and "--data_num 12" in command_text, command_text)
 
 
+def simulate_peak_concurrency_display() -> None:
+    """Keep the selected search tier separate from measured Concurrency/Max."""
+    bash = shutil.which("bash")
+    if not bash:
+        add_check("actual Bash peak concurrency display", False, "Bash is unavailable; report decoding was not executed", warn=True)
+        return
+    text = read_text(RUN_SCRIPT)
+    parser = re.search(r"^[^\n]*docker exec -i[^\n]*\"\$PEAK_REQUEST_RATE\"[^\n]*<<'PY'[^\n]*\n(.*?)^PY[ \t]*$", text, flags=re.M | re.S)
+    decode = re.search(r'^(        if \[\[ "\$PEAK_RAW" == .*?^        fi[ \t]*$)', text, flags=re.M | re.S)
+    summary = re.search(r'^(    if \[ -n "\$PEAK_METRICS" \]; then\n.*?^    fi[ \t]*$)', text, flags=re.M | re.S)
+    logger = re.search(r"^log\(\) \{.*$", text, flags=re.M)
+    header = re.search(r'^CSV_HEADER="([^"]+)"$', text, flags=re.M)
+    if not all((parser, decode, summary, logger, header)):
+        add_check("actual peak report extraction and Bash decoding found", False, "missing report protocol or summary block")
+        return
+    columns = next(csv.reader([header.group(1)]))
+    with tempfile.TemporaryDirectory(prefix="addon_peak_display_") as tmp:
+        root = Path(tmp)
+        for selected, measured in ((2, "1.9719"), (1, "0.982"), (None, "1.9719")):
+            source = dict.fromkeys(columns[1:21], "1")
+            source.update(current_time="2026-10-15 12:34:56", input_len="8192", output_len="1024",
+                          total_req="2", max_cc="9", cc=measured, rr="0.5")
+            best = {**source, "passed": "yes"}
+            if selected is not None:
+                best["concurrency"] = selected
+            report = root / "peak_report.json"
+            report.write_text(json.dumps({"best": [best]}), encoding="utf-8")
+            extracted = subprocess.run([sys.executable, "-c", parser.group(1), "0.5", str(report)],
+                                       text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            output = root / "summary.csv"
+            with output.open("w", encoding="utf-8", newline="") as handle:
+                csv.writer(handle).writerow(columns)
+            environment = {**os.environ, "PEAK_RAW": extracted.stdout.rstrip("\r\n"),
+                           "PEAK_METRICS": "", "PEAK_CONFIG_CC": "stale", "ARCHIVE_NAME": "display_case",
+                           "RESULTS_CSV": str(output), "PEAK_REPEAT_RATE": "0.9"}
+            code = logger.group(0) + "\n" + decode.group(1) + "\n" + summary.group(1) + "\n"
+            decoded = subprocess.run([bash, "-eu", "-c", code], env=environment,
+                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            label = f"peak selected={selected} measured={measured} native_max=9"
+            expected_display = "未知" if selected is None else str(selected)
+            add_check(label + " display uses report concurrency",
+                      extracted.returncode == decoded.returncode == 0 and
+                      f"最优并发={expected_display}（实测cc={measured}）" in decoded.stdout,
+                      "actual Python extraction and Bash decoder preserve the selected tier")
+            with output.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            expected = {"scenario": "display_case", **source, "repeat_rate": "0.9", "status": "peak"}
+            add_check(label + " summary keeps all original metrics", rows == [expected], "23 columns unchanged, including measured cc and native max_cc")
+
+
+def simulate_empty_result_rows() -> None:
+    """Run each real failure/no-result call through its actual Bash helper."""
+    bash = shutil.which("bash")
+    if not bash:
+        add_check("actual Bash empty-result rows", False, "Bash is unavailable; placeholder rows were not executed", warn=True)
+        return
+    text = read_text(RUN_SCRIPT)
+    helper = re.search(r"^append_empty_result\(\) \{\n.*?^\}[ \t]*$", text, flags=re.M | re.S)
+    header = re.search(r'^CSV_HEADER="([^"]+)"$', text, flags=re.M)
+    calls = re.findall(r"^[ \t]+(append_empty_result [^\n]+)$", text, flags=re.M)
+    if helper is None or header is None:
+        add_check("empty-result helper and schema found", False, "missing actual helper or CSV header")
+        return
+    columns = next(csv.reader([header.group(1)]))
+    add_check("all five empty-result branches use the shared helper", len(calls) == 5, f"branches={len(calls)}")
+    environment = {
+        **os.environ,
+        "ARCHIVE_NAME": 'scenario, "quoted"', "SCENARIO_INPUT_LEN": "8192", "SCENARIO_OUTPUT_LEN": "1024",
+        "SCENARIO_CONCURRENCY": "2", "SCENARIO_REQUEST_RATE": "0.25", "SCENARIO_REPEAT_RATE": "0.75",
+        "PEAK_INPUT_LEN": "8192", "PEAK_OUTPUT_LEN": "1024", "PEAK_CURRENT_TIME": "2026-10-15 12:34:56",
+        "PEAK_MAX_CC": "2", "PEAK_REQUEST_RATE": "0.5", "PEAK_REPEAT_RATE": "0.9",
+        "CSV_HEADER": header.group(1),
+    }
+    # Map the host's Python executable to the production helper's python3 command.
+    interpreter = shlex.quote(sys.executable.replace("\\", "/"))
+    with tempfile.TemporaryDirectory(prefix="addon_empty_rows_") as tmp:
+        for index, call in enumerate(calls, 1):
+            path = Path(tmp) / f"empty_{index}.csv"
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                csv.writer(handle).writerow(columns)
+            code = 'python3() { ' + interpreter + ' "$@"; }\n' + helper.group(0) + "\n" + call + "\n"
+            result = subprocess.run([bash, "-eu", "-c", code], env={**environment, "RESULTS_CSV": str(path)},
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            fixed = "$SCENARIO_INPUT_LEN" in call
+            status = "no_result" if call.endswith('"no_result"') else "failed"
+            label = f"{'fixed' if fixed else 'peak'} {status} branch {index}"
+            add_check(label + " actual writer exits successfully", result.returncode == 0, result.stderr.strip() or "actual shared helper executed")
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.reader(handle))
+            add_check(label + " exact 23 fields", len(rows) == 2 and len(rows[1]) == 23, f"field_counts={[len(row) for row in rows]}")
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                named_rows = list(csv.DictReader(handle))
+            expected = dict.fromkeys(columns, "")
+            expected.update({
+                "scenario": environment["ARCHIVE_NAME"], "input_len": "8192", "output_len": "1024",
+                "cc": "2" if fixed else "", "rr": "0.25" if fixed else "0.5",
+                "repeat_rate": "0.75" if fixed else "0.9", "status": status,
+            })
+            if not fixed and status == "no_result":
+                expected.update(current_time=environment["PEAK_CURRENT_TIME"], max_cc="2")
+            add_check(label + " all named fields and quoted scenario match", named_rows == [expected], "metadata remains in its named columns; unavailable metrics stay empty")
+
+
+def simulate_peak_search_controls() -> None:
+    """Execute the real Bash command builder, then the real parser and search."""
+    bash = shutil.which("bash")
+    if not bash:
+        add_check("actual Bash peak controls", False, "Bash is unavailable; command construction was not executed", warn=True)
+        return
+    text = read_text(RUN_SCRIPT)
+    construct = re.search(r'^(    PEAK_CMD="python3 add/aisbench_perf_matrix\.py.*?)(?=^    CONTAINER_LOG_TMP=)', text, flags=re.M | re.S)
+    declaration = re.search(r"^PEAK_HARD_CAP=.*$", text, flags=re.M)
+    functions = re.findall(r"^(?:log|fail)\(\) \{.*$", text, flags=re.M)
+    if construct is None or declaration is None or len(functions) != 2:
+        add_check("actual Bash peak controls found", False, "missing command builder or switch declaration")
+        return
+    code = "\n".join(functions) + "\n" + declaration.group(0) + "\n" + construct.group(1) + '\nprintf "%s\\n" "$PEAK_CMD"\n'
+    module = load_module("addon_matrix_controls", ADD_DIR / "aisbench_perf_matrix.py")
+    common = {
+        "PEAK_RUN_TAG": "offline-controls", "ARCHIVE_NAME": "offline_peak", "PEAK_INPUT_LEN": "8192",
+        "PEAK_OUTPUT_LEN": "1024", "PEAK_MIN_CC": "1", "PEAK_MAX_CC": "1",
+        "PEAK_DATA_MULTIPLIER_VAL": "1", "PEAK_REQUEST_RATE": "0", "PEAK_TTFT": "30",
+        "PEAK_TPOT": "1000", "PEAK_WAIT": "0", "FAILED_REQ_LIMIT": "0", "NPU_NUM": "1",
+        "CONTAINER_OUTPUT_DIR": "/tmp/unused-offline-controls", "RUN_TIMESTAMP": "offline",
+        "PEAK_REPEAT_RATE": "0",
+    }
+
+    def run_search(case, config, cutoff):
+        calls = []
+        original = module.run_single_evaluation
+
+        def measurement(**kwargs):
+            cc = kwargs["concurrency"]
+            calls.append(cc)
+            if len(calls) > 32:
+                raise RuntimeError("offline probe guard exceeded")
+            return module.EvaluationResult(
+                sequence_id=kwargs["sequence_id"], concurrency=cc,
+                num_prompts=module.calculate_num_prompts(cc, case.request_multiplier),
+                passed=cc <= cutoff, reason="offline monotone predicate", return_code=0,
+                metrics={}, csv_row={}, command=[], run_dir="", process_log="", aisbench_log="",
+                aisbench_all_log="", result_csv="", captured_outputs_dir="",
+            )
+
+        module.run_single_evaluation = measurement
+        try:
+            searcher = module.PeakSearcher(case, config, ADD_DIR, module.logging.getLogger("offline-controls"))
+            best, history = searcher.search()
+            for result in list(history):
+                searcher.evaluate(result.concurrency)
+            return best.concurrency if best else 0, calls, len(history)
+        finally:
+            module.run_single_evaluation = original
+
+    nested_case = json.dumps([{
+        "name": "nested", "input_len": 8192, "output_len": 1024,
+        "min_concurrency": 1, "max_concurrency": 1, "request_multiplier": 1,
+    }], separators=(",", ":"))
+    tests = [
+        ("default switch", None, "--auto-expand-max-concurrency 2", 2, False),
+        ("switch 0", "0", "--auto-expand-max-concurrency 2", 2, False),
+        ("switch 1 overrides cap2", "1", "--auto-expand-max-concurrency 2", 1, False),
+        ("switch 1 overrides unlimited cap", "1", "--auto-expand-max-concurrency 0", 1, False),
+        ("switch 1 overrides negative cap", "1", "--auto-expand-max-concurrency -1", 1, False),
+        ("switch 1 overrides equals syntax", "1", "--auto-expand-max-concurrency=999", 1, False),
+        ("switch 1 overrides initial max", "1", "--max-concurrency 99 --auto-expand-max-concurrency 999", 1, False),
+        ("switch 1 overrides abbreviated cap", "1", "--auto-expand-max-concurrenc 999", 1, False),
+        ("switch 0 permits nested cases", "0", "--cases-json " + shlex.quote(nested_case) + " --auto-expand-max-concurrency 2", 2, False),
+        ("switch 1 rejects nested cases", "1", "--cases-json " + shlex.quote(nested_case), 1, True),
+        ("switch 1 rejects abbreviated nested cases", "1", "--cases " + shlex.quote(nested_case), 1, True),
+    ]
+    for name, switch, forwarded, expected, reject in tests:
+        environment = {**os.environ, **common, "PEAK_FORWARD": forwarded}
+        environment.pop("PEAK_HARD_CAP", None)
+        if switch is not None:
+            environment["PEAK_HARD_CAP"] = switch
+        shell = subprocess.run([bash, "-eu", "-c", code], cwd=str(PROJECT_ROOT), env=environment,
+                               text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if reject:
+            add_check(name, shell.returncode != 0 and "does not accept cases-json" in shell.stdout + shell.stderr,
+                      "unsupported nested case override rejected before executing a benchmark")
+            continue
+        if shell.returncode != 0:
+            add_check(name, False, f"command construction exit={shell.returncode}")
+            continue
+        command = shlex.split(shell.stdout)
+        previous_argv = sys.argv
+        try:
+            sys.argv = command[1:]
+            args, extra = module.parse_args()
+            config = module.load_runner_config(args, extra)
+        finally:
+            sys.argv = previous_argv
+        best, calls, history_count = run_search(config.cases[0], config, 2)
+        add_check(name + " effective cap", config.auto_expand_max_concurrency == expected, f"effective cap={config.auto_expand_max_concurrency}")
+        add_check(name + " actual search", best == expected and max(calls) <= expected,
+                  f"probes={calls}, best={best}")
+        add_check(name + " cache unique", len(calls) == len(set(calls)) == history_count, f"measurements={len(calls)}")
+
+    # The numerical cap limits expansion; it does not clamp an already measured
+    # initial range. These checks cover both previously repaired boundary cases.
+    config = module.RunnerConfig(str(ADD_DIR / "aisbench_perf_matrix_config.py"), sys.executable, "", "TTFT avg", "TPOT avg", 4, {}, [], "", [])
+    case = module.SearchCase("singleton", 8192, 1024, 1, 1, "0", 1, 30, 1000, 0)
+    best, calls, _ = run_search(case, config, 4)
+    add_check("singleton expands when cap permits", best == 4 and calls == [1, 2, 4], f"probes={calls}, best={best}")
+    case.max_concurrency = 8
+    best, calls, _ = run_search(case, config, 8)
+    add_check("numeric cap preserves passing initial high", best == 8 and calls == [4, 8], f"probes={calls}, best={best}")
+
+
 def write_report() -> None:
     total = len(checks)
     passed = sum(1 for item in checks if item.status == "PASS")
@@ -854,6 +1080,9 @@ def main() -> int:
     simulate_fixed_result_extraction()
     simulate_archive_snapshot()
     simulate_perf_matrix_command()
+    simulate_peak_concurrency_display()
+    simulate_empty_result_rows()
+    simulate_peak_search_controls()
     write_report()
     print(f"Validation report written: {REPORT_PATH}")
     failed = sum(1 for item in checks if item.status == "FAIL")

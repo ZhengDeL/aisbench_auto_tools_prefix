@@ -41,6 +41,7 @@ bash run_perf_scenarios.sh
 | `NPU_NUM` | `24` |
 | `MAX_CONTEXT_LEN` | `133120` |
 | `POD_INFO` | 20 个 metrics 端点，完整列表见 [env.env](env.env) |
+| `PEAK_HARD_CAP` | `1`，沿用原增补仓加载 env 后到顶即停的策略 |
 
 NPU 数只用于传递测试参数和计算单卡吞吐，不会自动探测硬件。`POD_INFO` 的端点数量也不会自动设置 `dp`；当前场景没有显式设置 `dp`，底层默认是 `1`。
 
@@ -102,6 +103,7 @@ unset SCENARIOS_JSON_OVERRIDE
 | `PEAK_WAIT_SECONDS` | `10` | 场景未指定时的摸高轮间等待秒数 |
 | `PEAK_TTFT_LIMIT` | `5` | 场景未指定时的 TTFT 阈值，单位秒 |
 | `PEAK_TPOT_LIMIT` | `50` | 场景未指定时的 TPOT 阈值，单位毫秒 |
+| `PEAK_HARD_CAP` | `0` | `0` 保留自动扩容；`1` 以各场景的 `peak_max_cc` 为硬上限 |
 | `SCENARIOS_JSON_OVERRIDE` | 未设置，使用内置数组 | 整体替换场景配置 |
 
 `PROJECT_ROOT` 是脚本定位到的项目根目录。容器内固定路径为 `/workspace/model`、`/workspace/aisbench_dataset`、`/workspace/aisbench_outputs` 和 `/workspace/aisbench_auto_tools_prefix-main`，它们不是上述环境变量的宿主机路径。
@@ -116,7 +118,7 @@ unset SCENARIOS_JSON_OVERRIDE
 
 ### API 与缓存指标
 
-`API_URL` 为空时，由 AISBench 根据 `HOST_IP/HOST_PORT` 构造接口地址；非空时按镜像内客户端的 URL 规则处理该地址。它的接线是 `API_URL` → 容器 `config.URL` → 模型配置 `url`。网关路径应按实际接口确认。需要鉴权时，在加载 env 后设置 `API_KEY`。
+`API_URL` 为空时，由 AISBench 根据 `HOST_IP/HOST_PORT` 构造接口地址。它的接线是 `API_URL` → 容器 `config.URL` → 模型配置 `url`。指定镜像的 chat 客户端使用 `urljoin(base_url, "v1/chat/completions")`：例如 `API_URL=http://192.168.1.18:8000/` 最终请求 `/v1/chat/completions`，带网关前缀时也应按此规则保留末尾斜杠并核验最终路径。需要鉴权时，在加载 env 后设置 `API_KEY`。
 
 `POD_INFO` 写入容器配置，覆盖基础 `config.py` 原来的同名值。空值生成 `[]`，底层回退到 `HOST_IP:HOST_PORT`。只有 `dataset_type=prefix_cache` 且开启 `prefix_test` 时，这条测试链路才查询缓存指标。PD 分离时应按要观察的角色填写端点；当前 env 保留了服务器原来的 P/D 地址列表。
 
@@ -147,9 +149,20 @@ unset SCENARIOS_JSON_OVERRIDE
 
 搜索先测初始区间中点。中点通过时继续探测初始上界，上界通过后通常继续翻倍；失败时向下寻找通过档位，必要时可探到并发 1，再在通过/失败边界间做整数二分。同一并发在一次搜索中使用已缓存的测量结果。
 
-**`peak_max_cc` 是初始上界，不是硬顶。** 当前配置可以从 200 继续探到 400、800 等。若需要限制向上扩容，可修改 `aisbench_perf_matrix_config.py` 中的 `AUTO_EXPAND_MAX_CONCURRENCY`；独立运行引擎时也可使用 `--auto-expand-max-concurrency`。该项只限制扩容，初始场景的 `peak_max_cc` 也必须不超过目标上限。当前没有 `PEAK_HARD_CAP` 环境变量。
+**是否超过 `peak_max_cc` 继续摸高，由 `PEAK_HARD_CAP` 控制。** 脚本未收到该变量时回退为 `0`，保留自动扩容：初始上界 200 通过后可以继续探到 400、800 等。当前 `env.env` 沿用原增补仓的 `export PEAK_HARD_CAP=1`：加载后以每个场景的 `peak_max_cc` 为硬上限，到顶通过即停止；到顶失败时仍会向下搜索满足 SLO 的并发。
+
+```bash
+source ./env.env
+PEAK_HARD_CAP=1 bash run_perf_scenarios.sh
+```
+
+底层引擎还支持 `aisbench_perf_matrix_config.py` 中的 `AUTO_EXPAND_MAX_CONCURRENCY` 和命令行 `--auto-expand-max-concurrency`。数值 `0` 表示不限制扩容，正数限制后续向上探测；它本身不裁剪已指定的初始区间。shell 的 `PEAK_HARD_CAP=1` 会根据当前场景上界设置该参数。
+
+硬顶模式会在额外透传参数之后锁定初始上界和扩容上限，并拒绝额外的 `cases-json` 覆盖，以保证单个场景的上界有效。不开启硬顶时，保留底层引擎的数值上限及额外参数行为。
 
 最终 best 是本次搜索中找到的满足条件的最高并发，不代表经过多轮重复验证的稳定容量，也不保证所有未测并发都满足。
+
+本镜像的原生 CSV 还提供单请求 `PrefillTokenThroughput` 统计均值，它与整轮的全局吞吐口径不同。上游未提取到全局 prefill 吞吐时会写入 `9999` 哨兵，add 汇总将其显示为空，表示该指标不可用；原始 CSV 保留用于核查。输出吞吐、输入吞吐、总 token 吞吐采用原生 JSON 的整轮指标。
 
 ## 7. 结果目录、指标和状态
 

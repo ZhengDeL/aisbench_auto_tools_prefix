@@ -41,6 +41,14 @@ def read_last_result(path: Path) -> dict[str, str]:
     if None in last:
         raise ValueError("result CSV has more data fields than header columns")
     project_result(last)
+    # Upstream uses 9999 when its global prefill throughput parser found no
+    # value. The image's per-request PrefillTokenThroughput average has a
+    # different denominator and cannot fill this global field.
+    try:
+        if float(last["prefill_token_throughput"]) == 9999:
+            last["prefill_token_throughput"] = ""
+    except (TypeError, ValueError):
+        pass
     return last
 
 

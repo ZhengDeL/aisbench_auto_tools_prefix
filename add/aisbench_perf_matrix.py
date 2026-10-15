@@ -715,7 +715,7 @@ class PeakSearcher:
         probe = current_success.concurrency * 2
         while True:
             if limit > 0 and probe > limit:
-                if current_success.concurrency == limit:
+                if current_success.concurrency >= limit:
                     return current_success, None
                 probe = limit
             result = self.evaluate(probe)
@@ -734,9 +734,7 @@ class PeakSearcher:
         mid_result = self.evaluate(midpoint)
 
         if mid_result.passed:
-            if high == midpoint:
-                return mid_result, self.history
-            high_result = self.evaluate(high)
+            high_result = mid_result if high == midpoint else self.evaluate(high)
             if high_result.passed:
                 success_result, fail_result = self.find_upward_failure(high_result)
                 if fail_result is None:
