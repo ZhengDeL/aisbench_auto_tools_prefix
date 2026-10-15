@@ -2,7 +2,7 @@
 
 `run_perf_scenarios.sh` 负责管理 AISBench 压测容器、生成运行配置、执行固定并发和摸高搜索，并汇总、归档结果。实际请求仍由项目根目录的 `aisbench_test.py` 发出。
 
-当前版本的基础文件使用[原仓提交 ef2b6d8](https://github.com/rayn-zzz/aisbench_auto_tools_prefix/commit/ef2b6d8653d57487b622b0dc9db458f8a1e8dec6)，增补代码和配置以服务器 `./add` 为基础。兼容处理全部放在 `add/`，基础文件保持原仓内容。底层参数与数据集生成方式见[上层 README](../README.md)。
+当前版本的基础文件使用[原仓提交 ef2b6d8](https://github.com/rayn-zzz/aisbench_auto_tools_prefix/commit/ef2b6d8653d57487b622b0dc9db458f8a1e8dec6)，功能适配放在 `add/`。根目录只将 IP 示例改为 `192.168.1.x`，其余基础逻辑沿用原仓。底层参数与数据集生成方式见[上层 README](../README.md)。
 
 ## 1. 运行条件
 
@@ -12,7 +12,7 @@
 - 宿主机能读取模型权重目录，镜像内 AISBench、transformers 能加载对应 tokenizer。
 - 被测推理服务可从压测容器访问；需要缓存指标时，各 `POD_INFO` 端点的 `/metrics` 也应可访问。
 
-脚本使用宿主机网络创建压测容器。容器名相同但镜像或输出挂载不匹配时，会删除并重建该压测容器；请使用专用的 `CONTAINER_NAME`。它不会部署模型服务。
+脚本使用宿主机网络创建带管理标签的专用压测容器。复用前核对管理标签、镜像、模型权重和输出挂载；仅已确认属于本工具的容器可按固定容器 ID 重建。遇到同名未知镜像或无标签容器会报错停止。升级旧版无标签工具容器时，可以指定新的 `CONTAINER_NAME`，由脚本创建；它不会部署或自动删除模型服务。
 
 ## 2. 快速开始
 
@@ -31,19 +31,19 @@ source ./env.env
 bash run_perf_scenarios.sh
 ```
 
-**脚本不会自动加载 `env.env`。** 当前文件保存的是一套实际部署配置，换环境使用前需要修改模型名、权重路径、服务地址、NPU 数和指标端点。
+**脚本不会自动加载 `env.env`。** 仓库中的文件是公开示例，使用前填写模型名、权重路径、服务地址、NPU 数和指标端点。真实配置可另存为被 Git 忽略的 `env.local.env`，用 `source ./env.local.env` 加载。
 
 | 项目 | 当前 `env.env` 的值 |
 |---|---|
-| `MODEL_NAME` | `glm-5.3-flash-w8a8` |
-| `MODEL_HOST_PATH` | `/mnt/models/GLM-5.3-Flash-w8a8` |
-| `HOST_IP` / `HOST_PORT` | `192.168.1.13` / `8000` |
-| `NPU_NUM` | `24` |
+| `MODEL_NAME` | `your-model` |
+| `MODEL_HOST_PATH` | `/mnt/models/your-model` |
+| `HOST_IP` / `HOST_PORT` | `192.168.1.10` / `8000` |
+| `NPU_NUM` | `1`，按实际统计口径修改 |
 | `MAX_CONTEXT_LEN` | `133120` |
-| `POD_INFO` | 20 个 metrics 端点，完整列表见 [env.env](env.env) |
+| `POD_INFO` | 空；需要前缀指标时填写实际 prefill metrics 端点 |
 | `PEAK_HARD_CAP` | `1`，沿用原增补仓加载 env 后到顶即停的策略 |
 
-NPU 数只用于传递测试参数和计算单卡吞吐，不会自动探测硬件。`POD_INFO` 的端点数量也不会自动设置 `dp`；当前场景没有显式设置 `dp`，底层默认是 `1`。
+`NPU_NUM` 是吞吐归一化的分母：`single_output_throughput = output_throughput / NPU_NUM`，`single_E2E_throughput = E2E_throughput / NPU_NUM`；全局吞吐保持整轮统计值。用户必须按报告单位填写参与测试的设备总数：按物理卡报告就填物理卡数，按 NPU 芯片报告就填芯片数，并在报告中注明口径。A3 一张物理卡包含 2 颗 NPU 芯片，两种口径对应的归一化吞吐相差 2 倍。默认 `1` 是示例值，脚本不会自动探测硬件。`POD_INFO` 的端点数量也不会自动设置 `dp`；当前场景没有显式设置 `dp`，底层默认是 `1`。
 
 加载配置后可以继续覆盖变量，例如：
 
@@ -78,21 +78,21 @@ unset SCENARIOS_JSON_OVERRIDE
 
 ## 4. 环境变量与配置优先级
 
-下表是**未设置对应环境变量时，脚本自身使用的回退值**。其中模型和地址是服务器脚本保留的旧回退配置，不能当作当前 GLM 部署配置；按第 2 节加载 `env.env` 后，以环境值为准。
+下表是**未设置对应环境变量时，脚本自身使用的回退值**。模型、路径和地址均为公开示例；按第 2 节加载配置后，以环境值为准。
 
 | 环境变量 | 脚本回退值 | 用途 |
 |---|---|---|
-| `MODEL_NAME` | `glm-5.1-test` | 服务识别的模型名称 |
-| `MODEL_HOST_PATH` | `/mnt/models/DeepSeek-V4-Pro-w4a8-mtp` | 宿主机权重目录，用于 tokenizer |
-| `HOST_IP` | `192.168.1.16` | 推理服务地址 |
+| `MODEL_NAME` | `your-model` | 服务识别的模型名称 |
+| `MODEL_HOST_PATH` | `/mnt/models/your-model` | 宿主机权重目录，用于 tokenizer |
+| `HOST_IP` | `192.168.1.10` | 推理服务地址 |
 | `HOST_PORT` | `8000` | 推理服务端口 |
-| `NPU_NUM` | `128` | 单卡吞吐计算使用的卡数 |
+| `NPU_NUM` | `1` | `single_*` 吞吐的分母；按报告单位填写物理卡数或 NPU 芯片数 |
 | `POD_INFO` | 空 | 逗号分隔的 metrics 地址；生成配置时转为列表 |
 | `API_KEY` | 空 | 鉴权 Key |
 | `API_URL` | 空 | 自定义服务 URL，映射到容器内 `config.py` 的 `URL` |
 | `FAILED_REQ_LIMIT` | `0` | 解析到的失败请求数超过此值时判失败 |
 | `MAX_CONTEXT_LEN` | `512000` | 场景的输入加输出长度上限；加载当前 env 后为 `133120` |
-| `CONTAINER_NAME` | `ais_bench-25` | 压测容器名 |
+| `CONTAINER_NAME` | `ais_bench-example` | 压测容器名 |
 | `EXPECTED_IMAGE` | `ghcr.io/aisbench/aisbench_benchmark:v3.1-20260912-master-openeuler22.03-py310` | 压测镜像 |
 | `HOST_OUTPUT_DIR` | `${PROJECT_ROOT}/outputs/default` | 宿主机结果根目录 |
 | `TOOLS_HOST_DIR` | `$PROJECT_ROOT` | 同步到容器的工具目录 |
@@ -118,9 +118,11 @@ unset SCENARIOS_JSON_OVERRIDE
 
 ### API 与缓存指标
 
-`API_URL` 为空时，由 AISBench 根据 `HOST_IP/HOST_PORT` 构造接口地址。它的接线是 `API_URL` → 容器 `config.URL` → 模型配置 `url`。指定镜像的 chat 客户端使用 `urljoin(base_url, "v1/chat/completions")`：例如 `API_URL=http://192.168.1.18:8000/` 最终请求 `/v1/chat/completions`，带网关前缀时也应按此规则保留末尾斜杠并核验最终路径。需要鉴权时，在加载 env 后设置 `API_KEY`。
+`API_URL` 为空时，由 AISBench 根据 `HOST_IP/HOST_PORT` 构造接口地址。它的接线是 `API_URL` → 容器 `config.URL` → 模型配置 `url`。指定镜像的 chat 客户端使用 `urljoin(base_url, "v1/chat/completions")`：例如 `API_URL=http://192.168.1.10:8000/` 最终请求 `/v1/chat/completions`，带网关前缀时也应按此规则保留末尾斜杠并核验最终路径。需要鉴权时，在加载 env 后设置 `API_KEY`。
 
-`POD_INFO` 写入容器配置，覆盖基础 `config.py` 原来的同名值。空值生成 `[]`，底层回退到 `HOST_IP:HOST_PORT`。只有 `dataset_type=prefix_cache` 且开启 `prefix_test` 时，这条测试链路才查询缓存指标。PD 分离时应按要观察的角色填写端点；当前 env 保留了服务器原来的 P/D 地址列表。
+终端摘要在指定 `API_URL` 时显示它的scheme、host、port和path，省略userinfo、query和fragment；未指定时显示 `HOST_IP:HOST_PORT`。摘要不改变请求接线。
+
+`POD_INFO` 写入容器配置，覆盖基础 `config.py` 原来的同名值。空值生成 `[]`，底层回退到 `HOST_IP:HOST_PORT`。只有 `dataset_type=prefix_cache` 且开启 `prefix_test` 时，这条测试链路才查询缓存指标。PD 分离时应按要观察的角色填写端点；公开 env 不包含任何真实 P/D 地址；例如 `POD_INFO="192.168.1.10:9081,192.168.1.11:9081"`。
 
 ## 5. 当前内置场景与请求数量
 
@@ -139,13 +141,17 @@ unset SCENARIOS_JSON_OVERRIDE
 
 场景中的数字并发表示固定测试，`"max"` 表示摸高。例如只保留 `"concurrency": [1, 10]` 就不摸高。额外的底层参数可写在场景里，如 `dataset_type`、`prefix_num`、`repeat_rate`、`prefix_test`、`seed`、`dp`、`test_type`；布尔开关使用 JSON 的 `true/false`。
 
+固定测试支持 `test_type: "text"` 非流式模式：汇总中的四个TTFT/TPOT字段留空、终端显示N/A，保留E2E、请求计数和吞吐。非流式只有完整响应时间，即使原生误显示正TTFT，也不能用作首token延迟。流式实际只生成1个token时没有token间隔，两项TPOT同样留空，即使原生写出正值也不展示为TPOT；不伪造0。这些不适用字段仍先检查原值为空或有限非负，拒绝垃圾、NaN、inf和负数。模式写入归档manifest供后续验收，旧归档未记录模式时按stream严格读取。
+
 ## 6. 摸高搜索和通过条件
 
 摸高默认比较 `TTFT avg` 和 `TPOT avg`，不是 P90。列名可在 `aisbench_perf_matrix_config.py` 的 `TTFT_COLUMN`、`TPOT_COLUMN` 中修改。
 
+摸高要求 `test_type: "stream"` 且配置输出长度至少2；shell会在初始化容器前拒绝不符合的场景，独立matrix也会在发送首个请求前检查全部case的最终参数。即使关闭SLO，也不能用非流式或无TPOT的单token响应判定通过。
+
 - CSV 中 TTFT 是毫秒，比较时除以 1000，再与秒单位的 `ttft_limit` 比较；TPOT 的数值和阈值都是毫秒。
 - 超过阈值才不满足，等于阈值可通过。阈值 ≤0 时关闭该项 SLO 比较，但仍拒绝缺失、非数字、NaN、inf、负数和 `99999` 等无效指标。
-- 进程执行失败、结果异常，或解析到的 `Failed Requests` 超过 `FAILED_REQ_LIMIT`，也会判为不满足。没有解析到失败计数并不等于已证明失败数为零。
+- 进程执行失败、结果异常、缺少可靠的 `Failed Requests` 计数，或该计数超过 `FAILED_REQ_LIMIT`，都会判为不满足；已知成功请求数为零也会被拒绝。
 
 搜索先测初始区间中点。中点通过时继续探测初始上界，上界通过后通常继续翻倍；失败时向下寻找通过档位，必要时可探到并发 1，再在通过/失败边界间做整数二分。同一并发在一次搜索中使用已缓存的测量结果。
 
@@ -160,7 +166,7 @@ PEAK_HARD_CAP=1 bash run_perf_scenarios.sh
 
 硬顶模式会在额外透传参数之后锁定初始上界和扩容上限，并拒绝额外的 `cases-json` 覆盖，以保证单个场景的上界有效。不开启硬顶时，保留底层引擎的数值上限及额外参数行为。
 
-最终 best 是本次搜索中找到的满足条件的最高并发，不代表经过多轮重复验证的稳定容量，也不保证所有未测并发都满足。
+二分和扩容依赖通过状态随并发大致单调。服务波动或非单调结果下，最终best仅是本次已测通过档位中的最高并发，不保证所有未测档位满足，更不证明真正容量极限或经过多轮重复验证的稳定容量。
 
 本镜像的原生 CSV 还提供单请求 `PrefillTokenThroughput` 统计均值，它与整轮的全局吞吐口径不同。上游未提取到全局 prefill 吞吐时会写入 `9999` 哨兵，add 汇总将其显示为空，表示该指标不可用；原始 CSV 保留用于核查。输出吞吐、输入吞吐、总 token 吞吐采用原生 JSON 的整轮指标。
 
@@ -215,7 +221,7 @@ scenario,current_time,input_len,output_len,total_req,max_cc,cc,rr,TTFT avg,TTFT 
 | `TPOT avg` / `TPOT SLO_P90` | 平均 / P90 每输出 token 时延，毫秒 |
 | `E2E_time` | 整轮 Benchmark Duration，秒；不是单请求 E2EL |
 | `output_throughput` / `E2E_throughput` | 输出 / 总 token 吞吐，token/s |
-| `single_output_throughput` / `single_E2E_throughput` | 上述吞吐除以配置的 NPU 数 |
+| `single_output_throughput` / `single_E2E_throughput` | 上述全局吞吐除以 `NPU_NUM`；按所填物理卡数或芯片数解释，并注明报告单位 |
 | `qps` / `qpm` | 请求吞吐，每秒 / 每分钟 |
 | `input_token_throughput` / `prefill_token_throughput` | 输入 / prefill 吞吐，token/s |
 | `cc` / `max_cc` | 上游测量的 Concurrency / Max Concurrency；不保证 `cc` 等于配置档位，固定任务名 `_cN` 中的 N 表示指定并发 |
@@ -225,13 +231,15 @@ scenario,current_time,input_len,output_len,total_req,max_cc,cc,rr,TTFT avg,TTFT 
 
 | `status` | 实际含义 |
 |---|---|
-| `passed` | 固定测试执行、结果结构和平均时延值检查通过，且解析到的失败请求数未超限；**不检查 TTFT/TPOT SLO** |
+| `passed` | 固定测试执行、按模式适用的结果字段检查通过，成功请求数非零且失败数未超限；text的四延迟及单token缺失TPOT可为空；**不检查 TTFT/TPOT SLO** |
 | `peak_round` | 一次摸高探测的实时记录，可能满足，也可能不满足；是否通过及原因见 `search_trace.*`、`evaluation.json` |
 | `peak` | 摸高搜索成功完成后选出的最终 best 行 |
 | `failed` | 执行、归档或结果校验失败，失败请求数超限，或摸高未找到满足档位等 |
 | `no_result` | 流程返回成功但汇总未提取到结果，属于异常 |
 
-单个测试失败通常记录状态后继续后续任务；容器准备、文件同步或场景解析等初始化失败会退出脚本。最终打印“全部测试完成”不代表所有行通过，应检查 CSV 和搜索明细。以上状态也不证明回答内容正确或长期稳定。
+场景和已知参数先校验，非法值在 Docker 初始化和发请求前报错。单个测试失败记录状态后继续后续任务；只要出现 `failed/no_result`，整批最终返回非零退出码。全部任务成功才返回 `0`；容器准备或文件同步失败也会立即退出。最终打印“全部测试完成”不代表所有行通过，应同时检查退出码、CSV 和搜索明细。
+
+计数从标签后的值解析，支持时间戳日志和表格格式，日期不会被拼入失败数。CSV 的写入与读取使用标准 CSV 规则，场景名可以包含逗号和双引号；场景名不接受单引号、竖线、换行或空值。非法开关、非整数并发/请求数、负倍率、非有限 SLO，以及冲突的归档名称会明确报错。
 
 ## 8. 检查结果
 
@@ -247,6 +255,7 @@ tail -n 30 "$OUTPUT_ROOT/scenario_results/latest/execution.log"
 
 ```bash
 python3 validate_addon.py
+python3 -m unittest discover -s . -p 'test_*.py'
 ```
 
 它使用合成样本检查代码接线、配置、CSV 和搜索结果解析，生成本地 `VALIDATION_REPORT.md`；有 Bash 时还做 shell 语法检查。通过不代表真实镜像或服务已验证。
@@ -297,3 +306,14 @@ python3 validate_result_integrity.py \
 调用顺序：shell 准备容器和配置 → 固定测试调用根目录 `aisbench_test.py`、归档及结果适配器 → 摸高由 matrix 多次调用同一基础入口 → 汇总。`aisbench_perf_matrix_config.py` 中的独立默认案例不是 shell 当前两组 64K 场景，二者不要混用。
 
 本版已完成离线检查；指定镜像内的真实端到端运行、tokenizer 加载、业务回答和性能仍须在目标环境验证。
+
+## 公开发布检查
+
+公开配置、注释和文档统一使用 `192.168.1.x` 示例地址。`127.0.0.1` 等回环地址和 `0.0.0.0` 监听地址保留其程序语义。真实地址、鉴权信息、运行日志及本地分析材料放在被忽略的本地配置或输出目录，提交前执行：
+
+```bash
+python3 add/validate_publication.py
+python3 add/validate_addon.py
+```
+
+发布扫描会检查 Git 实际跟踪的文件；无 `.git` 的交付包按公开源码目录检查。提交本地配置、日志、压测产物或真实网络地址会被拒绝。GitHub 工作流也执行同样的检查。

@@ -6,3 +6,10 @@ aisbench_result.csv
 temp_api.py
 picked_ids.txt
 add/VALIDATION_REPORT.md
+ANALYSIS/
+*.local.env
+*.local.json
+*.bundle
+release*.tar.gz
+publication-private-map.json
+validation/

@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from validate_result_integrity import find_archive
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate run_perf_scenarios.sh output artifacts.")
@@ -39,10 +41,8 @@ def extract_latest_peak_report_path(log_text: str, host_output_dir: Path) -> Opt
     return container_to_host(line, host_output_dir)
 
 
-def find_latest_fixed_archive(host_output_dir: Path, scenario_prefix: str) -> Optional[Path]:
-    pattern = "performance_%s_*" % scenario_prefix
-    matches = sorted(path for path in host_output_dir.glob(pattern) if path.is_dir())
-    return matches[-1] if matches else None
+def find_latest_fixed_archive(host_output_dir: Path, scenario_prefix: str, current_time: Optional[str] = None) -> Optional[Path]:
+    return find_archive(host_output_dir, scenario_prefix, current_time)
 
 
 def write_report(path: Path, checks: List[Tuple[str, bool, str]]) -> None:
@@ -107,7 +107,7 @@ def main() -> int:
     fixed_rows = [row for row in rows if row.get("status") == "passed"]
     for row in fixed_rows:
         scenario = row.get("scenario", "")
-        archive = find_latest_fixed_archive(host_output_dir, scenario)
+        archive = find_latest_fixed_archive(host_output_dir, scenario, row.get("current_time", ""))
         add(checks, "fixed archive exists: %s" % scenario, archive is not None, str(archive or ""))
         if archive is not None:
             add(checks, "fixed archive manifest: %s" % scenario, (archive / "archive_manifest.json").is_file(), str(archive))

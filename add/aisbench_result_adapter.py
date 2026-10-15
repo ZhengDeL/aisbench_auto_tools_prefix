@@ -1,6 +1,7 @@
 """Read upstream result CSVs by name and preserve the add-on summary schema."""
 from __future__ import annotations
 
+import argparse
 import csv
 import math
 import sys
@@ -15,6 +16,21 @@ CANONICAL_COLUMNS = (
     "single_E2E_throughput", "qps", "qpm", "input_token_throughput",
     "prefill_token_throughput",
 )
+TOKEN_LATENCY_COLUMNS = ("TTFT avg", "TTFT P90", "TPOT avg", "TPOT SLO_P90")
+
+# Match the upstream parser's defaults per field. A partially parsed row must
+# not become a passing result merely because its two average latencies exist.
+FAILURE_SENTINELS = {
+    **dict.fromkeys((
+        "input_len", "output_len", "total_req", "max_cc", "cc", "TTFT avg",
+        "TTFT P90", "TPOT avg", "TPOT SLO_P90", "E2E_time",
+        "output_throughput", "single_output_throughput",
+    ), 99999),
+    **dict.fromkeys((
+        "E2E_throughput", "single_E2E_throughput", "qps", "qpm",
+        "input_token_throughput",
+    ), 9999),
+}
 
 
 def project_result(row: Mapping[str, Any]) -> list[str]:
@@ -24,7 +40,9 @@ def project_result(row: Mapping[str, Any]) -> list[str]:
     return [str(row[name]) for name in CANONICAL_COLUMNS]
 
 
-def read_last_result(path: Path) -> dict[str, str]:
+def read_last_result(path: Path, test_type: str = "stream") -> dict[str, str]:
+    if test_type not in ("stream", "text"):
+        raise ValueError("test_type must be stream or text")
     last = None
     with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -49,6 +67,29 @@ def read_last_result(path: Path) -> dict[str, str]:
             last["prefill_token_throughput"] = ""
     except (TypeError, ValueError):
         pass
+    if not last["current_time"].strip():
+        raise ValueError("result CSV missing current_time")
+    optional_latencies = set(TOKEN_LATENCY_COLUMNS) if test_type == "text" else set()
+    try:
+        if float(last["output_len"]) == 1:
+            optional_latencies.update(TOKEN_LATENCY_COLUMNS[2:])
+    except (TypeError, ValueError):
+        pass  # The regular numeric checks below reject an invalid output_len.
+    for name in CANONICAL_COLUMNS[1:]:
+        if (name == "prefill_token_throughput" or name in optional_latencies) and not last[name].strip():
+            last[name] = ""
+            continue
+        try:
+            value = float(last[name])
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid or missing numeric result: {name}") from error
+        if name in optional_latencies:
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"invalid numeric result: {name}")
+            last[name] = ""
+            continue
+        if not math.isfinite(value) or value < 0 or value == FAILURE_SENTINELS.get(name):
+            raise ValueError(f"invalid numeric result or failure sentinel: {name}")
     return last
 
 
@@ -66,14 +107,12 @@ def invalid_result_reason(
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: aisbench_result_adapter.py RESULT.csv", file=sys.stderr)
-        return 2
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("result_csv", type=Path)
+    parser.add_argument("--test-type", choices=("stream", "text"), default="stream")
+    args = parser.parse_args()
     try:
-        row = read_last_result(Path(sys.argv[1]))
-        reason = invalid_result_reason(row)
-        if reason:
-            raise ValueError(reason)
+        row = read_last_result(args.result_csv, test_type=args.test_type)
         csv.writer(sys.stdout, lineterminator="\n").writerow(project_result(row))
     except (OSError, ValueError, csv.Error) as error:
         print(f"invalid aisbench result: {error}", file=sys.stderr)

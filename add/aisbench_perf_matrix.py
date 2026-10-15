@@ -13,6 +13,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -193,6 +194,8 @@ def args_dict_to_cli(values: Dict[str, Any]) -> List[str]:
         if value is None or value is False:
             continue
         option = f"--{key}"
+        if option in AISBENCH_FLAG_OPTIONS and value is not True:
+            raise ValueError(f"{option} must use a boolean value in args")
         if value is True:
             cli.append(option)
             continue
@@ -204,31 +207,48 @@ def args_dict_to_cli(values: Dict[str, Any]) -> List[str]:
     return cli
 
 
+def integer_setting(value: Any, name: str, minimum: Optional[int] = None) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{name} must be an integer") from error
+    if isinstance(value, bool) or (isinstance(value, float) and value != result):
+        raise ValueError(f"{name} must be an integer")
+    if minimum is not None and result < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return result
+
+
+def finite_setting(value: Any, name: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{name} must be a finite number") from error
+    if isinstance(value, bool) or not math.isfinite(result):
+        raise ValueError(f"{name} must be a finite number")
+    return result
+
+
 def build_case(raw_case: Dict[str, Any], default_case: Dict[str, Any], index: int) -> SearchCase:
     merged = dict(default_case)
     merged.update(dict(raw_case or {}))
     try:
         name = str(merged.get("name") or f"case_{index}")
-        input_len = int(merged["input_len"])
-        output_len = int(merged["output_len"])
-        min_concurrency = int(merged["min_concurrency"])
-        max_concurrency = int(merged["max_concurrency"])
+        input_len = integer_setting(merged["input_len"], "input_len", 1)
+        output_len = integer_setting(merged["output_len"], "output_len", 2)
+        min_concurrency = integer_setting(merged["min_concurrency"], "min_concurrency", 1)
+        max_concurrency = integer_setting(merged["max_concurrency"], "max_concurrency", 1)
     except KeyError as exc:
         raise ValueError(f"SEARCH_CASES 第 {index} 项缺少必填字段: {exc}") from exc
-    if min_concurrency <= 0 or max_concurrency <= 0:
-        raise ValueError(f"SEARCH_CASES 第 {index} 项并发上下界必须大于 0")
     if min_concurrency > max_concurrency:
         raise ValueError(f"SEARCH_CASES 第 {index} 项并发下界不能大于上界")
-    request_multiplier = int(merged.get("request_multiplier", default_case.get("request_multiplier", 4)))
-    if request_multiplier <= 0:
-        raise ValueError(f"SEARCH_CASES 第 {index} 项 request_multiplier 必须大于 0")
-    wait_seconds = int(merged.get("wait_seconds", default_case.get("wait_seconds", 10)))
-    if wait_seconds < 0:
-        raise ValueError(f"SEARCH_CASES 第 {index} 项 wait_seconds 不能小于 0")
+    request_multiplier = integer_setting(merged.get("request_multiplier", default_case.get("request_multiplier", 4)), "request_multiplier", 1)
+    wait_seconds = integer_setting(merged.get("wait_seconds", default_case.get("wait_seconds", 10)), "wait_seconds", 0)
     # 单组合(本 case)覆盖：dataset_type/prefix_num/repeat_rate 若本行填写，则追加到 forward_args。
     # forward_args 在执行时位于 global_forward_args 之后，argparse 后者生效 → 本行覆盖全局；
     # 留空(不带该键)则不追加 → 继承全局。向后兼容旧 cases-json。
     forward_args = list(merged.get("forward_args", []) or [])
+    case_args = dict(merged.get("args", {}) or {})
     for per_case_key in ("dataset_type", "prefix_num", "repeat_rate", "seed", "dp"):
         per_case_value = raw_case.get(per_case_key)
         if per_case_value is not None and str(per_case_value).strip() != "":
@@ -236,21 +256,30 @@ def build_case(raw_case: Dict[str, Any], default_case: Dict[str, Any], index: in
     # prefix_test 为开关：本 case 显式给出布尔/真值时按值控制（DeployX.Ops 侧已解析有效值并逐 case 下发）
     if "prefix_test" in raw_case:
         prefix_test_value = raw_case.get("prefix_test")
-        truthy = prefix_test_value is True or str(prefix_test_value).strip().lower() in ("1", "true", "on", "yes", "是")
+        prefix_test_text = str(prefix_test_value).strip().lower()
+        if prefix_test_text not in ("1", "true", "on", "yes", "是", "0", "false", "off", "no", "否"):
+            raise ValueError("prefix_test must be a boolean value")
+        truthy = prefix_test_text in ("1", "true", "on", "yes", "是")
         if truthy:
             forward_args.append("--prefix_test")
+        else:
+            forward_args = [token for token in forward_args if token != "--prefix_test"]
+        case_args["prefix_test"] = truthy
+    request_rate = str(merged.get("request_rate", default_case.get("request_rate", "0")))
+    if finite_setting(request_rate, "request_rate") < 0:
+        raise ValueError("request_rate must be >= 0")
     return SearchCase(
         name=name,
         input_len=input_len,
         output_len=output_len,
         min_concurrency=min_concurrency,
         max_concurrency=max_concurrency,
-        request_rate=str(merged.get("request_rate", default_case.get("request_rate", "0"))),
+        request_rate=request_rate,
         request_multiplier=request_multiplier,
-        ttft_limit=float(merged.get("ttft_limit", default_case.get("ttft_limit", 0))),
-        tpot_limit=float(merged.get("tpot_limit", default_case.get("tpot_limit", 0))),
+        ttft_limit=finite_setting(merged.get("ttft_limit", default_case.get("ttft_limit", 0)), "ttft_limit"),
+        tpot_limit=finite_setting(merged.get("tpot_limit", default_case.get("tpot_limit", 0)), "tpot_limit"),
         wait_seconds=wait_seconds,
-        args=dict(merged.get("args", {}) or {}),
+        args=case_args,
         forward_args=forward_args,
     )
 
@@ -304,10 +333,11 @@ def load_runner_config(args: argparse.Namespace, forwarded: Sequence[str]) -> Ru
     run_tag = str(getattr(module, "RUN_TAG", "") or args.run_tag)
     ttft_column = str(args.ttft_column or getattr(module, "TTFT_COLUMN", "TTFT avg"))
     tpot_column = str(args.tpot_column or getattr(module, "TPOT_COLUMN", "TPOT avg"))
-    auto_expand_max_concurrency = int(
+    auto_expand_max_concurrency = integer_setting(
         args.auto_expand_max_concurrency
         if args.auto_expand_max_concurrency is not None
-        else getattr(module, "AUTO_EXPAND_MAX_CONCURRENCY", 0)
+        else getattr(module, "AUTO_EXPAND_MAX_CONCURRENCY", 0),
+        "AUTO_EXPAND_MAX_CONCURRENCY", 0,
     )
 
     cases: List[SearchCase] = []
@@ -325,7 +355,8 @@ def load_runner_config(args: argparse.Namespace, forwarded: Sequence[str]) -> Ru
     elif cli_case_override_requested(args):
         base_case = dict(default_case)
         base_case.update(dict(search_cases[0] or {}))
-        overrides = {
+        overrides = dict(base_case)
+        overrides.update({
             "name": args.case_name or base_case.get("name", "cli_case"),
             "input_len": args.input_len if args.input_len is not None else base_case.get("input_len"),
             "output_len": args.output_len if args.output_len is not None else base_case.get("output_len"),
@@ -338,20 +369,25 @@ def load_runner_config(args: argparse.Namespace, forwarded: Sequence[str]) -> Ru
             "wait_seconds": args.wait_seconds if args.wait_seconds is not None else base_case.get("wait_seconds"),
             "args": dict(base_case.get("args", {}) or {}),
             "forward_args": list(base_case.get("forward_args", []) or []),
-        }
+        })
         cases.append(build_case(overrides, default_case, 1))
     else:
         for index, raw_case in enumerate(search_cases, start=1):
             cases.append(build_case(dict(raw_case or {}), default_case, index))
 
-    failed_req_limit = int(
+    failed_req_limit = integer_setting(
         args.failed_req_limit
         if args.failed_req_limit is not None
-        else getattr(module, "FAILED_REQ_LIMIT", 0)
+        else getattr(module, "FAILED_REQ_LIMIT", 0),
+        "FAILED_REQ_LIMIT", 0,
     )
 
     global_forward_args.extend(str(item) for item in forwarded)
-    return RunnerConfig(
+    names = [case.name for case in cases]
+    slugs = [case.slug for case in cases]
+    if len(set(names)) != len(names) or len(set(slugs)) != len(slugs):
+        raise ValueError("case names and sanitized output names must be unique")
+    config = RunnerConfig(
         config_file=str(config_path),
         python_bin=python_bin,
         run_tag=run_tag,
@@ -364,6 +400,11 @@ def load_runner_config(args: argparse.Namespace, forwarded: Sequence[str]) -> Ru
         cases=cases,
         failed_req_limit=failed_req_limit,
     )
+    validate_aisbench_arguments(["--repeat_rate", str(args.repeat_rate)])
+    # Validate every final command before the first case can issue a request.
+    for case in cases:
+        build_run_command(config, case, case.min_concurrency, calculate_num_prompts(case.min_concurrency, case.request_multiplier))
+    return config
 
 
 def calculate_num_prompts(concurrency: int, multiplier: int) -> int:
@@ -462,24 +503,54 @@ def convert_ttft_ms_to_seconds(value_ms: float) -> float:
     return value_ms / 1000.0
 
 
-def parse_failed_requests(log_path: Path) -> Optional[int]:
-    """从 aisbench 日志中解析最后一次出现的 Failed Requests 计数。找不到返回 None。"""
+def parse_request_count(log_path: Path, label: str) -> Optional[int]:
+    """Read the last labelled count without including timestamps or ANSI codes."""
     if not log_path or not Path(log_path).exists():
         return None
     value: Optional[int] = None
     try:
         with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
-                match = re.search(r"Failed Requests\D*(\d+)", line)
+                plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
+                labelled = re.search(r"\b" + re.escape(label) + r"\b", plain)
+                if not labelled:
+                    continue
+                value = None
+                match = re.fullmatch(
+                    r"\s*(?:[|│]\s*(?:total\s*[|│]\s*)?|[:=]\s*)?"
+                    r"([+\-]?\d[\d,]*(?:\.\d+)?)\s*(?:[|│].*)?",
+                    plain[labelled.end():].strip(),
+                )
                 if match:
-                    value = int(match.group(1))
+                    token = match.group(1)
+                    if "," in token and not re.fullmatch(r"[+\-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?", token):
+                        value = None
+                        continue
+                    try:
+                        number = Decimal(token.replace(",", ""))
+                        value = int(number) if number >= 0 and number == number.to_integral_value() else None
+                    except (InvalidOperation, ValueError, OverflowError):
+                        value = None
     except OSError:
         return None
     return value
 
 
+def parse_failed_requests(log_path: Path) -> Optional[int]:
+    return parse_request_count(log_path, "Failed Requests")
+
+
+def parse_success_requests(log_path: Path) -> Optional[int]:
+    return parse_request_count(log_path, "Success Requests")
+
+
 def resolve_threshold_reason(case: SearchCase, csv_row: Dict[str, Any], ttft_column: str, tpot_column: str) -> Tuple[bool, str, Dict[str, Any]]:
     metrics = dict(csv_row)
+    try:
+        finite_setting(case.ttft_limit, "ttft_limit")
+        finite_setting(case.tpot_limit, "tpot_limit")
+    except ValueError as error:
+        return False, str(error), metrics
     if not metrics:
         return False, "未生成 aisbench_result.csv 或结果为空", metrics
     invalid_reason = invalid_result_reason(metrics, (ttft_column, tpot_column))
@@ -501,10 +572,65 @@ def resolve_threshold_reason(case: SearchCase, csv_row: Dict[str, Any], ttft_col
     return True, "满足阈值", metrics
 
 
+def validate_aisbench_arguments(tokens: Sequence[str]) -> None:
+    numeric_options = {
+        "--input_len", "--output_len", "--data_num", "--concurrency", "--npu_num", "--dp",
+        "--prefix_num", "--repeat", "--seed", "--request_rate", "--repeat_rate",
+        "--length_mean", "--length_std", "--length_min", "--length_max", "--test_type", "--dataset_type",
+    }
+    values: Dict[str, str] = {}
+    index = 0
+    while index < len(tokens):
+        option, separator, inline = str(tokens[index]).partition("=")
+        if option in AISBENCH_FLAG_OPTIONS and separator:
+            raise ValueError(f"{option} is a flag and does not accept a value")
+        if option in AISBENCH_VALUE_OPTIONS or option in numeric_options:
+            if separator:
+                value = inline
+            else:
+                index += 1
+                if index >= len(tokens):
+                    raise ValueError(f"missing value for {option}")
+                value = str(tokens[index])
+            if option in numeric_options:
+                values[option] = value
+        index += 1
+    for option in ("--input_len", "--output_len", "--data_num", "--concurrency", "--npu_num", "--dp", "--prefix_num", "--repeat", "--length_mean", "--length_min", "--length_max"):
+        if option in values:
+            integer_setting(values[option], option, 1)
+    if "--seed" in values:
+        integer_setting(values["--seed"], "--seed")
+    for option in ("--request_rate", "--length_std"):
+        if option in values and finite_setting(values[option], option) < 0:
+            raise ValueError(f"{option} must be >= 0")
+    if "--repeat_rate" in values:
+        raw = values["--repeat_rate"].strip()
+        ratio = finite_setting(raw[:-1] if raw.endswith("%") else raw, "--repeat_rate")
+        ratio = ratio / 100 if raw.endswith("%") else ratio
+        if not 0 <= ratio <= 1:
+            raise ValueError("--repeat_rate must be in [0,1] or [0%,100%]")
+    for first, second in (("--length_mean", "--length_std"), ("--length_min", "--length_max")):
+        if (first in values) != (second in values):
+            raise ValueError(f"{first} and {second} must be supplied together")
+    if "--length_min" in values and int(values["--length_min"]) > int(values["--length_max"]):
+        raise ValueError("--length_min must not exceed --length_max")
+    for option, choices in (("--test_type", {"stream", "text"}), ("--dataset_type", {"normal", "prefix_cache"})):
+        if option in values and values[option] not in choices:
+            raise ValueError(f"invalid {option}")
+    if values.get("--test_type", "stream") != "stream":
+        raise ValueError("peak search requires test_type=stream for token latency metrics")
+    if "--output_len" in values and int(values["--output_len"]) < 2:
+        raise ValueError("peak search requires output_len >= 2 for TPOT")
+
+
 def build_run_command(config: RunnerConfig, case: SearchCase, concurrency: int, num_prompts: int) -> List[str]:
+    finite_setting(case.ttft_limit, "ttft_limit")
+    finite_setting(case.tpot_limit, "tpot_limit")
     command = [config.python_bin, str(AISBENCH_TEST_SCRIPT)]
     command.extend(args_dict_to_cli(config.global_args))
     command.extend(config.global_forward_args)
+    disabled_flags = {f"--{name}" for name, value in case.args.items() if value is False and f"--{name}" in AISBENCH_FLAG_OPTIONS}
+    command = [token for token in command if token not in disabled_flags]
     command.extend(args_dict_to_cli(case.args))
     command.extend(case.forward_args)
     command.extend(
@@ -521,7 +647,9 @@ def build_run_command(config: RunnerConfig, case: SearchCase, concurrency: int, 
             str(case.request_rate),
         ]
     )
-    return command[:2] + dedupe_aisbench_cli_args(command[2:])
+    command = command[:2] + dedupe_aisbench_cli_args(command[2:])
+    validate_aisbench_arguments(command[2:])
+    return command
 
 
 def run_single_evaluation(
@@ -592,13 +720,22 @@ def run_single_evaluation(
     else:
         passed, reason, metrics = resolve_threshold_reason(case, csv_row, config.ttft_column, config.tpot_column)
 
-    # Failed Requests 超过阈值也视为不满足（即使 TTFT/TPOT 达标）
+    # A valid CSV and exit code alone do not prove that requests succeeded.
     failed_req = parse_failed_requests(process_log_path)
     if failed_req is None and aisbench_log:
         failed_req = parse_failed_requests(Path(aisbench_log))
-    if passed and failed_req is not None and failed_req > config.failed_req_limit:
+    success_req = parse_success_requests(process_log_path)
+    if success_req is None and aisbench_log:
+        success_req = parse_success_requests(Path(aisbench_log))
+    if passed and failed_req is None:
+        passed = False
+        reason = "缺少或无法解析 Failed Requests 计数"
+    elif passed and failed_req > config.failed_req_limit:
         passed = False
         reason = f"Failed Requests={failed_req} 超过限制 {config.failed_req_limit}"
+    if passed and success_req == 0:
+        passed = False
+        reason = "Success Requests=0，未完成任何成功请求"
 
     result = EvaluationResult(
         sequence_id=sequence_id,
@@ -844,7 +981,7 @@ def append_live_peak_round(csv_path: str, case: SearchCase, result: EvaluationRe
         metrics.get("single_output_throughput", ""), metrics.get("E2E_throughput", ""),
         metrics.get("single_E2E_throughput", ""), metrics.get("qps", ""), metrics.get("qpm", ""),
         metrics.get("input_token_throughput", ""), metrics.get("prefill_token_throughput", ""),
-        repeat_rate, "peak_round",
+        metrics.get("repeat_rate", repeat_rate), "peak_round",
     ]
     needs_header = not path.exists() or path.stat().st_size == 0
     with path.open("a", encoding="utf-8", newline="") as handle:

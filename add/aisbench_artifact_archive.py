@@ -155,7 +155,10 @@ def archive_performance_run(
     since_ts: Optional[float] = None,
     source_root: Optional[Path] = None,
     task_kind: str = "performance",
+    test_type: str = "stream",
 ) -> Dict[str, Any]:
+    if test_type not in ("stream", "text"):
+        raise ValueError("test_type must be stream or text")
     source_root = source_root or BASE_DIR
     output_root = Path(output_dir)
     if not output_root.is_absolute():
@@ -171,6 +174,7 @@ def archive_performance_run(
         output_root=output_root,
         source_root=source_root,
         captured_outputs_dir=captured_outputs_dir,
+        extra_metadata={"test_type": test_type},
     )
 
 
@@ -184,6 +188,7 @@ def parse_args() -> argparse.Namespace:
     perf_parser.add_argument("--run-tag", default="", help="optional task id or suffix")
     perf_parser.add_argument("--since-ts", type=float, default=None, help="only capture files modified after this timestamp")
     perf_parser.add_argument("--task-kind", default="performance", help="archive kind label")
+    perf_parser.add_argument("--test-type", choices=("stream", "text"), default="stream")
 
     return parser.parse_args()
 
@@ -197,6 +202,7 @@ def main() -> int:
             run_tag=args.run_tag,
             since_ts=args.since_ts,
             task_kind=args.task_kind,
+            test_type=args.test_type,
         )
         print("===AISBENCH_ARCHIVE===")
         print(json.dumps(manifest, ensure_ascii=False, indent=2))

@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from aisbench_artifact_archive import sanitize_archive_name
 from aisbench_result_adapter import read_last_result
 
 
@@ -83,13 +84,37 @@ def read_final_rows(csv_path: Path) -> List[Dict[str, str]]:
 
 
 def read_last_source_result(csv_path: Path) -> Dict[str, str]:
-    row = read_last_result(csv_path)
+    test_type = "stream"
+    manifest_path = csv_path.parent / "archive_manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("extra_metadata", {}), dict):
+            raise ValueError("invalid archive result context")
+        test_type = manifest.get("extra_metadata", {}).get("test_type", "stream")
+    row = read_last_result(csv_path, test_type=test_type)
     return {column: str(row[column]) for column in SOURCE_RESULT_COLUMNS}
 
 
-def find_archive(host_output_dir: Path, scenario: str) -> Optional[Path]:
-    matches = sorted(path for path in host_output_dir.glob("performance_%s_*" % scenario) if path.is_dir())
-    return matches[-1] if matches else None
+def find_archive(host_output_dir: Path, scenario: str, current_time: Optional[str] = None) -> Optional[Path]:
+    """Resolve a unique archive by its original name and optional source time."""
+    if current_time is not None and not str(current_time).strip():
+        return None
+    pattern = "performance_%s_*" % sanitize_archive_name(scenario)
+    matches = []
+    for path in host_output_dir.glob(pattern):
+        if not path.is_dir():
+            continue
+        try:
+            manifest = json.loads((path / "archive_manifest.json").read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict) or manifest.get("archive_name") != scenario:
+                continue
+            source = read_last_source_result(path / "aisbench_result.csv")
+            if current_time is not None and norm(source.get("current_time")) != norm(current_time):
+                continue
+        except (OSError, ValueError, csv.Error):
+            continue
+        matches.append(path)
+    return matches[0] if len(matches) == 1 else None
 
 
 def extract_peak_report_paths(log_text: str, host_output_dir: Path) -> List[Path]:
@@ -169,7 +194,7 @@ def main() -> int:
         scenario = norm(row.get("scenario"))
         status = norm(row.get("status"))
         if status == "passed":
-            archive = find_archive(host_output_dir, scenario)
+            archive = find_archive(host_output_dir, str(row.get("scenario") or ""), row.get("current_time", ""))
             add(checks, "fixed archive found: %s" % scenario, archive is not None, str(archive or ""))
             if archive is None:
                 continue
