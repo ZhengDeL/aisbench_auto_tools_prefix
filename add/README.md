@@ -6,9 +6,9 @@
 
 ## 1. 运行条件
 
-- Linux、Bash、Python 3，以及 `tar`、`awk`、`sed`、`grep`、`find`、`base64` 等常用命令。镜像内使用 Python 3.10。
+- Linux、Bash、Python 3，以及 `tar`、`awk`、`sed`、`grep`、`find`、`base64` 等常用命令。镜像内使用 Python 3.11。
 - Docker 已启动，当前用户可以执行 `docker` 命令。
-- 可以使用镜像 `ghcr.io/aisbench/aisbench_benchmark:v3.1-20260912-master-openeuler22.03-py310`；镜像架构须与压测主机匹配。
+- 可以使用镜像 `ghcr.io/aisbench/aisbench_benchmark:v3.1-20261013-master-openeuler24.03-py311`；镜像架构须与压测主机匹配。
 - 宿主机能读取模型权重目录，镜像内 AISBench、transformers 能加载对应 tokenizer。
 - 被测推理服务可从压测容器访问；需要缓存指标时，各 `POD_INFO` 端点的 `/metrics` 也应可访问。
 
@@ -93,7 +93,7 @@ unset SCENARIOS_JSON_OVERRIDE
 | `FAILED_REQ_LIMIT` | `0` | 解析到的失败请求数超过此值时判失败 |
 | `MAX_CONTEXT_LEN` | `512000` | 场景的输入加输出长度上限；加载当前 env 后为 `133120` |
 | `CONTAINER_NAME` | `ais_bench-example` | 压测容器名 |
-| `EXPECTED_IMAGE` | `ghcr.io/aisbench/aisbench_benchmark:v3.1-20260912-master-openeuler22.03-py310` | 压测镜像 |
+| `EXPECTED_IMAGE` | `ghcr.io/aisbench/aisbench_benchmark:v3.1-20261013-master-openeuler24.03-py311` | 压测镜像 |
 | `HOST_OUTPUT_DIR` | `${PROJECT_ROOT}/outputs/default` | 宿主机结果根目录 |
 | `TOOLS_HOST_DIR` | `$PROJECT_ROOT` | 同步到容器的工具目录 |
 | `DATA_NUM_MULTIPLIER` | `10` | 固定并发主测试请求数倍率，须为正整数 |

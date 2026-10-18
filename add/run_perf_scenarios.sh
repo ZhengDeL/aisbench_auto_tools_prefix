@@ -15,7 +15,7 @@ set -uo pipefail
 
 # 容器设置
 CONTAINER_NAME="${CONTAINER_NAME:-ais_bench-example}"
-EXPECTED_IMAGE="${EXPECTED_IMAGE:-ghcr.io/aisbench/aisbench_benchmark:v3.1-20260912-master-openeuler22.03-py310}"
+EXPECTED_IMAGE="${EXPECTED_IMAGE:-ghcr.io/aisbench/aisbench_benchmark:v3.1-20261013-master-openeuler24.03-py311}"
 
 ADD_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$ADD_DIR/.." && pwd)"
