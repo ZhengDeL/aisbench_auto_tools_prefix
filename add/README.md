@@ -23,7 +23,7 @@ git clone --branch main-add-20261015 https://github.com/ZhengDeL/aisbench_auto_t
 cd aisbench_auto_tools_prefix/add
 ```
 
-已有仓库时，进入其 `add/` 目录。先编辑配置，再加载并运行：
+已有仓库时，进入其 `add/` 目录。**日常使用直接修改 `env.env`，无需复制文件。** 按顺序执行以下三行命令：
 
 ```bash
 vi env.env
@@ -31,18 +31,9 @@ source ./env.env
 bash run_perf_scenarios.sh
 ```
 
-**服务、路径等全局参数仍需先 `source`；场景数组由脚本直接读取配置文件。** 默认读取脚本所在目录的 `env.env` 中的 `SCENARIOS_JSON` 块，无需将场景 `export` 为环境变量。仓库中的文件是公开示例，使用前填写模型名、权重路径、服务地址、NPU 数和指标端点，并编辑文件末尾的场景。
+`env.env` 上半部分填写模型名、权重路径、服务地址、NPU 数和指标端点；下半部分的 `SCENARIOS_JSON` 填写测试场景。仓库中提供的是公开示例，使用前改为实际配置。
 
-真实配置可复制完整 `env.env` 为被 Git 忽略的 `env.local.env`，同时保留全局参数和场景块。使用自定义文件时，加载全局参数并将同一个文件作为脚本第一个参数：
-
-```bash
-cp env.env env.local.env
-vi env.local.env
-source ./env.local.env
-bash run_perf_scenarios.sh ./env.local.env
-```
-
-脚本仅从所选文件解析一个字面 JSON 场景块，不执行该配置文件，也不自动加载其中的其他参数。场景块使用下节所示的 `SCENARIOS_JSON=$(cat <<'JSON' ... JSON )` 格式。
+`source ./env.env` 加载服务地址、路径等全局参数；`bash run_perf_scenarios.sh` 启动测试，并直接读取同一文件中的场景 JSON。场景无需 `export`。每次修改配置后，重新执行这两行命令。
 
 | 项目 | 当前 `env.env` 的值 |
 |---|---|
@@ -55,15 +46,6 @@ bash run_perf_scenarios.sh ./env.local.env
 | `PEAK_HARD_CAP` | `1`，沿用原增补仓加载 env 后到顶即停的策略 |
 
 `NPU_NUM` 是吞吐归一化的分母：`single_output_throughput = output_throughput / NPU_NUM`，`single_E2E_throughput = E2E_throughput / NPU_NUM`；全局吞吐保持整轮统计值。用户必须按报告单位填写参与测试的设备总数：按物理卡报告就填物理卡数，按 NPU 芯片报告就填芯片数，并在报告中注明口径。A3 一张物理卡包含 2 颗 NPU 芯片，两种口径对应的归一化吞吐相差 2 倍。默认 `1` 是示例值，脚本不会自动探测硬件。`POD_INFO` 的端点数量也不会自动设置 `dp`；当前场景没有显式设置 `dp`，底层默认是 `1`。
-
-加载配置后可以继续覆盖变量，例如：
-
-```bash
-source ./env.env
-DATA_NUM_MULTIPLIER=7 CONTAINER_NAME=ais_bench_check bash run_perf_scenarios.sh
-```
-
-`source env.env` 会覆盖该文件中定义的同名变量，因此临时覆盖应放在加载之后。
 
 ## 3. 先用小场景验证流程
 
@@ -85,7 +67,7 @@ JSON
 )
 ```
 
-保存后按第 2 节加载并运行；使用 `env.local.env` 时，记得将它作为脚本第一个参数。上例是 1K 输入、512 输出、4 并发，共 4 条主测试请求，没有 `"max"`，不会摸高，也没有前缀预热。出现结果文件和 `passed` 只能确认该轮流程检查通过，回答内容仍需另外核验。
+保存后按第 2 节加载并运行；使用其他配置文件的可选用法见第 4 节。上例是 1K 输入、512 输出、4 并发，共 4 条主测试请求，没有 `"max"`，不会摸高，也没有前缀预热。出现结果文件和 `passed` 只能确认该轮流程检查通过，回答内容仍需另外核验。
 
 旧版 `SCENARIOS_JSON_OVERRIDE` 已不再支持；如果当前环境仍设置了它，脚本会报错停止。先 `unset SCENARIOS_JSON_OVERRIDE`，再把场景移到所用配置文件。
 
@@ -127,6 +109,30 @@ JSON
 3. shell 把最终场景值作为命令行参数传给摸高引擎，覆盖 `aisbench_perf_matrix_config.py` 中对应的默认值。场景填写 `npu_num` 时，也会优先于全局 `NPU_NUM`。
 
 例如，当前场景已写入 TTFT=15 秒、TPOT=60 毫秒，仅设置 `PEAK_TTFT_LIMIT=5`、`PEAK_TPOT_LIMIT=50` 不会改变它们。请直接修改所用配置文件中的场景字段。
+
+### 可选：使用其他配置文件
+
+只有需要保留多套配置时，才使用其他文件。普通使用继续编辑 `env.env` 即可。
+
+如果已另外准备完整的 `env.local.env`，在 `add/` 目录执行：
+
+```bash
+source ./env.local.env
+bash run_perf_scenarios.sh ./env.local.env
+```
+
+两行使用同一个文件：第一行加载全局参数，第二行指定场景 JSON 的读取位置。其他配置文件也必须同时包含全局参数和一个 `SCENARIOS_JSON=$(cat <<'JSON' ... JSON )` 场景块。脚本只解析其中的场景，不自动加载全局参数。`env.local.env` 已被 Git 忽略，可保存本地真实配置。
+
+### 可选：临时覆盖全局参数
+
+加载配置后可以继续覆盖变量，例如：
+
+```bash
+source ./env.env
+DATA_NUM_MULTIPLIER=7 CONTAINER_NAME=ais_bench_check bash run_perf_scenarios.sh
+```
+
+`source env.env` 会覆盖该文件中定义的同名变量，因此临时覆盖应放在加载之后。
 
 ### API 与缓存指标
 
