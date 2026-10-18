@@ -109,7 +109,7 @@ JSON
 | `EXPECTED_IMAGE` | `ghcr.io/aisbench/aisbench_benchmark:v3.1-20261013-master-openeuler24.03-py311` | 压测镜像 |
 | `HOST_OUTPUT_DIR` | `${PROJECT_ROOT}/outputs/default` | 宿主机结果根目录 |
 | `TOOLS_HOST_DIR` | `$PROJECT_ROOT` | 同步到容器的工具目录 |
-| `DATA_NUM_MULTIPLIER` | `10` | 固定并发主测试请求数倍率，须为正整数 |
+| `DATA_NUM_MULTIPLIER` | `4` | 固定并发主测试请求数倍率，须为正整数 |
 | `PEAK_MIN_CONCURRENCY` | `1` | 场景未指定时的摸高初始下界 |
 | `PEAK_MAX_MULTIPLIER` | `20` | 未指定 `peak_max_cc` 时，首个固定并发 × 此值；无固定档时为全局 `PEAK_MIN_CONCURRENCY` × 此值 |
 | `PEAK_DATA_MULTIPLIER` | `4` | 场景未指定时的摸高请求数倍率 |
@@ -145,7 +145,7 @@ JSON
 
 两组场景都使用 `prefix_cache`、`prefix_num=1`、`repeat_rate=0.9`、`prefix_test=true`、`request_rate=0`，摸高倍率 `4`、轮间等待 `10` 秒。`request_rate=0` 表示不限请求发送速率。
 
-**固定并发**：场景写了 `data_num` 就使用该值；否则为并发数 × `DATA_NUM_MULTIPLIER`。默认倍率为 `10`，所以每个场景的五档主测试分别发出 `10、100、200、500、1000` 条请求。
+**固定并发**：场景写了 `data_num` 就使用该值；否则为并发数 × `DATA_NUM_MULTIPLIER`。默认倍率为 `4`，所以每个场景的五档主测试分别发出 `4、40、80、200、400` 条请求。
 
 **摸高**：每档主测试请求数为该档并发 × `peak_data_multiplier`，当前为 `4`。它独立于固定倍率；场景额外写入的 `data_num` 不会覆盖摸高引擎计算的请求数。
 

@@ -53,7 +53,7 @@ POD_INFO="${POD_INFO:-}"
 export POD_INFO
 
 # 固定并发测试请求数 = 并发数 × 此倍率（场景指定 data_num 时优先使用场景值）
-DATA_NUM_MULTIPLIER="${DATA_NUM_MULTIPLIER:-10}"
+DATA_NUM_MULTIPLIER="${DATA_NUM_MULTIPLIER:-4}"
 export DATA_NUM_MULTIPLIER
 
 # 摸高搜索默认参数（场景 JSON 可覆盖）
