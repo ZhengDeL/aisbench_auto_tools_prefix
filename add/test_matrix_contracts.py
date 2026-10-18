@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -444,6 +445,144 @@ class ParameterContracts(IsolatedTest):
         for value in (float("nan"), float("inf")):
             case.ttft_limit = value
             self.assertFalse(matrix.resolve_threshold_reason(case, row, "TTFT avg", "TPOT avg")[0])
+
+
+class RepeatedConcurrencyContracts(IsolatedTest):
+    def expand(self, values, **changes):
+        from validate_addon import expand_scenarios_for_simulation
+        scenario = dict(name="repeat", input_len=16, output_len=4, request_rate=0,
+                        concurrency=values, **changes)
+        with patch.dict(os.environ, {"DATA_NUM_MULTIPLIER": "7"}):
+            return expand_scenarios_for_simulation([scenario])
+
+    def test_user_list_preserves_order_and_adds_one_peak(self):
+        fixed, peak = self.expand([1, 10, 10, 20, 20, 50, 100, "max"])
+        self.assertEqual([line.split("|", 1)[0] for line in fixed], [
+            "repeat_c1", "repeat_c10", "repeat_c10_run2", "repeat_c20",
+            "repeat_c20_run2", "repeat_c50", "repeat_c100"])
+        self.assertEqual(len(peak), 1)
+        self.assertTrue(peak[0].startswith("repeat_peak|"))
+        for line, concurrency in zip(fixed, [1, 10, 10, 20, 20, 50, 100]):
+            args = shlex.split(line.split("|", 1)[1])
+            self.assertEqual(args[args.index("--concurrency") + 1], str(concurrency))
+            self.assertEqual(args[args.index("--data_num") + 1], str(concurrency * 7))
+
+    def test_nonadjacent_numeric_strings_and_explicit_request_count(self):
+        for extra in ({}, {"data_num": 3}):
+            with self.subTest(extra=extra):
+                fixed, peak = self.expand([1, "1", 10, 1, "10", 1], **extra)
+                self.assertEqual([line.split("|", 1)[0] for line in fixed], [
+                    "repeat_c1", "repeat_c1_run2", "repeat_c10", "repeat_c1_run3",
+                    "repeat_c10_run2", "repeat_c1_run4"])
+                self.assertEqual(peak, [])
+                for line, concurrency in zip(fixed, [1, 1, 10, 1, 10, 1]):
+                    args = shlex.split(line.split("|", 1)[1])
+                    self.assertEqual(args.count("--data_num"), 1)
+                    self.assertEqual(args[args.index("--data_num") + 1], str(extra.get("data_num", concurrency * 7)))
+
+    def test_duplicate_max_and_cross_scenario_collisions_remain_invalid(self):
+        from validate_addon import expand_scenarios_for_simulation
+        with self.assertRaises(ValueError):
+            self.expand([1, "max", 1, "max"])
+        for names in (("same", "same"), ("same.name", "same_name")):
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                expand_scenarios_for_simulation([
+                    {"name": name, "concurrency": [1, 1]} for name in names])
+
+    def test_real_shell_batch_keeps_repeated_csv_rows_and_archives(self):
+        from validate_addon import find_bash, run_bash_code
+        bash = find_bash()
+        if not bash:
+            self.skipTest("Bash unavailable; no Docker or model requests are used")
+        fixed, peak = self.expand([1, 10, 10, 20, 20, 50, 100, "max"])
+        source = (ADD_DIR / "run_perf_scenarios.sh").read_text(encoding="utf-8")
+        tail = source[source.index("######################## 4. 循环执行固定"):]
+        helpers = []
+        for name in ("append_empty_result", "append_source_result", "read_request_counts"):
+            match = re.search(r"^" + name + r"\(\) \{\n.*?^\}[ \t]*$", source, re.M | re.S)
+            self.assertIsNotNone(match)
+            helpers.append(match.group(0))
+        tools = self.root / "tools"
+        add = tools / "add"
+        add.mkdir(parents=True)
+        for name in ("aisbench_artifact_archive.py", "aisbench_result_adapter.py"):
+            shutil.copy2(ADD_DIR / name, add / name)
+        output = self.root / "output"
+        results = output / "scenario_results" / "offline"
+        results.mkdir(parents=True)
+        calls = self.root / "calls.jsonl"
+        row = source_row()
+        row.update(input_len="16", output_len="4", rr="0")
+        stub = """import argparse, csv, json, os
+from pathlib import Path
+p = argparse.ArgumentParser()
+for name in ('concurrency', 'data_num'):
+    p.add_argument('--' + name, type=int, required=True)
+a, _ = p.parse_known_args()
+calls = Path(os.environ['MOCK_CALLS'])
+index = len(calls.read_text().splitlines()) + 1 if calls.exists() else 1
+with calls.open('a', encoding='utf-8') as f:
+    f.write(json.dumps({'concurrency': a.concurrency, 'data_num': a.data_num}) + '\\n')
+row = BASE_ROW.copy()
+row.update(current_time='offline_' + str(index), total_req=str(a.data_num),
+           max_cc=str(a.concurrency), cc=str(a.concurrency), qps=str(index))
+with open('aisbench_result.csv', 'w', newline='', encoding='utf-8') as f:
+    w = csv.DictWriter(f, fieldnames=list(row)); w.writeheader(); w.writerow(row)
+Path('aisbench.log').write_text('round=' + str(index), encoding='utf-8')
+print('Failed Requests: 0')
+print('Success Requests: ' + str(a.data_num))
+"""
+        (tools / "aisbench_test.py").write_text("BASE_ROW = " + repr(row) + "\n" + stub, encoding="utf-8", newline="\n")
+        peak_stub = """import argparse, json, os
+from pathlib import Path
+p = argparse.ArgumentParser()
+for name in ('run-tag', 'case-name'):
+    p.add_argument('--' + name, required=True)
+a, _ = p.parse_known_args()
+root = Path(os.environ['MOCK_OUTPUT_ROOT']) / ('peak_' + a.case_name + '_' + a.run_tag)
+root.mkdir(parents=True)
+row = BASE_ROW.copy()
+row.update(concurrency=2, passed='yes')
+(root / 'peak_search_report.json').write_text(json.dumps({'best': [row]}), encoding='utf-8')
+"""
+        (add / "aisbench_perf_matrix.py").write_text("BASE_ROW = " + repr(row) + "\n" + peak_stub, encoding="utf-8", newline="\n")
+        interpreter = shlex.quote(sys.executable.replace("\\", "/"))
+        prefix = ("python3() { " + interpreter + ' "$@"; }\nexport -f python3\n'
+                  'log() { printf "%s\\n" "$*"; }\nfail() { log "ERROR: $*"; exit 1; }\n'
+                  'docker() {\n'
+                  ' [ "$1" = exec ] || return 91\n shift\n'
+                  ' [ "$1" != -i ] || shift\n shift\n'
+                  ' if [ "$1" = bash ]; then shift 2; "$BASH" -c "$1"; else "$@"; fi\n}\n'
+                  + "\n".join(helpers) + "\n")
+        env = {**os.environ, "FIXED_COUNT": str(len(fixed)), "PEAK_COUNT": "1", "TOTAL_TESTS": "8",
+               "COMBOS": "\n".join(fixed), "PEAK_COMBOS": "\n".join(peak), "RUN_TIMESTAMP": "offline",
+               "HOST_OUTPUT_DIR": output.as_posix(), "RESULTS_HOST_DIR": results.as_posix(),
+               "RESULTS_CSV": (results / "all_results.csv").as_posix(), "RESULTS_LOG": (results / "execution.log").as_posix(),
+               "WORK_PATH_DETECTED": add.as_posix(), "TOOL_ROOT": tools.as_posix(),
+               "CONTAINER_NAME": "offline", "CONTAINER_OUTPUT_DIR": output.as_posix(),
+               "HOST_IP": "localhost", "HOST_PORT": "8000", "API_URL": "", "FAILED_REQ_LIMIT": "0",
+               "NPU_NUM": "1", "PEAK_HARD_CAP": "0", "MOCK_CALLS": str(calls), "MOCK_OUTPUT_ROOT": str(output)}
+        process = run_bash_code(bash, prefix + tail, env=env, timeout=90)
+        self.assertEqual(process.returncode, 0, process.stdout[-6000:] + process.stderr)
+        invoked = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(invoked, [{"concurrency": cc, "data_num": cc * 7} for cc in [1, 10, 10, 20, 20, 50, 100]])
+        with (results / "all_results.csv").open(encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            summary = list(reader)
+            self.assertEqual(len(reader.fieldnames), 23)
+        expected_names = [line.split("|", 1)[0] for line in fixed]
+        self.assertEqual([r["scenario"] for r in summary], expected_names + ["repeat_peak"])
+        self.assertEqual([r["status"] for r in summary], ["passed"] * 7 + ["peak"])
+        self.assertEqual(len(set(r["scenario"] for r in summary)), 8)
+        manifests = list(output.glob("performance_*/archive_manifest.json"))
+        self.assertEqual(len(manifests), 7)
+        archived = {json.loads(p.read_text(encoding="utf-8"))["archive_name"]: p.parent for p in manifests}
+        self.assertEqual(set(archived), set(expected_names))
+        for index, entry in enumerate(summary[:7], 1):
+            path = archived[entry["scenario"]]
+            self.assertEqual((path / "aisbench.log").read_text(encoding="utf-8"), "round=" + str(index))
+            with (path / "aisbench_result.csv").open(encoding="utf-8", newline="") as f:
+                self.assertEqual(next(csv.DictReader(f)), {key: entry[key] for key in adapter.CANONICAL_COLUMNS})
 
 
 class ProductionModeContracts(IsolatedTest):

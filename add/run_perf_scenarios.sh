@@ -229,8 +229,8 @@ for sc in scenarios:
     if not isinstance(concurrency_values, list) or not concurrency_values:
         raise ValueError(f"{name}.concurrency must be a non-empty array")
     concurrency_values = [c if c == 'max' else integer(c, f"{name}.concurrency") for c in concurrency_values]
-    if len(concurrency_values) != len(set(concurrency_values)):
-        raise ValueError(f"{name}.concurrency contains duplicate entries")
+    if concurrency_values.count('max') > 1:
+        raise ValueError(f"{name}.concurrency may contain max only once")
     special_keys = {'name', 'input_len', 'output_len', 'concurrency', 'request_rate',
                     'ttft_limit', 'tpot_limit', 'peak_min_cc', 'peak_max_cc',
                     'peak_data_multiplier', 'peak_wait'}
@@ -274,6 +274,7 @@ for sc in scenarios:
         raise ValueError(f"{name}: peak search requires test_type=stream")
     if has_peak and output_len < 2:
         raise ValueError(f"{name}: peak search requires output_len >= 2 for TPOT")
+    fixed_occurrences = {}
     for conc in fixed_concs:
         data_num = str(extra['data_num']) if 'data_num' in extra else str(conc * DATA_NUM_MULTIPLIER)
         params = {'input_len': input_len, 'output_len': output_len,
@@ -284,6 +285,10 @@ for sc in scenarios:
         params.update(extra)
         cmd_str = ' '.join(item for item in (format_cli_arg(k, v) for k, v in params.items()) if item)
         archive_name = f'{name}_c{conc}'
+        # Keep every fixed entry in order and give repeated runs distinct artifacts.
+        fixed_occurrences[conc] = fixed_occurrences.get(conc, 0) + 1
+        if fixed_occurrences[conc] > 1:
+            archive_name += f'_run{fixed_occurrences[conc]}'
         register_task(archive_name)
         combo_lines.append(f'{archive_name}|{cmd_str}')
     if has_peak:

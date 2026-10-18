@@ -1081,7 +1081,7 @@ def simulate_scenario_validation() -> None:
         ("zero concurrency", {"concurrency": [0]}, {}), ("negative concurrency", {"concurrency": [-1]}, {}),
         ("boolean concurrency", {"concurrency": [True]}, {}), ("fraction concurrency", {"concurrency": [1.5]}, {}),
         ("concurrency not a list", {"concurrency": "max"}, {}), ("empty concurrency", {"concurrency": []}, {}),
-        ("duplicate concurrency", {"concurrency": [1, "1"]}, {}), ("zero requests", {"data_num": 0}, {}),
+        ("duplicate peak entry", {"concurrency": [1, "max", "max"]}, {}), ("zero requests", {"data_num": 0}, {}),
         ("negative input", {"input_len": -1}, {}), ("zero output", {"output_len": 0}, {}),
         ("nonfinite rate", {"request_rate": "nan"}, {}), ("negative rate", {"request_rate": -1}, {}),
         ("invalid repeat rate", {"repeat_rate": 1.1}, {}), ("zero npu", {"npu_num": 0}, {}),
@@ -1121,7 +1121,8 @@ def simulate_scenario_validation() -> None:
         result = run_bash_code(bash, prelude + prefix, env=env, timeout=30)
         add_check(name + " rejected before Docker", result.returncode != 0 and "UNEXPECTED_DOCKER_CALL" not in result.stdout and "ValueError" in result.stderr,
                   f"exit={result.returncode}; actual parser, no Docker/model calls")
-    for name, changes in [("quoted name", {"name": 'hello, "quoted"'}), ("zero SLO disables limit", {"concurrency": ["max"], "ttft_limit": 0, "tpot_limit": 0}),
+    for name, changes in [("quoted name", {"name": 'hello, "quoted"'}), ("repeated normalized concurrency", {"concurrency": [1, "1", 2, 1]}),
+                          ("zero SLO disables limit", {"concurrency": ["max"], "ttft_limit": 0, "tpot_limit": 0}),
                           ("percentage ratio", {"repeat_rate": "50%"}), ("zero percentage", {"repeat_rate": "0%"}),
                           ("full prefix percentage", {"repeat_rate": "100%", "dataset_type": "prefix_cache"}),
                           ("fractional Gaussian std", {"length_mean": 16, "length_std": 0.5}),
