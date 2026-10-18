@@ -66,56 +66,9 @@ PEAK_TPOT_LIMIT="${PEAK_TPOT_LIMIT:-50}"              # 默认 TPOT 阈值 (ms)
 # 摸高硬顶开关: 0=允许通过初始上界后继续扩容, 1=以场景 peak_max_cc 为硬上限
 PEAK_HARD_CAP="${PEAK_HARD_CAP:-0}"
 
-# -------------------- 场景定义（直接修改这个 JSON） --------------------
-# 必填: name, input_len, output_len, concurrency(并发值数组), request_rate
-# 可选: 传给 aisbench_test.py 的额外参数（如 dataset_type, prefix_num 等）
-# concurrency 数组中用 "max" 触发摸高搜索，需配合:
-#   ttft_limit        TTFT 阈值 (s)
-#   tpot_limit        TPOT 阈值 (ms)
-#   peak_min_cc       peak search lower bound
-#   peak_max_cc       peak search upper bound
-#   peak_data_multiplier data_num multiplier
-#   peak_wait         wait seconds between peak-search rounds
-SCENARIOS_JSON=$(cat <<'JSON'
-[
-  {
-    "name": "0_ai_coding_64k256",
-    "input_len": "65536",
-    "output_len": "256",
-    "concurrency": [1, 10, 20, 50, 100, "max"],
-    "request_rate": "0",
-    "ttft_limit": 15,
-    "tpot_limit": 60,
-    "peak_min_cc": 1,
-    "peak_max_cc": 200,
-    "peak_data_multiplier": 4,
-    "peak_wait": 10,
-    "dataset_type": "prefix_cache",
-    "prefix_num": "1",
-    "repeat_rate": "0.9",
-    "prefix_test": true
-  },
-  {
-    "name": "0_ai_coding_64k1k",
-    "input_len": "65536",
-    "output_len": "1024",
-    "concurrency": [1, 10, 20, 50, 100, "max"],
-    "request_rate": "0",
-    "ttft_limit": 15,
-    "tpot_limit": 60,
-    "peak_min_cc": 1,
-    "peak_max_cc": 200,
-    "peak_data_multiplier": 4,
-    "peak_wait": 10,
-    "dataset_type": "prefix_cache",
-    "prefix_num": "1",
-    "repeat_rate": "0.9",
-    "prefix_test": true
-  }
-]
-JSON
-)
-SCENARIOS_JSON="${SCENARIOS_JSON_OVERRIDE:-$SCENARIOS_JSON}"
+# 场景直接读取配置文件中的 JSON 块，不从环境变量获取。
+# 默认读取 add/env.env；第一个参数可指定另一份完整 env 文件。
+SCENARIO_CONFIG_FILE="${1:-$ADD_DIR/env.env}"
 # ----------------------------------------------------------------------
 
 ######################## 配置区（按需修改） ########################
@@ -140,6 +93,32 @@ PY
 
 ######################## 3. 解析场景 JSON 并自动展开并发 ########################
 log "校验并展开场景配置..."
+if [ "$#" -gt 1 ]; then
+    fail "用法: bash run_perf_scenarios.sh [env配置文件]"
+fi
+if [ "${SCENARIOS_JSON_OVERRIDE+x}" = "x" ]; then
+    fail "SCENARIOS_JSON_OVERRIDE 已停用，请将场景写入 env 文件的 SCENARIOS_JSON 配置块，并 unset SCENARIOS_JSON_OVERRIDE"
+fi
+[ -r "$SCENARIO_CONFIG_FILE" ] || fail "场景配置文件不存在或不可读: $SCENARIO_CONFIG_FILE"
+
+# 即使调用者曾 export 同名变量，也不会将场景配置传入子进程环境。
+unset SCENARIOS_JSON
+if ! SCENARIOS_JSON=$(python3 - "$SCENARIO_CONFIG_FILE" <<'PY'
+import pathlib, re, sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8-sig")
+definitions = re.findall(r"^[ \t]*(?:export[ \t]+)?SCENARIOS_JSON[ \t]*=", text, flags=re.M)
+blocks = re.findall(r"^SCENARIOS_JSON=\$\(cat <<'JSON'[ \t]*\n(.*?)^JSON\n\)[ \t]*(?:\n|$)", text, flags=re.M | re.S)
+if len(definitions) != 1 or len(blocks) != 1:
+    raise ValueError(f"{path}: expected one non-exported SCENARIOS_JSON=$(cat <<'JSON' ... JSON ) block")
+print(blocks[0])
+PY
+); then
+    fail "读取场景配置失败: $SCENARIO_CONFIG_FILE"
+fi
+export -n SCENARIOS_JSON
+
 SCENARIOS_JSON_FILE=$(mktemp /tmp/scenarios_XXXXXX.json)
 trap 'rm -f -- "${SCENARIOS_JSON_FILE:-}" "${COMBOS_FILE:-}" "${PEAK_COMBOS_FILE:-}" "${CONTAINER_LOG_TMP:-}" "${PEAK_METRICS_FILE:-}"' EXIT
 echo "$SCENARIOS_JSON" > "$SCENARIOS_JSON_FILE"

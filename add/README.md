@@ -31,7 +31,18 @@ source ./env.env
 bash run_perf_scenarios.sh
 ```
 
-**脚本不会自动加载 `env.env`。** 仓库中的文件是公开示例，使用前填写模型名、权重路径、服务地址、NPU 数和指标端点。真实配置可另存为被 Git 忽略的 `env.local.env`，用 `source ./env.local.env` 加载。
+**服务、路径等全局参数仍需先 `source`；场景数组由脚本直接读取配置文件。** 默认读取脚本所在目录的 `env.env` 中的 `SCENARIOS_JSON` 块，无需将场景 `export` 为环境变量。仓库中的文件是公开示例，使用前填写模型名、权重路径、服务地址、NPU 数和指标端点，并编辑文件末尾的场景。
+
+真实配置可复制完整 `env.env` 为被 Git 忽略的 `env.local.env`，同时保留全局参数和场景块。使用自定义文件时，加载全局参数并将同一个文件作为脚本第一个参数：
+
+```bash
+cp env.env env.local.env
+vi env.local.env
+source ./env.local.env
+bash run_perf_scenarios.sh ./env.local.env
+```
+
+脚本仅从所选文件解析一个字面 JSON 场景块，不执行该配置文件，也不自动加载其中的其他参数。场景块使用下节所示的 `SCENARIOS_JSON=$(cat <<'JSON' ... JSON )` 格式。
 
 | 项目 | 当前 `env.env` 的值 |
 |---|---|
@@ -56,27 +67,29 @@ DATA_NUM_MULTIPLIER=7 CONTAINER_NAME=ais_bench_check bash run_perf_scenarios.sh
 
 ## 3. 先用小场景验证流程
 
-当前内置场景会执行多轮 64K 测试和摸高搜索。只想检查配置与流程时，可整体替换为一个小场景：
+当前 `env.env` 中的场景会执行多轮 64K 测试和摸高搜索。只想检查配置与流程时，将所用配置文件末尾的 `SCENARIOS_JSON` 块替换为下面的小场景；这是文件内容，无需 `export`：
 
 ```bash
-source ./env.env
-export SCENARIOS_JSON_OVERRIDE='[
+SCENARIOS_JSON=$(cat <<'JSON'
+[
   {
     "name": "smoke",
-    "input_len": "512",
-    "output_len": "32",
-    "concurrency": [1],
+    "input_len": "1024",
+    "output_len": "512",
+    "concurrency": [4],
     "request_rate": "0",
-    "data_num": "2"
+    "data_num": "4"
   }
-]'
-bash run_perf_scenarios.sh
-unset SCENARIOS_JSON_OVERRIDE
+]
+JSON
+)
 ```
 
-`SCENARIOS_JSON_OVERRIDE` 替换整个场景数组，不与内置场景合并。上例没有 `"max"`，不会摸高，也没有前缀预热。出现结果文件和 `passed` 只能确认该轮流程检查通过，回答内容仍需另外核验。
+保存后按第 2 节加载并运行；使用 `env.local.env` 时，记得将它作为脚本第一个参数。上例是 1K 输入、512 输出、4 并发，共 4 条主测试请求，没有 `"max"`，不会摸高，也没有前缀预热。出现结果文件和 `passed` 只能确认该轮流程检查通过，回答内容仍需另外核验。
 
-## 4. 环境变量与配置优先级
+旧版 `SCENARIOS_JSON_OVERRIDE` 已不再支持；如果当前环境仍设置了它，脚本会报错停止。先 `unset SCENARIOS_JSON_OVERRIDE`，再把场景移到所用配置文件。
+
+## 4. 全局环境变量与文件配置优先级
 
 下表是**未设置对应环境变量时，脚本自身使用的回退值**。模型、路径和地址均为公开示例；按第 2 节加载配置后，以环境值为准。
 
@@ -104,17 +117,16 @@ unset SCENARIOS_JSON_OVERRIDE
 | `PEAK_TTFT_LIMIT` | `5` | 场景未指定时的 TTFT 阈值，单位秒 |
 | `PEAK_TPOT_LIMIT` | `50` | 场景未指定时的 TPOT 阈值，单位毫秒 |
 | `PEAK_HARD_CAP` | `0` | `0` 保留自动扩容；`1` 以各场景的 `peak_max_cc` 为硬上限 |
-| `SCENARIOS_JSON_OVERRIDE` | 未设置，使用内置数组 | 整体替换场景配置 |
 
 `PROJECT_ROOT` 是脚本定位到的项目根目录。容器内固定路径为 `/workspace/model`、`/workspace/aisbench_dataset`、`/workspace/aisbench_outputs` 和 `/workspace/aisbench_auto_tools_prefix-main`，它们不是上述环境变量的宿主机路径。
 
 配置按下面的规则生效：
 
-1. 加载 `env.env` 后，环境变量覆盖 shell 的回退值；后续的 `export` 或 `VAR=value bash ...` 可以再次覆盖。
+1. 加载配置文件后，全局环境变量覆盖 shell 的回退值；后续的 `export` 或 `VAR=value bash ...` 可以再次覆盖这些全局参数。场景数组始终从脚本第一个参数指定的文件读取，未指定时读取 `add/env.env`，不从环境变量取值。
 2. 场景显式填写的 `ttft_limit`、`tpot_limit`、`peak_min_cc`、`peak_max_cc`、`peak_data_multiplier`、`peak_wait` 优先于相应的 `PEAK_*` 环境默认。
 3. shell 把最终场景值作为命令行参数传给摸高引擎，覆盖 `aisbench_perf_matrix_config.py` 中对应的默认值。场景填写 `npu_num` 时，也会优先于全局 `NPU_NUM`。
 
-例如，当前场景已写入 TTFT=15 秒、TPOT=60 毫秒，仅设置 `PEAK_TTFT_LIMIT=5`、`PEAK_TPOT_LIMIT=50` 不会改变它们。请修改场景字段或用 `SCENARIOS_JSON_OVERRIDE` 替换。
+例如，当前场景已写入 TTFT=15 秒、TPOT=60 毫秒，仅设置 `PEAK_TTFT_LIMIT=5`、`PEAK_TPOT_LIMIT=50` 不会改变它们。请直接修改所用配置文件中的场景字段。
 
 ### API 与缓存指标
 
@@ -124,7 +136,7 @@ unset SCENARIOS_JSON_OVERRIDE
 
 `POD_INFO` 写入容器配置，覆盖基础 `config.py` 原来的同名值。空值生成 `[]`，底层回退到 `HOST_IP:HOST_PORT`。只有 `dataset_type=prefix_cache` 且开启 `prefix_test` 时，这条测试链路才查询缓存指标。PD 分离时应按要观察的角色填写端点；公开 env 不包含任何真实 P/D 地址；例如 `POD_INFO="192.168.1.10:9081,192.168.1.11:9081"`。
 
-## 5. 当前内置场景与请求数量
+## 5. 当前 env 场景与请求数量
 
 | 场景名 | 输入 / 输出 token | 固定并发 | 摸高初始范围 | TTFT / TPOT 阈值 |
 |---|---|---|---|---|
@@ -282,7 +294,8 @@ python3 validate_result_integrity.py \
 | 现象 | 检查方法 |
 |---|---|
 | 使用了错误模型、地址或 NPU 数 | 确认已编辑并 `source ./env.env`，临时覆盖放在加载之后 |
-| 只改 `PEAK_*`，摸高阈值没有变化 | 当前场景显式字段优先，修改场景或整体覆盖数组 |
+| 只改 `PEAK_*`，摸高阈值没有变化 | 当前场景显式字段优先，直接修改所用配置文件中的场景 |
+| 自定义 env 的场景未生效 | 确认加载全局参数后，使用 `bash run_perf_scenarios.sh ./env.local.env` 指定同一个完整配置文件 |
 | 改固定倍率后，摸高请求数没变化 | `DATA_NUM_MULTIPLIER` 只控制固定测试；摸高使用独立的 `peak_data_multiplier` |
 | 场景超过 MAX_CONTEXT_LEN | 检查输入加输出长度；脚本回退值 512000，当前 env 为 133120；该设置不会扩大模型服务的上下文能力 |
 | 容器内模型路径不存在 | 检查宿主机 `MODEL_HOST_PATH` 及容器 `/workspace/model` 的实际挂载；复用容器时不能仅凭路径存在就认定挂载的是正确权重 |
@@ -295,8 +308,8 @@ python3 validate_result_integrity.py \
 
 | 文件 | 作用 |
 |---|---|
-| [env.env](env.env) | 本次服务器配置，运行前编辑并加载 |
-| [run_perf_scenarios.sh](run_perf_scenarios.sh) | 主入口，含环境默认值和场景数组 |
+| [env.env](env.env) | 全局参数与场景配置；全局参数先加载，场景由脚本直接读取 |
+| [run_perf_scenarios.sh](run_perf_scenarios.sh) | 主入口，含全局参数回退值并读取 env 文件中的场景数组 |
 | [aisbench_perf_matrix.py](aisbench_perf_matrix.py) | 并发搜索、逐档执行及证据保存 |
 | [aisbench_perf_matrix_config.py](aisbench_perf_matrix_config.py) | 搜索引擎默认配置、指标列名和扩容限制 |
 | [aisbench_result_adapter.py](aisbench_result_adapter.py) | 按列名读取源 CSV、检查关键指标并投影汇总字段 |
@@ -305,7 +318,7 @@ python3 validate_result_integrity.py \
 | [validate_e2e_outputs.py](validate_e2e_outputs.py) | 运行后产物检查 |
 | [validate_result_integrity.py](validate_result_integrity.py) | 运行后汇总与源结果字段追溯 |
 
-调用顺序：shell 准备容器和配置 → 固定测试调用根目录 `aisbench_test.py`、归档及结果适配器 → 摸高由 matrix 多次调用同一基础入口 → 汇总。`aisbench_perf_matrix_config.py` 中的独立默认案例不是 shell 当前两组 64K 场景，二者不要混用。
+调用顺序：shell 准备容器和配置 → 固定测试调用根目录 `aisbench_test.py`、归档及结果适配器 → 摸高由 matrix 多次调用同一基础入口 → 汇总。`aisbench_perf_matrix_config.py` 中的独立默认案例不是 `env.env` 当前两组 64K 场景，二者不要混用。
 
 本版已完成离线检查；指定镜像内的真实端到端运行、tokenizer 加载、业务回答和性能仍须在目标环境验证。
 

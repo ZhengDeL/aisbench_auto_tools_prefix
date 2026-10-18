@@ -585,6 +585,177 @@ row.update(concurrency=2, passed='yes')
                 self.assertEqual(next(csv.DictReader(f)), {key: entry[key] for key in adapter.CANONICAL_COLUMNS})
 
 
+class ScenarioFileContracts(IsolatedTest):
+    @staticmethod
+    def block(scenarios):
+        return "SCENARIOS_JSON=$(cat <<'JSON'\n" + json.dumps(scenarios) + "\nJSON\n)\n"
+
+    @staticmethod
+    def scenario(**changes):
+        return {"name": "file_config", "input_len": 16, "output_len": 4,
+                "concurrency": [1], "request_rate": 0, **changes}
+
+    def run_prefix(self, content=None, *, default=False, options=None, missing=False, allexport=False):
+        """Execute the real shell preflight with Docker forbidden and no service."""
+        from validate_addon import find_bash
+        bash = find_bash()
+        if not bash:
+            self.skipTest("Bash unavailable; scenario file parsing was not executed")
+        source = (ADD_DIR / "run_perf_scenarios.sh").read_text(encoding="utf-8")
+        prefix = source[:source.index("######################## 0. 初始化结果保存目录")]
+        add = self.root / "isolated checkout" / "add"
+        add.mkdir(parents=True, exist_ok=True)
+        config_path = add / "env.env" if default else self.root / "selected scenarios.env"
+        if content is None:
+            content = (ADD_DIR / "env.env").read_text(encoding="utf-8")
+        if not missing:
+            config_path.write_bytes(content.encode("utf-8"))
+        elif config_path.exists():
+            config_path.unlink()
+        interpreter = shlex.quote(sys.executable.replace("\\", "/"))
+        prelude = ('set -a\n' if allexport else '') + ('python3() { ' + interpreter + ' "$@"; }\n'
+                   'docker() { echo UNEXPECTED_DOCKER_CALL; return 88; }\n')
+        tail = '''
+python3 - "$COMBOS" "$PEAK_COMBOS" "$SCENARIOS_JSON" "$HOST_IP" <<'PY'
+import json, os, sys
+print('FILE_CONTRACT=' + json.dumps({
+    'fixed': sys.argv[1].splitlines(), 'peak': sys.argv[2].splitlines(),
+    'scenarios': json.loads(sys.argv[3]), 'host': sys.argv[4],
+    'exported_scenarios': os.environ.get('SCENARIOS_JSON'),
+}))
+PY
+'''
+        script = add / "run_perf_scenarios.sh"
+        script.write_bytes((prelude + prefix + tail).encode("utf-8"))
+        env = {**os.environ, "NPU_NUM": "1", "DATA_NUM_MULTIPLIER": "7", "PEAK_HARD_CAP": "0",
+               "MAX_CONTEXT_LEN": "512000", "PEAK_MIN_CONCURRENCY": "1", "PEAK_MAX_MULTIPLIER": "20",
+               "PEAK_DATA_MULTIPLIER": "4", "PEAK_WAIT_SECONDS": "0", "PEAK_TTFT_LIMIT": "5",
+               "PEAK_TPOT_LIMIT": "50", "FAILED_REQ_LIMIT": "0", "HOST_IP": "environment-host.invalid"}
+        env.pop("SCENARIOS_JSON_OVERRIDE", None)
+        env.pop("SCENARIOS_JSON", None)
+        env.update(options or {})
+        command = [bash, "-uo", "pipefail", script.as_posix()]
+        if not default:
+            command.append(config_path.as_posix())
+        result = subprocess.run(command, cwd=self.root, env=env, text=True, capture_output=True, timeout=45)
+        payloads = [line[len("FILE_CONTRACT="):] for line in result.stdout.splitlines()
+                    if line.startswith("FILE_CONTRACT=")]
+        return result, json.loads(payloads[-1]) if payloads else None
+
+    def assert_success(self, result, payload):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNotNone(payload, result.stdout + result.stderr)
+        self.assertNotIn("UNEXPECTED_DOCKER_CALL", result.stdout)
+
+    def test_default_env_preserves_both_user_scenarios_and_all_fields(self):
+        common = {"input_len": "65536", "concurrency": [1, 10, 20, 50, 100, "max"],
+                  "request_rate": "0", "ttft_limit": 15, "tpot_limit": 60,
+                  "peak_min_cc": 1, "peak_max_cc": 200, "peak_data_multiplier": 4,
+                  "peak_wait": 10, "dataset_type": "prefix_cache", "prefix_num": "1",
+                  "repeat_rate": "0.9", "prefix_test": True}
+        expected = [{**common, "name": "0_ai_coding_64k256", "output_len": "256"},
+                    {**common, "name": "0_ai_coding_64k1k", "output_len": "1024"}]
+        result, payload = self.run_prefix(default=True)
+        self.assert_success(result, payload)
+        self.assertEqual(payload["scenarios"], expected)
+        self.assertEqual((len(payload["fixed"]), len(payload["peak"])), (10, 2))
+        self.assertIsNone(payload["exported_scenarios"])
+
+    def test_selected_file_and_immediate_edits_override_inherited_json(self):
+        for name, count in (("first_file", 2), ("edited_file", 4)):
+            scenarios = [self.scenario(name=name, concurrency=[count])]
+            result, payload = self.run_prefix(self.block(scenarios), options={
+                "SCENARIOS_JSON": self.block([self.scenario(name="stale_environment")])})
+            self.assert_success(result, payload)
+            self.assertEqual(payload["scenarios"], scenarios)
+            self.assertEqual(payload["fixed"][0].split("|", 1)[0], name + "_c" + str(count))
+            args = shlex.split(payload["fixed"][0].split("|", 1)[1])
+            self.assertEqual(args[args.index("--data_num") + 1], str(count * 7))
+            self.assertIsNone(payload["exported_scenarios"])
+
+    def test_file_read_does_not_source_shell_or_scalar_configuration(self):
+        marker = self.root / "must_not_execute"
+        content = ('export HOST_IP=file-host.invalid\n'
+                   + "touch " + shlex.quote(marker.as_posix()) + "\n"
+                   + self.block([self.scenario()]))
+        result, payload = self.run_prefix(content)
+        self.assert_success(result, payload)
+        self.assertEqual(payload["host"], "environment-host.invalid")
+        self.assertFalse(marker.exists(), "scenario file must be read, never executed")
+
+    def test_scenario_json_remains_unexported_when_allexport_is_enabled(self):
+        result, payload = self.run_prefix(self.block([self.scenario()]), allexport=True)
+        self.assert_success(result, payload)
+        self.assertIsNone(payload["exported_scenarios"])
+
+    def test_sourcing_public_env_retains_json_without_exporting_to_children(self):
+        from validate_addon import find_bash, read_scenarios_file, run_bash_code
+        bash = find_bash()
+        if not bash:
+            self.skipTest("Bash unavailable; public env source contract was not executed")
+        copied = self.root / "source scenarios.env"
+        copied.write_bytes((ADD_DIR / "env.env").read_bytes())
+        interpreter = shlex.quote(sys.executable.replace("\\", "/"))
+        for setup in ("export SCENARIOS_JSON=stale_environment\n", "set -a\n",
+                      "export SCENARIOS_JSON=stale_environment\nset -a\n"):
+            with self.subTest(setup=setup):
+                code = 'python3() { ' + interpreter + ' "$@"; }\n' + setup
+                code += 'source "$PUBLIC_ENV_PATH"\n'
+                code += '''python3 - "$SCENARIOS_JSON" <<'PY'
+import json, os, sys
+print(json.dumps({'scenarios': json.loads(sys.argv[1]),
+                  'exported': os.environ.get('SCENARIOS_JSON')}))
+PY
+'''
+                process = run_bash_code(bash, code, env={**os.environ, "PUBLIC_ENV_PATH": copied.as_posix()})
+                self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+                payload = json.loads(process.stdout)
+                self.assertEqual(payload["scenarios"], read_scenarios_file())
+                self.assertIsNone(payload["exported"])
+
+    def test_file_concurrency_repetitions_remain_ordered_and_separate(self):
+        values = [1, 10, 10, 20, 20, 50, 100, "max"]
+        result, payload = self.run_prefix(self.block([self.scenario(concurrency=values)]))
+        self.assert_success(result, payload)
+        self.assertEqual([line.split("|", 1)[0] for line in payload["fixed"]], [
+            "file_config_c1", "file_config_c10", "file_config_c10_run2", "file_config_c20",
+            "file_config_c20_run2", "file_config_c50", "file_config_c100"])
+        self.assertEqual(len(payload["peak"]), 1)
+
+    def test_missing_multiple_malformed_blocks_and_json_fail_before_docker(self):
+        valid = self.block([self.scenario()])
+        cases = (("missing block", "export HOST_IP=unused\n"),
+                 ("multiple blocks", valid + valid),
+                 ("unterminated block", valid.replace("\nJSON\n)", "\nJSON")),
+                 ("unquoted delimiter", valid.replace("<<'JSON'", "<<JSON")),
+                 ("malformed JSON", "SCENARIOS_JSON=$(cat <<'JSON'\n[broken]\nJSON\n)\n"),
+                 ("wrong JSON root", self.block({"name": "object"})),
+                 ("empty scenario list", self.block([])))
+        for label, content in cases:
+            with self.subTest(label=label):
+                result, payload = self.run_prefix(content)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIsNone(payload)
+                self.assertNotIn("UNEXPECTED_DOCKER_CALL", result.stdout)
+                self.assertRegex(result.stdout + result.stderr, r"SCENARIOS|ValueError|JSONDecodeError")
+        result, payload = self.run_prefix(missing=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNone(payload)
+        self.assertNotIn("UNEXPECTED_DOCKER_CALL", result.stdout)
+
+    def test_legacy_override_even_empty_fails_with_migration_instruction(self):
+        for value in ("", "[]", json.dumps([self.scenario(name="old_override")])):
+            with self.subTest(value=value):
+                result, payload = self.run_prefix(self.block([self.scenario()]),
+                                                  options={"SCENARIOS_JSON_OVERRIDE": value})
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIsNone(payload)
+                self.assertNotIn("UNEXPECTED_DOCKER_CALL", result.stdout)
+                message = result.stdout + result.stderr
+                self.assertIn("SCENARIOS_JSON_OVERRIDE", message)
+                self.assertIn("env", message)
+
+
 class ProductionModeContracts(IsolatedTest):
     def fragment(self, name):
         source = (ADD_DIR / "run_perf_scenarios.sh").read_text(encoding="utf-8")
