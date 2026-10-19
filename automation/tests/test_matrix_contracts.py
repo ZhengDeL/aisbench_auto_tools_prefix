@@ -1,4 +1,4 @@
-"""Offline contracts: python -B -m unittest discover -s add -p test_matrix_contracts.py.
+"""Offline contracts: python -B -m unittest discover -s automation/tests -p test_matrix_contracts.py.
 
 Uses synthetic CSVs and a tiny Python child process, with no model, Docker,
 tokenizer, network, or repository runtime configuration access.
@@ -21,13 +21,59 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
-ADD_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(ADD_DIR))
+AUTOMATION_ROOT = Path(__file__).resolve().parent.parent
+CORE_ROOT = AUTOMATION_ROOT / 'core'
+TOOLS_ROOT = AUTOMATION_ROOT / 'tools'
+RELEASE_ROOT = AUTOMATION_ROOT.parent
+for folder in (CORE_ROOT, TOOLS_ROOT):
+    sys.path.insert(0, str(folder))
+ADD_DIR = CORE_ROOT
+PROJECT_ROOT = RELEASE_ROOT
 import aisbench_perf_matrix as matrix
 import aisbench_result_adapter as adapter
 import aisbench_artifact_archive as archive_tools
-import validate_e2e_outputs as e2e
-import validate_result_integrity as integrity
+import aisbench_result_validation as integrity
+from aisbench_configuration import (ENV_DEFAULTS, PUBLIC_ENV_NAMES, BOOLEAN_OPTIONS, VALUE_OPTIONS,
+                                    build_plan, effective_environment, native_options, read_scenarios)
+
+
+def find_bash():
+    bundled = Path('C:/Program Files/Git/bin/bash.exe')
+    return str(bundled) if os.name == 'nt' and bundled.is_file() else shutil.which('bash')
+
+
+def run_bash_code(bash, code, *, env, timeout=45):
+    with tempfile.TemporaryDirectory(prefix='matrix_bash_') as directory:
+        script = Path(directory) / 'check.sh'
+        script.write_bytes(code.encode('utf-8'))
+        return subprocess.run([bash, '-uo', 'pipefail', str(script)], env=env, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
+
+def read_scenarios_file(path=PROJECT_ROOT / 'env.env'):
+    return read_scenarios(path)
+
+
+def production_plan(scenarios, overrides=None):
+    with tempfile.TemporaryDirectory(prefix='matrix_plan_') as directory:
+        path = Path(directory) / 'scenarios.env'
+        path.write_bytes(("SCENARIOS_JSON=$(cat <<'JSON'\n" + json.dumps(scenarios) + '\nJSON\n)\n').encode('utf-8'))
+        environment = {name: os.environ[name] for name in PUBLIC_ENV_NAMES if name in os.environ}
+        environment.update(overrides or {})
+        return build_plan(effective_environment(environment, PROJECT_ROOT), path)
+
+
+def expand_scenarios_for_simulation(scenarios):
+    plan = production_plan(scenarios)
+    quote_args = lambda args: ' '.join(shlex.quote(str(value)) for value in args)
+    fixed = [item['name'] + '|' + quote_args(item['args']) for item in plan['fixed']]
+    peaks = []
+    for item in plan['peak']:
+        values = [item['name'], item['input_len'], item['output_len'], item['min_cc'], item['max_cc'],
+                  item['multiplier'], item['request_rate'], item['ttft'], item['tpot'], item['wait'],
+                  quote_args(item['extra_args'])]
+        peaks.append('|'.join(map(str, values)))
+    return fixed, peaks
 
 
 BASE_CASE = dict(
@@ -229,7 +275,6 @@ class ArchiveLookupContracts(IsolatedTest):
     def assert_lookup(self, scenario, current_time, expected):
         outputs = self.root / "outputs"
         self.assertEqual(integrity.find_archive(outputs, scenario, current_time), expected)
-        self.assertEqual(e2e.find_latest_fixed_archive(outputs, scenario, current_time), expected)
 
     def test_quoted_glob_name_and_sanitized_collision_use_manifest_identity(self):
         scenario = 'quoted, "name"[*]?_c1'
@@ -268,7 +313,7 @@ class ArchiveLookupContracts(IsolatedTest):
         (path / "aisbench_result.csv").write_text("bad header\n", encoding="utf-8")
         self.assert_lookup(scenario, "offline", None)
 
-    def test_both_validator_entrypoints_match_each_quoted_row_time(self):
+    def test_validator_entrypoint_matches_each_quoted_row_time(self):
         scenario = 'entrypoint, "case"[*]?_c1'
         _, old = self.make_archive(scenario, "2026-01-01 12:34:56", "a_old")
         _, newer = self.make_archive(scenario, "2026-01-01 12:34:57", "z_new")
@@ -286,17 +331,17 @@ class ArchiveLookupContracts(IsolatedTest):
 
         for invalid in (False, True):
             write_final([old, newer] if not invalid else [{**old, "current_time": "unmatched"}])
-            for filename in ("validate_e2e_outputs.py", "validate_result_integrity.py"):
+            for filename in ("aisbench_result_validation.py",):
                 with self.subTest(validator=filename, invalid_time=invalid):
                     process = subprocess.run(
-                        [sys.executable, "-B", str(ADD_DIR / filename), "--result-dir", str(result_dir),
+                        [sys.executable, "-B", str(CORE_ROOT / filename), "--result-dir", str(result_dir),
                          "--host-output-dir", str(self.root / "outputs")], text=True, capture_output=True,
                     )
                     self.assertEqual(process.returncode, 1 if invalid else 0, process.stdout + process.stderr)
                     if invalid:
                         self.assertIn("FAIL", process.stdout)
 
-    def test_text_archive_context_reaches_both_real_validator_clis(self):
+    def test_text_archive_context_reaches_real_validator_cli(self):
         scenario = 'text, "case"_c1'
         path, _ = self.make_archive(scenario, "offline_text", "text", test_type="text",
                                    latency_values={"TTFT avg": "15974.2", "TTFT P90": "16868.5",
@@ -311,8 +356,8 @@ class ArchiveLookupContracts(IsolatedTest):
             writer = csv.DictWriter(handle, fieldnames=integrity.CSV_COLUMNS)
             writer.writeheader()
             writer.writerow({"scenario": scenario, **normalized, "repeat_rate": "0", "status": "passed"})
-        for filename in ("validate_e2e_outputs.py", "validate_result_integrity.py"):
-            process = subprocess.run([sys.executable, "-B", str(ADD_DIR / filename), "--result-dir", str(results),
+        for filename in ("aisbench_result_validation.py",):
+            process = subprocess.run([sys.executable, "-B", str(CORE_ROOT / filename), "--result-dir", str(results),
                                       "--host-output-dir", str(self.root / "outputs")], text=True, capture_output=True)
             self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         manifest_path = path / "archive_manifest.json"
@@ -404,19 +449,27 @@ class ParameterContracts(IsolatedTest):
 
     def test_effective_known_arguments_validate_and_extensions_pass_through(self):
         invalid = (["--npu_num", "0"], ["--dp=0"], ["--prefix_num", "-1"], ["--repeat", "0"],
-                   ["--length_mean", "2"], ["--length_min", "3", "--length_max", "2"],
+                   ["--length_mean", "2"],
                    ["--length_mean", "2", "--length_std", "nan"], ["--repeat_rate", "101%"],
                    ["--test_type", "typo"], ["--dataset_type", "typo"], ["--prefix_test=false"])
         for tokens in invalid:
             with self.subTest(tokens=tokens), self.assertRaises(ValueError):
                 matrix.validate_aisbench_arguments(tokens)
         for tokens in (["--npu_num", "0", "--npu_num=2"], ["--repeat_rate", "50%"],
-                       ["--new_extension", "preserved"], ["--seed", "-1"]):
+                       ["--new_extension", "preserved"], ["--seed", "-1"],
+                       ["--length_min", "3", "--length_max", "2"]):
             with self.subTest(tokens=tokens):
                 matrix.validate_aisbench_arguments(tokens)
         loaded = self.load(extra_cli=["--new_extension", "preserved"])
         command = matrix.build_run_command(loaded, loaded.cases[0], 2, 2)
         self.assertEqual(command[command.index("--new_extension") + 1], "preserved")
+
+    def test_reversed_length_bounds_are_preserved_for_native_normalization(self):
+        # The pinned native implementation swaps reversed bounds itself.
+        loaded = self.load(extra_cli=["--length_min", "3", "--length_max", "2"])
+        command = matrix.build_run_command(loaded, loaded.cases[0], 2, 2)
+        self.assertEqual(command[command.index("--length_min") + 1], "3")
+        self.assertEqual(command[command.index("--length_max") + 1], "2")
 
     def test_peak_rejects_text_and_single_token_before_any_case_runs(self):
         for case in ({**BASE_CASE, "output_len": 1},
@@ -449,7 +502,6 @@ class ParameterContracts(IsolatedTest):
 
 class RepeatedConcurrencyContracts(IsolatedTest):
     def expand(self, values, **changes):
-        from validate_addon import expand_scenarios_for_simulation
         scenario = dict(name="repeat", input_len=16, output_len=4, request_rate=0,
                         concurrency=values, **changes)
         with patch.dict(os.environ, {"DATA_NUM_MULTIPLIER": "7"}):
@@ -481,7 +533,6 @@ class RepeatedConcurrencyContracts(IsolatedTest):
                     self.assertEqual(args[args.index("--data_num") + 1], str(extra.get("data_num", concurrency * 7)))
 
     def test_duplicate_max_and_cross_scenario_collisions_remain_invalid(self):
-        from validate_addon import expand_scenarios_for_simulation
         with self.assertRaises(ValueError):
             self.expand([1, "max", 1, "max"])
         for names in (("same", "same"), ("same.name", "same_name")):
@@ -489,100 +540,50 @@ class RepeatedConcurrencyContracts(IsolatedTest):
                 expand_scenarios_for_simulation([
                     {"name": name, "concurrency": [1, 1]} for name in names])
 
-    def test_real_shell_batch_keeps_repeated_csv_rows_and_archives(self):
-        from validate_addon import find_bash, run_bash_code
-        bash = find_bash()
-        if not bash:
-            self.skipTest("Bash unavailable; no Docker or model requests are used")
-        fixed, peak = self.expand([1, 10, 10, 20, 20, 50, 100, "max"])
-        source = (ADD_DIR / "run_perf_scenarios.sh").read_text(encoding="utf-8")
-        tail = source[source.index("######################## 4. 循环执行固定"):]
-        helpers = []
-        for name in ("append_empty_result", "append_source_result", "read_request_counts"):
-            match = re.search(r"^" + name + r"\(\) \{\n.*?^\}[ \t]*$", source, re.M | re.S)
-            self.assertIsNotNone(match)
-            helpers.append(match.group(0))
-        tools = self.root / "tools"
-        add = tools / "add"
-        add.mkdir(parents=True)
-        for name in ("aisbench_artifact_archive.py", "aisbench_result_adapter.py"):
-            shutil.copy2(ADD_DIR / name, add / name)
-        output = self.root / "output"
-        results = output / "scenario_results" / "offline"
-        results.mkdir(parents=True)
-        calls = self.root / "calls.jsonl"
-        row = source_row()
-        row.update(input_len="16", output_len="4", rr="0")
-        stub = """import argparse, csv, json, os
-from pathlib import Path
-p = argparse.ArgumentParser()
-for name in ('concurrency', 'data_num'):
-    p.add_argument('--' + name, type=int, required=True)
-a, _ = p.parse_known_args()
-calls = Path(os.environ['MOCK_CALLS'])
-index = len(calls.read_text().splitlines()) + 1 if calls.exists() else 1
-with calls.open('a', encoding='utf-8') as f:
-    f.write(json.dumps({'concurrency': a.concurrency, 'data_num': a.data_num}) + '\\n')
-row = BASE_ROW.copy()
-row.update(current_time='offline_' + str(index), total_req=str(a.data_num),
-           max_cc=str(a.concurrency), cc=str(a.concurrency), qps=str(index))
-with open('aisbench_result.csv', 'w', newline='', encoding='utf-8') as f:
-    w = csv.DictWriter(f, fieldnames=list(row)); w.writeheader(); w.writerow(row)
-Path('aisbench.log').write_text('round=' + str(index), encoding='utf-8')
-print('Failed Requests: 0')
-print('Success Requests: ' + str(a.data_num))
-"""
-        (tools / "aisbench_test.py").write_bytes(("BASE_ROW = " + repr(row) + "\n" + stub).encode("utf-8"))
-        peak_stub = """import argparse, json, os
-from pathlib import Path
-p = argparse.ArgumentParser()
-for name in ('run-tag', 'case-name'):
-    p.add_argument('--' + name, required=True)
-a, _ = p.parse_known_args()
-root = Path(os.environ['MOCK_OUTPUT_ROOT']) / ('peak_' + a.case_name + '_' + a.run_tag)
-root.mkdir(parents=True)
-row = BASE_ROW.copy()
-row.update(concurrency=2, passed='yes')
-(root / 'peak_search_report.json').write_text(json.dumps({'best': [row]}), encoding='utf-8')
-"""
-        (add / "aisbench_perf_matrix.py").write_bytes(("BASE_ROW = " + repr(row) + "\n" + peak_stub).encode("utf-8"))
-        interpreter = shlex.quote(sys.executable.replace("\\", "/"))
-        prefix = ("python3() { " + interpreter + ' "$@"; }\nexport -f python3\n'
-                  'log() { printf "%s\\n" "$*"; }\nfail() { log "ERROR: $*"; exit 1; }\n'
-                  'docker() {\n'
-                  ' [ "$1" = exec ] || return 91\n shift\n'
-                  ' [ "$1" != -i ] || shift\n shift\n'
-                  ' if [ "$1" = bash ]; then shift 2; "$BASH" -c "$1"; else "$@"; fi\n}\n'
-                  + "\n".join(helpers) + "\n")
-        env = {**os.environ, "FIXED_COUNT": str(len(fixed)), "PEAK_COUNT": "1", "TOTAL_TESTS": "8",
-               "COMBOS": "\n".join(fixed), "PEAK_COMBOS": "\n".join(peak), "RUN_TIMESTAMP": "offline",
-               "HOST_OUTPUT_DIR": output.as_posix(), "RESULTS_HOST_DIR": results.as_posix(),
-               "RESULTS_CSV": (results / "all_results.csv").as_posix(), "RESULTS_LOG": (results / "execution.log").as_posix(),
-               "WORK_PATH_DETECTED": add.as_posix(), "TOOL_ROOT": tools.as_posix(),
-               "CONTAINER_NAME": "offline", "CURRENT_ID": "offline", "CONTAINER_OUTPUT_DIR": output.as_posix(),
-               "HOST_IP": "localhost", "HOST_PORT": "8000", "API_URL": "", "FAILED_REQ_LIMIT": "0",
-               "NPU_NUM": "1", "PEAK_HARD_CAP": "0", "MOCK_CALLS": str(calls), "MOCK_OUTPUT_ROOT": str(output)}
-        process = run_bash_code(bash, prefix + tail, env=env, timeout=90)
-        self.assertEqual(process.returncode, 0, process.stdout[-6000:] + process.stderr)
-        invoked = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(invoked, [{"concurrency": cc, "data_num": cc * 7} for cc in [1, 10, 10, 20, 20, 50, 100]])
-        with (results / "all_results.csv").open(encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            summary = list(reader)
-            self.assertEqual(len(reader.fieldnames), 23)
-        expected_names = [line.split("|", 1)[0] for line in fixed]
-        self.assertEqual([r["scenario"] for r in summary], expected_names + ["repeat_peak"])
-        self.assertEqual([r["status"] for r in summary], ["passed"] * 7 + ["peak"])
-        self.assertEqual(len(set(r["scenario"] for r in summary)), 8)
-        manifests = list(output.glob("performance_*/archive_manifest.json"))
-        self.assertEqual(len(manifests), 7)
-        archived = {json.loads(p.read_text(encoding="utf-8"))["archive_name"]: p.parent for p in manifests}
-        self.assertEqual(set(archived), set(expected_names))
-        for index, entry in enumerate(summary[:7], 1):
-            path = archived[entry["scenario"]]
-            self.assertEqual((path / "aisbench.log").read_text(encoding="utf-8"), "round=" + str(index))
-            with (path / "aisbench_result.csv").open(encoding="utf-8", newline="") as f:
-                self.assertEqual(next(csv.DictReader(f)), {key: entry[key] for key in adapter.CANONICAL_COLUMNS})
+    def test_real_worker_batch_keeps_repeated_csv_rows_and_archives(self):
+        from aisbench_configuration import effective_environment
+        from aisbench_worker import Worker
+        from aisbench_execution import execute_native
+        scenes=[dict(name='repeat',input_len=16,output_len=4,concurrency=[1,10,10,20,20,50,100,'max'])]
+        with patch.dict(os.environ, {'DATA_NUM_MULTIPLIER':'7'}):
+            plan=production_plan(scenes)
+        native=self.root/'native-fixture'; native.mkdir()
+        source=source_row()
+        source.update(input_len='16',output_len='4',rr='0')
+        program=("import argparse,csv\nfrom pathlib import Path\n"
+                 "p=argparse.ArgumentParser()\np.add_argument('--concurrency',type=int)\np.add_argument('--data_num',type=int)\na,_=p.parse_known_args()\n"
+                 + "row="+repr(source)+"\n"
+                 "row.update(current_time='round_'+str(a.concurrency),total_req=str(a.data_num),max_cc=str(a.concurrency),cc=str(a.concurrency))\n"
+                 "with open('aisbench_result.csv','w',newline='') as h:\n w=csv.DictWriter(h,fieldnames=list(row));w.writeheader();w.writerow(row)\n"
+                 "print('Success Requests: '+str(a.data_num))\nprint('Failed Requests: 0')\n")
+        (native/'aisbench_test.py').write_text(program,encoding='utf-8')
+        before={p.name:p.read_bytes() for p in native.iterdir()}
+        values=effective_environment({'TOOLS_HOST_DIR':str(native),'HOST_OUTPUT_DIR':str(self.root/'output'),
+                                      'MODEL_HOST_PATH':str(self.root/'model')},PROJECT_ROOT)
+        worker=Worker(values,plan)
+        calls=[]
+        def run_container(arguments, timeout):
+            boundary=arguments.index('--')
+            forwarded=arguments[boundary+1:]
+            evidence=worker.host_path(arguments[arguments.index('--evidence-dir')+1])
+            report=execute_native(native,evidence,forwarded,timeout=30)
+            calls.append((int(forwarded[forwarded.index('--concurrency')+1]),int(forwarded[forwarded.index('--data_num')+1])))
+            return 0 if report['state']=='PASS' else 1
+        try:
+            with patch.object(worker,'run_container',side_effect=run_container):
+                for number,scene in enumerate(plan['fixed'],1):
+                    worker.index=number
+                    self.assertTrue(worker.fixed(scene))
+        finally:
+            worker.human.close();worker.events.close()
+        self.assertEqual(calls,[(cc,cc*7) for cc in [1,10,10,20,20,50,100]])
+        with (worker.result/'all_results.csv').open(newline='',encoding='utf-8') as handle:
+            rows=list(csv.DictReader(handle))
+        self.assertEqual([row['scenario'] for row in rows],[item['name'] for item in plan['fixed']])
+        self.assertEqual([row['status'] for row in rows],['passed']*7)
+        self.assertEqual(len(adapter.load_scope_index(worker.result)),7)
+        self.assertEqual(len(list(worker.result.glob('fixed_*/evaluation.json'))),7)
+        self.assertEqual(before,{p.name:p.read_bytes() for p in native.iterdir()})
 
 
 class ScenarioFileContracts(IsolatedTest):
@@ -596,51 +597,38 @@ class ScenarioFileContracts(IsolatedTest):
                 "concurrency": [1], "request_rate": 0, **changes}
 
     def run_prefix(self, content=None, *, default=False, options=None, missing=False, allexport=False):
-        """Execute the real shell preflight with Docker forbidden and no service."""
-        from validate_addon import find_bash
-        bash = find_bash()
-        if not bash:
-            self.skipTest("Bash unavailable; scenario file parsing was not executed")
-        source = (ADD_DIR / "run_perf_scenarios.sh").read_text(encoding="utf-8")
-        prefix = source[:source.index("######################## 0. 初始化结果保存目录")]
-        add = self.root / "isolated checkout" / "add"
-        add.mkdir(parents=True, exist_ok=True)
-        config_path = add / "env.env" if default else self.root / "selected scenarios.env"
+        # Exercise the actual structured worker preflight in a real child.
+        # Its report is generated before any Docker/container operation.
+        config_path = self.root / ('default.env' if default else 'selected scenarios.env')
         if content is None:
-            content = (ADD_DIR / "env.env").read_text(encoding="utf-8")
+            content = (PROJECT_ROOT / 'env.env').read_text(encoding='utf-8')
         if not missing:
-            config_path.write_bytes(content.encode("utf-8"))
-        elif config_path.exists():
-            config_path.unlink()
-        interpreter = shlex.quote(sys.executable.replace("\\", "/"))
-        prelude = ('set -a\n' if allexport else '') + ('python3() { ' + interpreter + ' "$@"; }\n'
-                   'docker() { echo UNEXPECTED_DOCKER_CALL; return 88; }\n')
-        tail = '''
-python3 - "$COMBOS" "$PEAK_COMBOS" "$SCENARIOS_JSON" "$HOST_IP" <<'PY'
-import json, os, sys
-print('FILE_CONTRACT=' + json.dumps({
-    'fixed': sys.argv[1].splitlines(), 'peak': sys.argv[2].splitlines(),
-    'scenarios': json.loads(sys.argv[3]), 'host': sys.argv[4],
-    'exported_scenarios': os.environ.get('SCENARIOS_JSON'),
-}))
-PY
-'''
-        script = add / "run_perf_scenarios.sh"
-        script.write_bytes((prelude + prefix + tail).encode("utf-8"))
-        env = {**os.environ, "AISBENCH_MANAGED_WORKER": "1", "NPU_NUM": "1", "DATA_NUM_MULTIPLIER": "7", "PEAK_HARD_CAP": "0",
-               "MAX_CONTEXT_LEN": "512000", "PEAK_MIN_CONCURRENCY": "1", "PEAK_MAX_MULTIPLIER": "20",
-               "PEAK_DATA_MULTIPLIER": "4", "PEAK_WAIT_SECONDS": "0", "PEAK_TTFT_LIMIT": "5",
-               "PEAK_TPOT_LIMIT": "50", "FAILED_REQ_LIMIT": "0", "HOST_IP": "environment-host.invalid"}
-        env.pop("SCENARIOS_JSON_OVERRIDE", None)
-        env.pop("SCENARIOS_JSON", None)
+            config_path.write_bytes(content.encode('utf-8'))
+        model = self.root / 'model'
+        model.mkdir(exist_ok=True)
+        env = {**os.environ, 'AISBENCH_MANAGED_WORKER':'1', 'NPU_NUM':'1',
+               'DATA_NUM_MULTIPLIER':'7', 'PEAK_HARD_CAP':'0', 'MAX_CONTEXT_LEN':'512000',
+               'PEAK_MIN_CONCURRENCY':'1', 'PEAK_MAX_MULTIPLIER':'20', 'PEAK_DATA_MULTIPLIER':'4',
+               'PEAK_WAIT_SECONDS':'0', 'PEAK_TTFT_LIMIT':'5', 'PEAK_TPOT_LIMIT':'50',
+               'FAILED_REQ_LIMIT':'0', 'HOST_IP':'environment-host.invalid',
+               'TOOLS_HOST_DIR':str(PROJECT_ROOT/'aisbench_auto_tools_prefix'),
+               'MODEL_HOST_PATH':str(model), 'HOST_OUTPUT_DIR':str(self.root/'unused-output'),
+               'AISBENCH_PREFLIGHT_REPORT':str(self.root/'preflight.json')}
+        env.pop('SCENARIOS_JSON_OVERRIDE', None)
+        env.pop('SCENARIOS_JSON', None)
         env.update(options or {})
-        command = [bash, "-uo", "pipefail", script.as_posix()]
-        if not default:
-            command.append(config_path.as_posix())
-        result = subprocess.run(command, cwd=self.root, env=env, text=True, capture_output=True, timeout=45)
-        payloads = [line[len("FILE_CONTRACT="):] for line in result.stdout.splitlines()
-                    if line.startswith("FILE_CONTRACT=")]
-        return result, json.loads(payloads[-1]) if payloads else None
+        code = "import os,sys,json,shlex\nsys.path.insert(0," + repr(str(ADD_DIR)) + ")\n"
+        code += "from aisbench_configuration import effective_environment,build_plan,read_scenarios\nimport aisbench_worker as worker\n"
+        code += "sys.argv=['worker'," + repr(str(config_path)) + "]\nrc=worker.main()\n"
+        code += "if rc==0:\n values=effective_environment(dict(os.environ),worker.RELEASE_ROOT)\n plan=build_plan(values,__import__('pathlib').Path(sys.argv[1]))\n"
+        code += " fixed=[s['name']+'|'+' '.join(shlex.quote(token) for token in s['args']) for s in plan['fixed']]\n"
+        code += " peak=[s['name']+'|'+str(s['min_cc'])+'|'+str(s['max_cc']) for s in plan['peak']]\n"
+        code += " print('FILE_CONTRACT='+json.dumps(dict(fixed=fixed,peak=peak,scenarios=read_scenarios(__import__('pathlib').Path(sys.argv[1])),host=values['HOST_IP'],exported_scenarios=os.environ.get('SCENARIOS_JSON'))))\n"
+        code += "sys.exit(rc)\n"
+        process = subprocess.run([sys.executable,'-B','-c',code], cwd=self.root, env=env,
+                                 text=True,capture_output=True,timeout=45)
+        payloads=[line[len('FILE_CONTRACT='):] for line in process.stdout.splitlines() if line.startswith('FILE_CONTRACT=')]
+        return process, json.loads(payloads[-1]) if payloads else None
 
     def assert_success(self, result, payload):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -689,12 +677,11 @@ PY
         self.assertIsNone(payload["exported_scenarios"])
 
     def test_sourcing_public_env_retains_json_without_exporting_to_children(self):
-        from validate_addon import find_bash, read_scenarios_file, run_bash_code
         bash = find_bash()
         if not bash:
             self.skipTest("Bash unavailable; public env source contract was not executed")
         copied = self.root / "source scenarios.env"
-        copied.write_bytes((ADD_DIR / "env.env").read_bytes())
+        copied.write_bytes((PROJECT_ROOT / "env.env").read_bytes())
         interpreter = shlex.quote(sys.executable.replace("\\", "/"))
         for setup in ("export SCENARIOS_JSON=stale_environment\n", "set -a\n",
                       "export SCENARIOS_JSON=stale_environment\nset -a\n"):
@@ -757,26 +744,42 @@ PY
 
 
 class ProductionModeContracts(IsolatedTest):
+    def test_public_help_does_not_load_configuration_or_start_a_batch(self):
+        environment = dict(os.environ, SCENARIOS_JSON_OVERRIDE='must not be read')
+        before = set((PROJECT_ROOT / 'outputs/default').glob('*/batch_state.json'))
+        result = subprocess.run([find_bash(), (PROJECT_ROOT / 'run_perf_scenarios.sh').as_posix(), '--help'],
+            cwd=str(self.root), env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Python 3.7+', result.stdout)
+        self.assertIn('无需单独 source', result.stdout)
+        self.assertEqual(set((PROJECT_ROOT / 'outputs/default').glob('*/batch_state.json')), before)
+
+    def test_interpreter_failure_stops_before_loading_configuration(self):
+        entry = shlex.quote((PROJECT_ROOT / 'run_perf_scenarios.sh').as_posix())
+        code = ("python3() { printf '%s\\n' 'sentinel: interpreter unavailable' >&2; return 1; }\n"
+                "export -f python3\nbash " + entry + "\n")
+        environment = dict(os.environ, SCENARIOS_JSON_OVERRIDE='must not be read')
+        result = run_bash_code(find_bash(), code, env=environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('sentinel: interpreter unavailable', result.stderr)
+        self.assertNotIn('SCENARIOS_JSON_OVERRIDE', result.stderr)
+
     def fragment(self, name):
-        source = (ADD_DIR / "run_perf_scenarios.sh").read_text(encoding="utf-8")
+        source = (PROJECT_ROOT / "run_perf_scenarios.sh").read_text(encoding="utf-8")
         match = re.search(re.escape(name) + r"=\$\(python3 -[^\n]*<<'PY'\n(.*?)^PY$", source, re.M | re.S)
         self.assertIsNotNone(match, name)
         return match.group(1)
 
     def test_fixed_mode_is_parsed_from_effective_command_and_forwarded(self):
-        source = self.fragment("SCENARIO_TEST_TYPE")
-        for command, expected in (("--data_num 1", "stream"), ("--test_type text", "text"),
-                                  ("--test_type stream --test_type=text --future_option 'two words'", "text")):
-            process = subprocess.run([sys.executable, "-c", source, command], text=True, capture_output=True)
-            self.assertEqual(process.returncode, 0, process.stderr)
-            self.assertEqual(process.stdout.strip(), expected)
-        process = subprocess.run([sys.executable, "-c", source, "--test_type typo"], text=True, capture_output=True)
-        self.assertNotEqual(process.returncode, 0)
-        shell = (ADD_DIR / "run_perf_scenarios.sh").read_text(encoding="utf-8")
-        self.assertEqual(shell.count("--test-type '$SCENARIO_TEST_TYPE'"), 2)
+        for mode in ('stream','text'):
+            plan=production_plan([dict(name='mode',input_len=16,output_len=4,concurrency=[4],test_type=mode)])
+            arguments=plan['fixed'][0]['args']
+            self.assertEqual(arguments[arguments.index('--test_type')+1],mode)
+            self.assertEqual(plan['fixed'][0]['test_type'],mode)
+        with self.assertRaises(ValueError):
+            production_plan([dict(name='mode',test_type='typo')])
 
     def test_real_shell_preflight_rejects_peak_text_and_one_token(self):
-        from validate_addon import expand_scenarios_for_simulation
         for changes in ({"test_type": "text", "output_len": 1024}, {"output_len": 1}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 expand_scenarios_for_simulation([{"name": "invalid_peak", "input_len": 16, "concurrency": ["max"], **changes}])
@@ -785,25 +788,21 @@ class ProductionModeContracts(IsolatedTest):
             self.assertEqual((len(fixed), len(peak)), (1, 0))
 
     def test_actual_endpoint_display_uses_url_and_redacts_sensitive_parts(self):
-        source = self.fragment("DISPLAY_ENDPOINT")
-        cases = (("", "fallback.invalid:9"),
-                 ("https://api.example.invalid:8443/v1/chat/completions", "https://api.example.invalid:8443/v1/chat/completions"),
-                 ("https://user:private-value@api.example.invalid:8443/v1?key=private-value#private-value", "https://api.example.invalid:8443/v1"),
-                 ("https://api.example.invalid/v1?key=private-value", "https://api.example.invalid/v1"),
-                 ("not a valid URL", "API_URL (invalid)"))
-        for url, expected in cases:
-            with self.subTest(url=url):
-                process = subprocess.run([sys.executable, "-c", source, url, "fallback.invalid", "9"], text=True, capture_output=True)
-                self.assertEqual(process.returncode, 0, process.stderr)
-                self.assertEqual(process.stdout.strip(), expected)
-                self.assertNotIn("private-value", process.stdout)
+        from aisbench_run_manager import service_authority, RunError
+        for url,expected in (('', 'http://fallback.invalid:9'),
+             ('https://api.example.invalid:8443/v1/chat/completions','https://api.example.invalid:8443'),
+             ('https://user:private-value@api.example.invalid:8443/v1?key=private-value#private-value','https://api.example.invalid:8443')):
+            display,_=service_authority(url,'fallback.invalid','9')
+            self.assertEqual(display,expected)
+            self.assertNotIn('private-value',display)
+        with self.assertRaises(RunError):
+            service_authority('not a valid URL','fallback.invalid','9')
 
     def test_public_env_is_actually_sourced_without_carriage_returns(self):
-        from validate_addon import find_bash, run_bash_code
         bash = find_bash()
         if not bash:
             self.skipTest("Bash is required to execute the public environment contract")
-        content = (ADD_DIR / "env.env").read_bytes()
+        content = (PROJECT_ROOT / "env.env").read_bytes()
         self.assertNotIn(b"\r", content)
         self.assertFalse(content.startswith(b"\xef\xbb\xbf"), "public shell environment must not contain a UTF-8 BOM")
         copied = self.root / "public.env"
@@ -840,7 +839,9 @@ class EvaluationContracts(IsolatedTest):
         self.assertEqual(matrix.parse_success_requests(path), 0)
 
     def test_real_child_evaluation_fails_closed_for_missing_counters(self):
-        script = self.root / "synthetic_benchmark.py"
+        native = self.root / "native"
+        native.mkdir()
+        script = native / "synthetic_benchmark.py"
         logger = logging.getLogger("aisbench-offline-child")
         logger.addHandler(logging.NullHandler())
         runner = config(failed=2)
@@ -851,10 +852,11 @@ class EvaluationContracts(IsolatedTest):
                  ("Success Requests: 1", False),
                  ("Failed Requests: unknown\nSuccess Requests: 1", False),
                  ("Failed Requests: 0\nSuccess Requests: 0", False))
-        with patch.object(matrix, "BASE_DIR", self.root), patch.object(matrix, "AISBENCH_TEST_SCRIPT", script):
+        with patch.object(matrix, "BASE_DIR", native), patch.object(matrix, "AISBENCH_TEST_SCRIPT", script):
             for sequence, (text, passed) in enumerate(cases, 1):
                 with self.subTest(log=text):
                     row = source_row()
+                    row["total_req"] = "1"
                     script.write_text("import csv\nwith open('aisbench_result.csv','w',newline='',encoding='utf-8') as f:\n"
                                       + " w=csv.writer(f);w.writerow(" + repr(list(row)) + ");w.writerow(" + repr(list(row.values())) + ")\n"
                                       + "print(" + repr(text) + ")\n", encoding="utf-8")
@@ -863,11 +865,11 @@ class EvaluationContracts(IsolatedTest):
                     self.assertEqual(result.passed, passed, result.reason)
 
     def test_search_oracle_boundaries_cap_and_probe_cache(self):
-        # cap bounds expansion only; an initial range above it remains valid.
+        # Hard caps cover initial probes; fresh boundary confirmations retain all calls.
         cases = ((1, 1, 4, 4, 4), (1, 1, 1, 4, 1), (1, 2, 2, 2, 2),
                  (8, 16, 16, 0, None), (8, 16, 16, 3, 3),
                  (1, 4, 13, 20, 13), (1, 4, 16, 7, 7),
-                 (1, 8, 4, 8, 8), (1, 4, 0, 7, 7))
+                 (1, 8, 4, 8, 4), (1, 4, 0, 7, 7))
         for low, high, cap, cutoff, expected in cases:
             with self.subTest(low=low, high=high, cap=cap, cutoff=cutoff):
                 calls = []
@@ -882,13 +884,165 @@ class EvaluationContracts(IsolatedTest):
                 with patch.object(matrix, "run_single_evaluation", side_effect=measure):
                     best, history = searcher.search()
                     self.assertEqual(best.concurrency if best else None, expected)
-                    self.assertEqual(len(calls), len(set(calls)))
+                    self.assertTrue(all(not cap or cc <= cap for cc in calls))
                     self.assertEqual(calls, [item.concurrency for item in history])
                     for item in history:
-                        self.assertIs(searcher.evaluate(item.concurrency), item)
+                        searcher.profile = item.profile
+                        self.assertEqual(searcher.evaluate(item.concurrency).concurrency, item.concurrency)
                     self.assertEqual(len(calls), len(history))
         self.assertEqual(matrix.calculate_num_prompts(3, 10), 30)
         self.assertEqual(matrix.calculate_num_prompts(3, 7), 21)
+
+
+# All distinct scenario/adapter/writer assertions formerly in validate_addon.py
+# stay in this one existing test suite; there is no second test runner.
+PLANNER_INVALID_CASES = [('zero concurrency', {'concurrency': [0]}, {}),
+ ('negative concurrency', {'concurrency': [-1]}, {}),
+ ('boolean concurrency', {'concurrency': [True]}, {}),
+ ('fraction concurrency', {'concurrency': [1.5]}, {}),
+ ('concurrency not a list', {'concurrency': 'max'}, {}),
+ ('empty concurrency', {'concurrency': []}, {}),
+ ('duplicate peak entry', {'concurrency': [1, 'max', 'max']}, {}),
+ ('zero requests', {'data_num': 0}, {}),
+ ('negative input', {'input_len': -1}, {}),
+ ('zero output', {'output_len': 0}, {}),
+ ('nonfinite rate', {'request_rate': 'nan'}, {}),
+ ('negative rate', {'request_rate': -1}, {}),
+ ('invalid repeat rate', {'repeat_rate': 1.1}, {}),
+ ('zero npu', {'npu_num': 0}, {}),
+ ('zero prefix count', {'prefix_num': 0}, {}),
+ ('zero DP', {'dp': 0}, {}),
+ ('fraction seed', {'seed': 1.5}, {}),
+ ('string prefix flag', {'prefix_test': 'false'}, {}),
+ ('numeric thinking flag', {'enable_think': 1}, {}),
+ ('string accuracy flag', {'test_accuracy': 'true'}, {}),
+ ('duplicate task archive slug',
+  {},
+  {'fixture_scenarios': [{'name': 'same.name', 'concurrency': [1]},
+                         {'name': 'same_name', 'concurrency': [1]}]}),
+ ('duplicate scenario name',
+  {},
+  {'fixture_scenarios': [{'name': 'same', 'concurrency': [1]}, {'name': 'same', 'concurrency': [2]}]}),
+ ('zero peak multiplier', {'concurrency': ['max'], 'peak_data_multiplier': 0}, {}),
+ ('reversed peak range', {'concurrency': ['max'], 'peak_min_cc': 8, 'peak_max_cc': 1}, {}),
+ ('negative peak wait', {'concurrency': ['max'], 'peak_wait': -1}, {}),
+ ('nonfinite SLO', {'concurrency': ['max'], 'ttft_limit': 'inf'}, {}),
+ ('fraction peak wait', {'concurrency': ['max'], 'peak_wait': 0.5}, {}),
+ ('fraction global peak wait', {}, {'PEAK_WAIT_SECONDS': '0.5'}),
+ ('invalid dataset type', {'dataset_type': 'typo'}, {}),
+ ('invalid test type', {'test_type': 'typo'}, {}),
+ ('unpaired gaussian', {'length_mean': 16}, {}),
+ ('unpaired range', {'length_min': 8}, {}),
+ ('negative length std', {'length_mean': 16, 'length_std': -1}, {}),
+ ('nonfinite length std', {'length_mean': 16, 'length_std': 'inf'}, {}),
+ ('zero minimum length', {'length_min': 0, 'length_max': 16}, {}),
+ ('variable length exceeds context', {'length_min': 8, 'length_max': 1000}, {'MAX_CONTEXT_LEN': '100'}),
+ ('pipe scenario', {'name': 'bad|name'}, {}),
+ ('single quote scenario', {'name': "bad'name"}, {}),
+ ('hard cap typo', {}, {'PEAK_HARD_CAP': 'true'}),
+ ('hard cap negative', {}, {'PEAK_HARD_CAP': '-1'}),
+ ('zero fixed multiplier', {}, {'DATA_NUM_MULTIPLIER': '0'}),
+ ('zero global peak multiplier', {}, {'PEAK_DATA_MULTIPLIER': '0'}),
+ ('negative failed allowance', {}, {'FAILED_REQ_LIMIT': '-1'}),
+ ('zero global NPU', {}, {'NPU_NUM': '0'}),
+ ('unknown extension argument', {'future_option': 'two words'}, {}),
+ ('unknown extension pipe value', {'future_option': 'two|words'}, {})]
+PLANNER_VALID_CASES = [('quoted name', {'name': 'hello, "quoted"'}),
+ ('repeated normalized concurrency', {'concurrency': [1, '1', 2, 1]}),
+ ('zero SLO disables limit', {'concurrency': ['max'], 'ttft_limit': 0, 'tpot_limit': 0}),
+ ('percentage ratio', {'repeat_rate': '50%'}),
+ ('zero percentage', {'repeat_rate': '0%'}),
+ ('full prefix percentage', {'repeat_rate': '100%', 'dataset_type': 'prefix_cache'}),
+ ('fractional Gaussian std', {'length_mean': 16, 'length_std': 0.5}),
+ ('reversed length bounds', {'length_min': 32, 'length_max': 16}),
+ ('negative integer seed', {'seed': -1}),
+ ('false boolean flag', {'prefix_test': False})]
+
+
+class ProductionConfigurationContracts(IsolatedTest):
+    def setUp(self):
+        super().setUp()
+        self.environment = patch.dict(os.environ, ENV_DEFAULTS)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def test_required_delivery_modules_and_default_plan(self):
+        import importlib.util
+        for name in ('aisbench_configuration', 'aisbench_worker', 'aisbench_run_manager', 'aisbench_execution',
+                     'aisbench_logging', 'aisbench_perf_matrix', 'aisbench_perf_matrix_config',
+                     'aisbench_result_adapter', 'aisbench_artifact_archive', 'aisbench_batch_results',
+                     'aisbench_result_validation', 'validate_publication'):
+            with self.subTest(module=name):
+                self.assertIsNotNone(importlib.util.find_spec(name))
+        for path in (PROJECT_ROOT / 'run_perf_scenarios.sh', PROJECT_ROOT / 'env.env',
+                     PROJECT_ROOT / 'aisbench_auto_tools_prefix' / 'aisbench_test.py'):
+            self.assertTrue(path.is_file(), str(path))
+        plan = production_plan(read_scenarios_file())
+        self.assertTrue(plan['fixed'])
+        self.assertTrue(plan['peak'])
+        self.assertEqual(len(plan['planned_scenarios']), len(plan['fixed']) + len(plan['peak']))
+
+    def test_every_existing_native_option_remains_in_public_schema(self):
+        native = native_options(PROJECT_ROOT / 'aisbench_auto_tools_prefix')
+        self.assertEqual(native, VALUE_OPTIONS | BOOLEAN_OPTIONS)
+        self.assertEqual(ENV_DEFAULTS['DATA_NUM_MULTIPLIER'], '4')
+
+    def test_all_invalid_production_plans_are_rejected(self):
+        for name, changes, options in PLANNER_INVALID_CASES:
+            with self.subTest(case=name):
+                options = options.copy()
+                scene = dict(name='validation', input_len=16, output_len=4, concurrency=[1], request_rate=0)
+                scene.update(changes)
+                scenes = options.pop('fixture_scenarios', [scene])
+                with self.assertRaises((ValueError, TypeError, KeyError)):
+                    production_plan(scenes, options)
+
+    def test_all_supported_production_plans_remain_supported(self):
+        for name, changes in PLANNER_VALID_CASES:
+            with self.subTest(case=name):
+                scene = dict(name='validation', input_len=16, output_len=4, concurrency=[1])
+                scene.update(changes)
+                plan = production_plan([scene])
+                self.assertTrue(plan['fixed'] or plan['peak'])
+        features = ({'test_type':'text','output_len':1}, {'output_len':1}, {'test_accuracy':True},
+                    {'enable_think':True}, {'repeat':2}, {'request_rate':'2'},
+                    {'dataset':'/mnt/models/custom-data.jsonl'},
+                    {'dataset_type':'prefix_cache','prefix_test':True,'dp':2,'prefix_num':2,'repeat_rate':'90%'})
+        for changes in features:
+            with self.subTest(feature=changes):
+                scene = dict(name='feature', input_len=16, output_len=4, concurrency=[4,4])
+                scene.update(changes)
+                plan = production_plan([scene])
+                self.assertEqual(len(plan['fixed']), 2)
+                self.assertFalse(plan['peak'])
+
+    def test_adapter_field_sweep_and_mode_applicability(self):
+        row = dict.fromkeys(adapter.CANONICAL_COLUMNS, '1')
+        row.update(current_time='offline', input_len='1024', output_len='512', total_req='16', max_cc='4', rr='0')
+        for mode in ('stream', 'text'):
+            result = adapter.normalize_result(row, test_type=mode)
+            self.assertEqual(result['TTFT avg'], '1' if mode == 'stream' else '')
+        accuracy = adapter.normalize_result(row, test_accuracy=True)
+        self.assertTrue(all(accuracy[name] == '' for name in adapter.CANONICAL_COLUMNS[1:]))
+        for field in adapter.CANONICAL_COLUMNS[1:]:
+            for value in ('nan', 'inf', '-1', 'invalid'):
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    adapter.normalize_result(dict(row, **{field:value}))
+
+    def test_actual_worker_writer_quotes_names_and_binds_scope_generation(self):
+        from aisbench_worker import Worker
+        worker = object.__new__(Worker)
+        worker.rows, worker.scopes, worker.result, worker.output = [], [], self.root, self.root
+        raw = dict.fromkeys(adapter.CANONICAL_COLUMNS, '1')
+        raw.update(current_time='offline', repeat_rate='0.9')
+        Worker.append_row(worker, {'name':'quoted, "scenario"','repeat_rate':'0.9'}, raw, 'passed',
+                          scope={'scope_id':'s1'})
+        with (self.root / 'all_results.csv').open(newline='', encoding='utf-8') as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+            self.assertEqual(reader.fieldnames, adapter.SUMMARY_COLUMNS)
+            self.assertEqual(rows[0]['scenario'], 'quoted, "scenario"')
+        self.assertEqual(set(adapter.load_scope_index(self.root)), {0})
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 """Offline process-level contracts for the run manager and real shell preflight.
 
-Run: python -B -m unittest discover -s add -p test_parallel_runs.py
+Run: python -B -m unittest discover -s automation/tests -p test_parallel_runs.py
 The fixtures are created in a temporary directory. No real Docker daemon,
 model, tokenizer, server, repository env.local.env or benchmark is accessed.
 """
 from __future__ import annotations
 
 import csv
+import importlib.util
 import hashlib
 import json
 import os
@@ -21,9 +22,15 @@ import time
 import unittest
 
 sys.dont_write_bytecode = True
-ADD_DIR = Path(__file__).resolve().parent
+AUTOMATION_ROOT = Path(__file__).resolve().parent.parent
+CORE_ROOT = AUTOMATION_ROOT / 'core'
+TOOLS_ROOT = AUTOMATION_ROOT / 'tools'
+RELEASE_ROOT = AUTOMATION_ROOT.parent
+for folder in (CORE_ROOT, TOOLS_ROOT):
+    sys.path.insert(0, str(folder))
+ADD_DIR = CORE_ROOT
 MANAGER = ADD_DIR / "aisbench_run_manager.py"
-SHELL = ADD_DIR / "run_perf_scenarios.sh"
+SHELL = RELEASE_ROOT / "run_perf_scenarios.sh"
 
 # One helper implements the synthetic worker and Docker CLI. The manager itself
 # remains the production implementation: its file loading, environment handling,
@@ -98,6 +105,7 @@ report = {
     'tools_host_dir': str(root / 'tools'), 'host_ip': env.get('HOST_IP', 'default-host'),
     'host_port': env.get('HOST_PORT', '8000'), 'model_name': model,
     'api_url': env.get('API_URL', ''), 'service_id': env.get('SERVICE_ID', ''),
+    'planned_scenarios': [name + '_c1' for name in scenario_names],
     'planned_tests': len(scenario_names), 'fixed_count': len(scenario_names), 'peak_count': 0,
     'effective_config': {'scenarios': json.loads(scenario_block.group(1))},
 }
@@ -126,9 +134,15 @@ runtime = {'container_id': identity, 'container_name': name, 'image': image,
            'phase': 'benchmark', 'current_scenario': 'small_c1', 'test_index': 1}
 runtime_path = pathlib.Path(env['AISBENCH_RUNTIME_REPORT'])
 runtime_path.write_text(json.dumps(runtime))
+print('worker stdout started', flush=True)
+print('worker stderr started', file=sys.stderr, flush=True)
+if env.get('AISBENCH_TEST_RAW_BYTES'):
+    os.write(1, b'raw-utf8-\xff\x00\r\n')
+    print('API_KEY=' + env.get('API_KEY', ''), flush=True)
 event('start', model=model, name=name, output=str(output), tag=tag, identity=identity,
       host=env.get('HOST_IP'), api_key=env.get('API_KEY'),
       multiplier=env.get('DATA_NUM_MULTIPLIER'), cap=env.get('PEAK_HARD_CAP'),
+       peak_options={key: env.get(key) for key in ('PEAK_PRECISION', 'PEAK_CONFIRM_RUNS', 'PEAK_CONFIRM_MIN_REQUESTS', 'PEAK_MAX_TRIALS', 'PEAK_TRIAL_TIMEOUT', 'PEAK_TOTAL_TIMEOUT', 'PEAK_INVALID_RETRIES', 'PEAK_FLOOR_CONCURRENCY')},
       exported_json=env.get('SCENARIOS_JSON'), pod_info=env.get('POD_INFO'),
       config_hash=config_hash, scenario_names=scenario_names)
 duration = float(env.get('AISBENCH_TEST_DURATION', '0.4'))
@@ -195,6 +209,10 @@ class ParallelProcessContracts(unittest.TestCase):
         write_lf(self.fixture, FIXTURE)
         python = shlex.quote(Path(sys.executable).as_posix())
         fixture = shlex.quote(self.fixture.as_posix())
+        # The thin Bash entry execs python3; a real executable shim keeps that
+        # production path testable on Windows without shell-function shortcuts.
+        write_lf(self.binary / 'python3', '#!/usr/bin/env bash\nexec ' + python + ' -B "$@"\n')
+        (self.binary / 'python3').chmod(0o755)
         write_lf(self.binary / 'docker', '#!/usr/bin/env bash\nexec ' + python + ' -B ' + fixture + ' docker "$@"\n')
         (self.binary / 'docker').chmod(0o755)
         if os.name == 'nt':
@@ -213,7 +231,8 @@ class ParallelProcessContracts(unittest.TestCase):
             self.env.pop(key, None)
         (self.root / 'model').mkdir()
         (self.root / 'tools').mkdir()
-        write_lf(self.root / 'tools' / 'aisbench_test.py', '# Offline placeholder.\n')
+        shutil.copyfile(RELEASE_ROOT / 'aisbench_auto_tools_prefix' / 'aisbench_test.py',
+                        self.root / 'tools' / 'aisbench_test.py')
 
     def stop_children(self):
         for process in self.processes:
@@ -227,17 +246,18 @@ class ParallelProcessContracts(unittest.TestCase):
 
     def create_checkout(self, name):
         checkout = self.root / name
-        add = checkout / 'add'
+        (checkout / 'aisbench_auto_tools_prefix').mkdir(parents=True)
+        add = checkout / 'automation'
         add.mkdir(parents=True)
         command = (shlex.quote(Path(sys.executable).as_posix()) + ' -B '
                    + shlex.quote(self.fixture.as_posix()) + ' worker "$@"')
-        write_lf(add / 'run_perf_scenarios.sh', '#!/usr/bin/env bash\nexec ' + command + '\n')
-        write_lf(add / 'env.env', "SCENARIOS_JSON=$(cat <<'JSON'\n"
+        write_lf(checkout / 'run_perf_scenarios.sh', '#!/usr/bin/env bash\nexec ' + command + '\n')
+        write_lf(checkout / 'env.env', "SCENARIOS_JSON=$(cat <<'JSON'\n"
                  + '[{"name":"small","input_len":16,"output_len":4,"concurrency":[1]}]\nJSON\n)\n')
         return checkout
 
     def config(self, filename, *, model='model-a', output=None, container=None, host=None, extra='', checkout=None):
-        target = (checkout or self.checkout) / 'add' / filename
+        target = (checkout or self.checkout) / filename
         address = self.config_hosts.setdefault(str(target), '192.168.1.' + str(len(self.config_hosts) + 1))
         values = {'MODEL_NAME': model, 'MODEL_HOST_PATH': (self.root / 'model').as_posix(),
                   'TOOLS_HOST_DIR': (self.root / 'tools').as_posix(),
@@ -254,7 +274,7 @@ class ParallelProcessContracts(unittest.TestCase):
 
     def start(self, *configs, checkout=None, env=None, launcher=None):
         command = [sys.executable, '-B', str(launcher or MANAGER),
-                   str((checkout or self.checkout) / 'add' / 'run_perf_scenarios.sh'),
+                   str((checkout or self.checkout) / 'run_perf_scenarios.sh'),
                    *map(str, configs)]
         process = subprocess.Popen(command, cwd=checkout or self.checkout,
                                    env={**self.env, **(env or {})}, text=True,
@@ -295,7 +315,7 @@ class ParallelProcessContracts(unittest.TestCase):
                           if row['args'][0] in ('run', 'rm', 'start', 'stop', 'exec')], output)
 
     def latest_batch(self):
-        paths = list(self.checkout.glob('outputs/parallel/*/batch_results.json'))
+        paths = list(self.checkout.glob('outputs/default/*/batch_results.json'))
         self.assertTrue(paths, 'no persisted batch result')
         path = max(paths, key=lambda item: item.stat().st_mtime_ns)
         return path, json.loads(path.read_text(encoding='utf-8'))
@@ -407,7 +427,7 @@ class ParallelProcessContracts(unittest.TestCase):
             self.assertNotEqual(row['pod_info'], 'stale-metrics')
         self.assertEqual(by_model['model-a']['api_key'], 'secret-a')
         self.assertNotEqual(by_model['model-b']['api_key'], 'stale-parent-secret')
-        summaries = list(self.checkout.glob('outputs/parallel/*/batch_results.json'))
+        summaries = list(self.checkout.glob('outputs/default/*/batch_results.json'))
         self.assertEqual(len(summaries), 1, output)
         self.assertTrue(summaries[0].with_suffix('.csv').is_file())
         for path in (summaries[0], summaries[0].with_suffix('.csv')):
@@ -444,7 +464,7 @@ class ParallelProcessContracts(unittest.TestCase):
         row, = [row for row in self.events('start') if row['model'] == 'original-model']
         self.assertEqual(row['config_hash'], original_hash)
         self.assertEqual(row['scenario_names'], ['small'])
-        summary = next(self.checkout.glob('outputs/parallel/*/batch_results.json'))
+        summary = next(self.checkout.glob('outputs/default/*/batch_results.json'))
         tasks = json.loads(summary.read_text(encoding='utf-8'))['tasks']
         task, = [task for task in tasks if task['task'] == 'snapshot_a']
         self.assertEqual(task['config_sha256'], original_hash)
@@ -524,7 +544,7 @@ class ParallelProcessContracts(unittest.TestCase):
         self.assertNotEqual(code, 0, output)
         finishes = {row['model']: row['code'] for row in self.events('finish')}
         self.assertEqual(finishes, {'peer-a': 0, 'fail-after-start': 7, 'peer-c': 0, 'peer-d': 0})
-        path = next(self.checkout.glob('outputs/parallel/*/batch_results.csv'))
+        path = next(self.checkout.glob('outputs/default/*/batch_results.csv'))
         with path.open(encoding='utf-8-sig', newline='') as handle:
             rows = list(csv.DictReader(handle))
         self.assertEqual(len(rows), 4)
@@ -590,6 +610,155 @@ class ParallelProcessContracts(unittest.TestCase):
         self.assertEqual((start['model'], start['host'], start['multiplier']),
                          ('explicit-file-model', '192.168.1.42', '3'))
         self.assertEqual(marker.read_text(), 'x')
+
+    def test_zero_config_loads_default_once_and_parent_presence_overrides_zero_and_empty(self):
+        marker = self.root / 'default-source-count'
+        self.config('env.env', model='default-file-model', host='192.168.1.44',
+                    extra='API_KEY=file-secret\nPEAK_HARD_CAP=1\nDATA_NUM_MULTIPLIER=4\nprintf x >> '
+                    + shlex.quote(marker.as_posix()))
+        code, output = self.finish(self.start(env={'MODEL_NAME': 'export-model', 'PEAK_HARD_CAP': '0',
+                                                   'API_KEY': '', 'DATA_NUM_MULTIPLIER': '9'}))
+        self.assertEqual(code, 0, output)
+        start, = self.events('start')
+        self.assertEqual((start['model'], start['host'], start['cap'], start['api_key'], start['multiplier']),
+                         ('export-model', '192.168.1.44', '0', '', '9'))
+        self.assertEqual(marker.read_text(), 'x')
+        path, result = self.latest_batch()
+        task, = result['tasks']
+        self.assertEqual(task['parameter_sources']['PEAK_HARD_CAP'], 'parent_export')
+        self.assertTrue((path.parent / 'logs' / 'events.jsonl').is_file())
+
+    def test_zero_config_without_exports_uses_default_file_globals(self):
+        self.config('env.env', model='file-model', host='192.168.1.52', extra='PEAK_HARD_CAP=1')
+        code, output = self.finish(self.start())
+        self.assertEqual(code, 0, output)
+        start, = self.events('start')
+        self.assertEqual((start['model'], start['host'], start['cap']), ('file-model', '192.168.1.52', '1'))
+
+    def test_missing_config_and_source_failure_have_durable_private_preflight_evidence(self):
+        bad = self.config('private_source.env', extra='API_KEY=never-display-source-secret\nprintf "%s" "$API_KEY" >&2\nreturn 7')
+        for config in (self.root / 'missing.env', bad):
+            with self.subTest(config=config.name):
+                code, output = self.run_pair(config)
+                self.assertNotEqual(code, 0, output)
+                self.assertNotIn('never-display-source-secret', output)
+                path, _result = self.latest_batch()
+                state = json.loads((path.parent / 'batch_state.json').read_text(encoding='utf-8'))
+                self.assertEqual(state['state'], 'failed')
+                self.assertNotEqual(state['exit_code'], 0)
+                self.assertTrue((path.parent / 'logs' / 'batch.log').is_file())
+                if config == bad:
+                    diagnostics = list((path.parent / 'logs' / 'preflight').glob('*.stderr.raw.log'))
+                    self.assertEqual(len(diagnostics), 1)
+                    self.assertIn(b'never-display-source-secret', diagnostics[0].read_bytes())
+                    self.assertNotIn('never-display-source-secret', (path.parent / 'logs' / 'batch.log').read_text(encoding='utf-8'))
+        self.assertFalse(self.events('start'))
+
+    def test_worker_raw_stdout_and_stderr_are_separate_and_invalid_bytes_preserved(self):
+        config = self.config('bytes.env', extra='API_KEY=worker-private-token')
+        code, output = self.run_pair(config, env={'AISBENCH_TEST_RAW_BYTES': '1'})
+        self.assertEqual(code, 0, output)
+        _, result = self.latest_batch()
+        task, = result['tasks']
+        raw = Path(task['diagnostic_paths']['stdout']).read_bytes()
+        stderr = Path(task['diagnostic_paths']['stderr']).read_bytes()
+        self.assertIn(b'raw-utf8-\xff\x00\r\n', raw)
+        self.assertIn(b'API_KEY=worker-private-token', raw)
+        self.assertIn(b'worker stderr started', stderr)
+        self.assertNotIn('worker-private-token', output)
+        self.assertNotIn('worker-private-token', Path(task['launcher_log']).read_text(encoding='utf-8'))
+
+    def test_native_output_and_bootstrap_symlink_are_rejected_without_native_writes(self):
+        native = self.checkout / 'aisbench_auto_tools_prefix'
+        config = self.config('native.env', output=native / 'outputs')
+        code, output = self.run_pair(config)
+        self.assertNotEqual(code, 0, output)
+        self.assertFalse(list(native.iterdir()))
+        self.assertFalse(self.events('start'))
+        custom = self.root / 'custom-output'
+        custom.mkdir()
+        try:
+            (custom / '.launcher').symlink_to(native, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest('directory symlink unavailable: ' + str(error))
+        config = self.config('launcher_alias.env', output=custom)
+        code, output = self.run_pair(config)
+        self.assertNotEqual(code, 0, output)
+        self.assertFalse(list(native.iterdir()))
+        self.assertFalse(self.events('start'))
+        checkout = self.create_checkout('bootstrap-checkout')
+        (checkout / 'outputs').mkdir()
+        try:
+            (checkout / 'outputs' / 'default').symlink_to(checkout / 'aisbench_auto_tools_prefix', target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest('directory symlink unavailable: ' + str(error))
+        config = self.config('safe.env', checkout=checkout)
+        code, output = self.run_pair(config, checkout=checkout)
+        self.assertNotEqual(code, 0, output)
+        self.assertFalse(list((checkout / 'aisbench_auto_tools_prefix').iterdir()))
+        self.assertFalse(self.events('start'))
+
+    def test_log_writer_failure_reaches_supervisor_and_stops_only_affected_task(self):
+        launcher = self.root / 'failed_log_launcher.py'
+        write_lf(launcher, 'import sys\nfrom pathlib import Path\n'
+                 + 'sys.path.insert(0, ' + repr(str(ADD_DIR)) + ')\n'
+                 + 'import aisbench_run_manager as manager\n'
+                 + 'original = manager.private_binary\n'
+                 + 'class BrokenWriter:\n'
+                 + '    def __init__(self, wrapped): self.wrapped = wrapped\n'
+                 + '    def write(self, value): raise OSError("synthetic disk full")\n'
+                 + '    def __getattr__(self, key): return getattr(self.wrapped, key)\n'
+                 + 'def open_log(path, roots, mode="xb"):\n'
+                 + '    handle = original(path, roots, mode)\n'
+                 + '    return BrokenWriter(handle) if Path(path).name == "stdout.raw.log" and "broken__" in str(path) else handle\n'
+                 + 'manager.private_binary = open_log\n'
+                 + 'sys.exit(manager.main())\n')
+        a = self.config('broken.env', model='model-a')
+        b = self.config('healthy.env', model='model-b')
+        code, output = self.run_pair(a, b, launcher=launcher, env={'AISBENCH_TEST_DURATION': '2'})
+        self.assertNotEqual(code, 0, output)
+        _, result = self.latest_batch()
+        tasks = {task['task']: task for task in result['tasks']}
+        self.assertEqual(tasks['broken']['state'], 'failed')
+        self.assertEqual(tasks['broken']['logging_error'], 'TASK_LOG_WRITE_FAILED')
+        self.assertEqual(tasks['healthy']['state'], 'success')
+        broken, = [row for row in self.events('start') if row['model'] == 'model-a']
+        healthy, = [row for row in self.events('start') if row['model'] == 'model-b']
+        stopped = {row['args'][-1] for row in self.events('docker') if row['args'][0] == 'stop'}
+        self.assertIn(broken['identity'], stopped)
+        self.assertNotIn(healthy['identity'], stopped)
+
+    def test_new_peak_global_parameters_are_loaded_and_parent_values_do_not_leak(self):
+        values = {'PEAK_PRECISION': '2', 'PEAK_CONFIRM_RUNS': '4', 'PEAK_CONFIRM_MIN_REQUESTS': '16',
+                  'PEAK_MAX_TRIALS': '20', 'PEAK_TRIAL_TIMEOUT': '45', 'PEAK_TOTAL_TIMEOUT': '300',
+                  'PEAK_INVALID_RETRIES': '0', 'PEAK_FLOOR_CONCURRENCY': '2'}
+        config = self.config('peak_options.env', extra='\n'.join(key + '=' + value for key, value in values.items()))
+        code, output = self.run_pair(config, env={key: '999' for key in values})
+        self.assertEqual(code, 0, output)
+        start, = self.events('start')
+        self.assertEqual(start['peak_options'], values)
+
+    def test_batch_journal_failure_after_start_stops_owned_workload_and_is_nonzero(self):
+        launcher = self.root / 'failed_batch_log_launcher.py'
+        write_lf(launcher, 'import sys\n'
+                 + 'sys.path.insert(0, ' + repr(str(ADD_DIR)) + ')\n'
+                 + 'import aisbench_run_manager as manager\n'
+                 + 'original = manager.BatchLog.emit\n'
+                 + 'def fail(self, event, message, **fields):\n'
+                 + '    if event == "task_started": raise OSError("synthetic disk full")\n'
+                 + '    return original(self, event, message, **fields)\n'
+                 + 'manager.BatchLog.emit = fail\n'
+                 + 'sys.exit(manager.main())\n')
+        config = self.config('journal_failure.env')
+        code, output = self.run_pair(config, launcher=launcher, env={'AISBENCH_TEST_DURATION': '4'})
+        self.assertNotEqual(code, 0, output)
+        path, result = self.latest_batch()
+        state = json.loads((path.parent / 'batch_state.json').read_text(encoding='utf-8'))
+        self.assertEqual(state['logging_error'], 'BATCH_LOG_WRITE_FAILED')
+        self.assertEqual(state['state'], 'failed')
+        for event in self.events('start'):
+            container = json.loads((self.root / 'containers' / (event['identity'] + '.json')).read_text())
+            self.assertFalse(container['State']['Running'])
 
     def test_service_lock_conflicts_across_checkouts_then_releases(self):
         a = self.config('a.env', host='192.168.1.90')
@@ -797,7 +966,7 @@ class ParallelProcessContracts(unittest.TestCase):
         directories = [Path(row['output']) / 'scenario_results' / row['tag'] for row in starts]
         self.assertEqual(len(set(directories)), 4)
         self.assertTrue(all(path.is_dir() for path in directories))
-        self.assertEqual(len(list(self.checkout.glob('outputs/parallel/*/batch_results.json'))), 2)
+        self.assertEqual(len(list(self.checkout.glob('outputs/default/*/batch_results.json'))), 2)
 
     @unittest.skipIf(os.name == 'nt', 'POSIX signal delivery requires Linux CI')
     def test_sigint_and_sigterm_stop_only_recorded_fixed_container_ids(self):
@@ -832,21 +1001,17 @@ class ParallelProcessContracts(unittest.TestCase):
     def test_real_shell_preflight_uses_production_validation_without_docker(self):
         config = self.config('real.env', model='unused-during-managed-preflight')
         report = self.root / 'real-preflight.json'
-        python = shlex.quote(Path(sys.executable).as_posix())
-        wrapper = self.root / 'real-preflight.sh'
-        code = ('python3() { ' + python + ' -B "$@"; }\nexport -f python3\n'
-                'docker() { echo FORBIDDEN_DOCKER_CALL >&2; return 97; }\nexport -f docker\n'
-                'exec "$BASH" ' + shlex.quote(SHELL.as_posix()) + ' ' + shlex.quote(config.as_posix()) + '\n')
-        write_lf(wrapper, code)
         env = {**self.env, 'AISBENCH_MANAGED_WORKER': '1', 'AISBENCH_PREFLIGHT_REPORT': str(report),
                'MODEL_NAME': 'real-preflight-model', 'MODEL_HOST_PATH': (self.root / 'model').as_posix(),
                'TOOLS_HOST_DIR': (self.root / 'tools').as_posix(), 'HOST_OUTPUT_DIR': (self.root / 'unused-out').as_posix(),
                'HOST_IP': '192.168.1.123', 'HOST_PORT': '8000', 'NPU_NUM': '1', 'PEAK_HARD_CAP': '1',
                'DATA_NUM_MULTIPLIER': '4', 'MAX_CONTEXT_LEN': '4096',
                'API_URL': 'https://api.invalid:8443/v1/chat/completions', 'SERVICE_ID': 'preflight-service'}
-        process = subprocess.run([self.bash, wrapper.as_posix()], env=env, text=True, capture_output=True, timeout=30)
+        command = [self.bash, SHELL.as_posix(), config.as_posix()]
+        process = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         self.assertNotIn('FORBIDDEN_DOCKER_CALL', process.stdout + process.stderr)
+        self.assertFalse(self.events('docker'), 'preflight contacted Docker')
         payload = json.loads(report.read_text(encoding='utf-8'))
         self.assertEqual(payload['model_name'], 'real-preflight-model')
         self.assertEqual(str(payload['host_ip']), '192.168.1.123')
@@ -858,41 +1023,39 @@ class ParallelProcessContracts(unittest.TestCase):
         # Exercise real parser rejection, rather than only the fake worker path.
         write_lf(config, "SCENARIOS_JSON=$(cat <<'JSON'\n[{\"name\":\"invalid\",\"input_len\":16,\"output_len\":4,\"concurrency\":[0]}]\nJSON\n)\n")
         report.unlink()
-        process = subprocess.run([self.bash, wrapper.as_posix()], env=env, text=True, capture_output=True, timeout=30)
+        process = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
         self.assertNotEqual(process.returncode, 0, process.stdout + process.stderr)
         self.assertFalse(report.exists())
         self.assertNotIn('FORBIDDEN_DOCKER_CALL', process.stdout + process.stderr)
+        self.assertFalse(self.events('docker'), 'invalid preflight contacted Docker')
 
     def test_real_shell_rejects_replaced_name_before_executing_new_container(self):
-        source = SHELL.read_text(encoding='utf-8')
-        start = source.index('assert_container_ready() {')
-        function = source[start:source.index('\n}\n', start) + 3]
+        # Use the production Python worker's identity check, rather than a
+        # source-text extraction that would test an obsolete shell function.
+        sys.path.insert(0, str(ADD_DIR))
+        spec = importlib.util.spec_from_file_location('aisbench_worker_identity_contract', ADD_DIR / 'aisbench_worker.py')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
         old_id, new_id = 'a' * 64, 'b' * 64
-        code = '''
-set -uo pipefail
-log() { printf '%s\\n' "$*"; }
-docker() {
-    if [ "$1" = inspect ] && [ "$4" = "$CURRENT_ID" ]; then
-        printf '%s|true\\n' "$CURRENT_ID"
-    elif [ "$1" = inspect ] && [ "$4" = "$CONTAINER_NAME" ]; then
-        printf '%s\\n' "$REPLACEMENT_ID"
-    else
-        echo FORBIDDEN_EXEC >&2
-        return 97
-    fi
-}
-'''
-        code += function + '\nassert_container_ready || exit 23\ndocker exec "$CURRENT_ID" true\n'
-        wrapper = self.root / 'identity-contract.sh'
-        write_lf(wrapper, code)
-        process = subprocess.run([self.bash, wrapper.as_posix()],
-                                 env={**self.env, 'CURRENT_ID': old_id,
-                                      'CONTAINER_NAME': 'same-name', 'REPLACEMENT_ID': new_id},
-                                 text=True, capture_output=True, timeout=10)
-        self.assertEqual(process.returncode, 23, process.stdout + process.stderr)
-        self.assertIn(old_id, process.stdout)
-        self.assertIn(new_id, process.stdout)
-        self.assertNotIn('FORBIDDEN_EXEC', process.stdout + process.stderr)
+        old = {'Id': old_id, 'Name': '/same-name', 'State': {'Running': True},
+               'Config': {'Image': 'offline-image', 'Labels': {'io.aisbench-auto-tools-prefix.managed': 'true'}}}
+        configuration = self.root / 'identity-map.json'
+        code = ('import json,pathlib,sys\n'
+                'path=pathlib.Path(sys.argv[1]); cfg=json.loads(path.read_text()); args=sys.argv[2:]\n'
+                'with pathlib.Path(sys.argv[1]+".calls").open("a") as h: h.write(json.dumps(args)+"\\n")\n'
+                'if args[0] != "inspect": raise SystemExit(97)\n'
+                'payload=cfg["fixed"] if args[-1] == cfg["fixed"]["Id"] else cfg["named"]\n'
+                'print(payload["Id"] if "--format" in args else json.dumps([payload]))\n')
+        docker = [sys.executable, '-B', '-c', code, str(configuration)]
+        configuration.write_text(json.dumps({'fixed': old, 'named': old}))
+        self.assertEqual(module.assert_container_identity(docker, old_id, 'same-name')['Id'], old_id)
+        configuration.write_text(json.dumps({'fixed': old, 'named': {**old, 'Id': new_id}}))
+        with self.assertRaises(RuntimeError):
+            module.assert_container_identity(docker, old_id, 'same-name')
+        recorded = [json.loads(line) for line in Path(str(configuration) + '.calls').read_text().splitlines()]
+        self.assertTrue(recorded)
+        self.assertTrue(all(arguments[0] == 'inspect' for arguments in recorded))
 
 
 if __name__ == '__main__':

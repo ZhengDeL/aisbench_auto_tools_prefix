@@ -14,6 +14,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import sys
+AUTOMATION_ROOT = Path(__file__).resolve().parent.parent
+CORE_ROOT = AUTOMATION_ROOT / 'core'
+TOOLS_ROOT = AUTOMATION_ROOT / 'tools'
+RELEASE_ROOT = AUTOMATION_ROOT.parent
+for folder in (CORE_ROOT, TOOLS_ROOT):
+    sys.path.insert(0, str(folder))
+
 import validate_publication as publication
 
 
@@ -37,8 +45,8 @@ class PublicationContracts(unittest.TestCase):
             'runner.sh': ('#!/bin/sh\nSERVER=' + self.external_address + '\n').encode(),
         }
         for name, content in self.original_files.items():
-            self.write(name, content)
-        self.write('add/feature.py', b"EXAMPLE_HOST = '192.168.1.10'\n")
+            self.write('aisbench_auto_tools_prefix/' + name, content)
+        self.write('automation/feature.py', b"EXAMPLE_HOST = '192.168.1.10'\n")
         self.repository = 'https://github.com/rayn-zzz/aisbench_auto_tools_prefix'
         self.commit = 'e' * 40
         self.manifest = {
@@ -48,7 +56,7 @@ class PublicationContracts(unittest.TestCase):
                       for name, content in self.original_files.items()},
         }
         self.original_manifest = self.encode_manifest(self.manifest)
-        self.write('add/upstream_manifest.json', self.original_manifest)
+        self.write('automation/metadata/upstream_manifest.json', self.original_manifest)
         self.git('add', '--all')
         for name, value in (('UPSTREAM_REPOSITORY', self.repository),
                             ('UPSTREAM_COMMIT', self.commit),
@@ -62,11 +70,18 @@ class PublicationContracts(unittest.TestCase):
         return (json.dumps(payload, sort_keys=True, indent=2) + '\n').encode('utf-8')
 
     def write(self, name, content):
+        if name.startswith('add/'):
+            name = 'automation/' + name[4:]
+        elif name in self.original_files:
+            name = 'aisbench_auto_tools_prefix/' + name
         target = self.root / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
 
     def git(self, *arguments):
+        arguments = tuple(('automation/' + value[4:] if value.startswith('add/') else
+                           'aisbench_auto_tools_prefix/' + value if value in getattr(self, 'original_files', {}) else value)
+                          for value in arguments)
         return subprocess.run(['git', '-C', str(self.root), *arguments],
                               text=True, capture_output=True, check=True).stdout
 
@@ -77,6 +92,10 @@ class PublicationContracts(unittest.TestCase):
         return findings, count, tracked
 
     def assert_rejected_path(self, expected):
+        if expected in self.original_files:
+            expected = 'aisbench_auto_tools_prefix/' + expected
+        elif expected == '[non-add-file]':
+            expected = '[non-native-file]'
         findings, count, tracked = self.audit()
         self.assertTrue(findings, 'non-upstream public tree unexpectedly passed')
         self.assertTrue(tracked)
@@ -92,7 +111,7 @@ class PublicationContracts(unittest.TestCase):
         self.git('add', 'add/feature.py')
         self.assertEqual(self.audit()[0], [])
         archive = self.directory / 'archive'
-        for relative in (*self.original_files, 'add/feature.py', 'add/upstream_manifest.json'):
+        for relative in (*('aisbench_auto_tools_prefix/' + name for name in self.original_files), 'automation/feature.py', 'automation/metadata/upstream_manifest.json'):
             destination = archive / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes((self.root / relative).read_bytes())
@@ -106,27 +125,27 @@ class PublicationContracts(unittest.TestCase):
         self.assert_rejected_path('README.md')
 
     def test_added_outer_file_is_rejected(self):
-        self.write('extra.md', b'An extra downstream root file.\n')
-        self.git('add', 'extra.md')
+        self.write('aisbench_auto_tools_prefix/extra.md', b'An extra downstream native file.\n')
+        self.git('add', 'aisbench_auto_tools_prefix/extra.md')
         # Unknown outer filenames are deliberately redacted by the publisher.
         self.assert_rejected_path('[non-add-file]')
 
     def test_removed_outer_file_is_rejected_even_when_removed_from_index(self):
-        (self.root / 'runner.sh').unlink()
+        (self.root / 'aisbench_auto_tools_prefix' / 'runner.sh').unlink()
         self.git('add', '--update')
         self.assert_rejected_path('runner.sh')
 
     def test_git_file_mode_change_is_rejected_with_identical_bytes(self):
         self.git('update-index', '--chmod=+x', 'runner.sh')
-        self.assertEqual((self.root / 'runner.sh').read_bytes(), self.original_files['runner.sh'])
+        self.assertEqual((self.root / 'aisbench_auto_tools_prefix' / 'runner.sh').read_bytes(), self.original_files['runner.sh'])
         self.assert_rejected_path('runner.sh')
 
     def test_manifest_is_required_trusted_and_bound_to_pinned_repository_and_commit(self):
-        manifest_path = self.root / 'add' / 'upstream_manifest.json'
+        manifest_path = self.root / 'automation' / 'metadata' / 'upstream_manifest.json'
         for kind in ('missing', 'malformed', 'forged-file-hash', 'wrong-repository', 'wrong-commit'):
             with self.subTest(manifest=kind):
                 self.write('README.md', self.original_files['README.md'])
-                self.write('add/upstream_manifest.json', self.original_manifest)
+                self.write('add/metadata/upstream_manifest.json', self.original_manifest)
                 payload = json.loads(self.original_manifest)
                 trusted_digest = hashlib.sha256(self.original_manifest).hexdigest()
                 if kind == 'missing':
@@ -155,15 +174,49 @@ class PublicationContracts(unittest.TestCase):
         self.assertTrue(tracked)
         address_findings = [item for item in findings if 'address' in item['reason']]
         self.assertEqual({str(item['path']).replace('\\', '/') for item in address_findings},
-                         {'add/private_example.py'})
+                         {'automation/private_example.py'})
 
     def test_tracked_local_configuration_is_rejected_even_with_public_example_values(self):
         self.write('add/test.local.env', b'HOST_IP=192.168.1.10\n')
         self.git('add', 'add/test.local.env')
         findings, _, tracked = self.audit()
         self.assertTrue(tracked)
-        self.assertTrue(any(str(item['path']).replace('\\', '/') == 'add/test.local.env'
-                            and item['reason'] == 'local artifact is tracked' for item in findings))
+        self.assertTrue(any(str(item['path']).replace('\\', '/') == 'automation/test.local.env'
+                            and 'local artifact is tracked' in item['reason'] for item in findings))
+
+    def test_untracked_native_file_and_empty_directory_are_rejected(self):
+        self.write('aisbench_auto_tools_prefix/untracked.py', b'x=1\n')
+        self.assertTrue(self.audit()[0])
+        (self.root / 'aisbench_auto_tools_prefix' / 'untracked.py').unlink()
+        (self.root / 'aisbench_auto_tools_prefix' / '__pycache__').mkdir()
+        self.assertTrue(self.audit()[0])
+
+    def test_staged_bad_bytes_cannot_be_hidden_by_good_worktree(self):
+        self.write('README.md', self.original_files['README.md'] + b'Changed staged native bytes\n')
+        self.git('add', 'README.md')
+        self.write('README.md', self.original_files['README.md'])
+        self.assertTrue(any('Git index' in item['reason'] for item in self.audit()[0]))
+
+    def test_actual_commit_is_audited_after_worktree_and_index_are_restored(self):
+        self.git('config', 'user.name', 'Publication contract')
+        self.git('config', 'user.email', 'publication@example.invalid')
+        self.git('commit', '-qm', 'Original')
+        self.write('README.md', self.original_files['README.md'] + b'Changed release commit\n')
+        self.git('add', 'README.md')
+        self.git('commit', '-qm', 'Changed')
+        bad = self.git('rev-parse', 'HEAD').strip()
+        self.write('README.md', self.original_files['README.md'])
+        self.git('add', 'README.md')
+        findings, _, _ = publication.audit(self.root, ref=bad)
+        self.assertTrue(any('Git tree' in item['reason'] for item in findings))
+
+    def test_new_delivery_root_docs_are_allowed_but_ipv6_is_scanned(self):
+        self.write('DEPLOY.md', b'Example http://192.168.1.10:8000/\n')
+        self.git('add', 'DEPLOY.md')
+        self.assertEqual(self.audit()[0], [])
+        address = ':'.join(('fd12','3456','789a','','1'))
+        self.write('DEPLOY.md', ('SERVER=[' + address + ']\n').encode())
+        self.assertTrue(self.audit()[0])
 
 
 if __name__ == '__main__':

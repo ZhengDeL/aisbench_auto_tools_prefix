@@ -1,430 +1,310 @@
-# add：多场景性能测试与并发摸高
+# AISBench 自动化使用与维护
 
-`run_perf_scenarios.sh` 负责管理 AISBench 压测容器、生成运行配置、执行固定并发和摸高搜索，并汇总、归档结果。实际请求仍由项目根目录的 `aisbench_test.py` 发出。
+本说明对应 **v2026.10.19 发布候选**。文中的行为和校验命令是使用、实现和验收约定，不代表所有实机场景已经验收。日常启动入口和默认配置均在仓库根目录：`run_perf_scenarios.sh`、`env.env`。
 
-**所有增补功能和公开配置仅放在 `add/`，`add/` 之外原样复用上游。** 当前基线为 [rayn-zzz/aisbench_auto_tools_prefix 提交 ef2b6d8](https://github.com/rayn-zzz/aisbench_auto_tools_prefix/commit/ef2b6d8653d57487b622b0dc9db458f8a1e8dec6)，完整提交号为 `ef2b6d8653d57487b622b0dc9db458f8a1e8dec6`。外层文件清单、内容字节和 Git 文件模式与该提交一致；根目录的 `config.py`、`default_api.py`、README 及上游示例均保持原样，不新增外层 `.gitignore` 或 `.github` 工作流。底层参数与数据集生成方式见[上层 README](../README.md)。
+## 目录与修改位置
 
-本版开发分支为 `feat/n-config-runs-20261019`，版本标签为 `v2026.10.19-n-config-upstream-clean`。更新基础仓时，先确认新的上游提交，再原样同步全部 `add/` 之外的文件、更新 `add/upstream_manifest.json` 基线及 `validate_publication.py` 中固定的提交号和清单校验值，并执行发布检查；兼容适配继续放在 `add/`。运行配置只写入各任务压测容器里的源码副本，不回写本地上游文件。
+| 位置 | 职责及修改边界 |
+|---|---|
+| 根目录 `env.env` | 服务、镜像、路径和场景；日常只改这里即可 |
+| 根目录 `run_perf_scenarios.sh` | 定位安装目录、检查 Python、启动管理器 |
+| `aisbench_auto_tools_prefix/` | 选定上游的原生源码；不加入增补代码，不产生运行文件 |
+| `automation/core/aisbench_run_manager.py` | 加载及冻结配置、全部任务预检、并行调度、互斥、取消、容器身份监督 |
+| `automation/core/aisbench_configuration.py` | 公开参数默认值、参数校验、场景展开和执行计划 |
+| `automation/core/aisbench_worker.py` | 单任务容器准备、原生源码副本配置、固定轮次与摸高调用 |
+| `automation/core/aisbench_execution.py` | 一次实际执行及请求/结果作用域判定 |
+| `automation/core/aisbench_perf_matrix.py` | 摸高搜索、复测、预算及终态 |
+| `automation/core/aisbench_perf_matrix_config.py` | 独立摸高入口的默认配置接口 |
+| `automation/core/aisbench_result_adapter.py` | 按表头读取原生结果、23 列投影、单位及适用性校验 |
+| `automation/core/aisbench_result_validation.py` | 运行时及离线共用的作用域、原始来源、完整性和结果检查，也可单独执行 |
+| `automation/core/aisbench_artifact_archive.py` | 保存原始证据、作用域、清单与校验值 |
+| `automation/core/aisbench_batch_results.py` | 批次/任务索引、合并视图及一致快照发布 |
+| `automation/core/aisbench_logging.py` | 人类日志、结构化事件、脱敏及写盘错误传播 |
+| `automation/tools/` | `validate_publication.py` 发布审计与 `check_all.sh` 唯一离线门禁 |
+| `automation/tests/` | 启动、配置、算法、归档、输出及故障回归测试 |
+| `automation/examples/` | 两份可改名的小规模完整配置 |
+| `automation/metadata/upstream_manifest.json` | 原生仓基线、文件内容和文件模式清单 |
+| `outputs/` | 运行日志、原始结果和验证报告，不作为公开源码提交 |
 
-## 1. 运行条件
+新增参数时同步修改参数定义、使用它的执行模块、配置末尾参考和相应测试；新增执行行为或算法时修改负责该行为的模块。无需为了修改输入长度、并发、服务地址而改 Python。原生接口发生变化时，兼容逻辑继续放在 `core/`。
 
-- Linux、Bash、Python 3，以及 `tar`、`awk`、`sed`、`grep`、`find`、`base64` 等常用命令。镜像内使用 Python 3.11。
-- Docker 已启动，当前用户可以执行 `docker` 命令。
-- 可以使用镜像 `ghcr.io/aisbench/aisbench_benchmark:v3.1-20261013-master-openeuler24.03-py311`；镜像架构须与压测主机匹配。
-- 宿主机能读取模型权重目录，镜像内 AISBench、transformers 能加载对应 tokenizer。
-- 被测推理服务可从压测容器访问；需要缓存指标时，各 `POD_INFO` 端点的 `/metrics` 也应可访问。
+## 运行条件与启动
 
-脚本使用宿主机网络创建带管理标签的专用压测容器。复用前核对管理标签、镜像、模型权重和输出挂载；仅已确认属于本工具的容器可按固定容器 ID 重建。遇到同名未知镜像或无标签容器会报错停止。升级旧版无标签工具容器时，可以指定新的 `CONTAINER_NAME`，由脚本创建；它不会部署或自动删除模型服务。
+需要 Linux、Bash、Python 3.7+、Docker 和常用 Linux 工具。默认镜像为：
 
-## 2. 快速开始
-
-首次获取仓库：
-
-```bash
-git clone --branch feat/n-config-runs-20261019 https://github.com/ZhengDeL/aisbench_auto_tools_prefix.git
-cd aisbench_auto_tools_prefix/add
+```text
+ghcr.io/aisbench/aisbench_benchmark:v3.1-20261013-master-openeuler24.03-py311
 ```
 
-已有仓库时，进入其 `add/` 目录。日常使用直接修改 `env.env`，然后将完整配置文件传给脚本，**无需先 `source`**：
+宿主机架构须匹配镜像；宿主机模型路径应可读，镜像内 tokenizer 应能加载。被测模型服务应已就绪，且能由使用宿主机网络的 AISBench 容器访问。需要缓存指标时，相关 `/metrics` 地址也须可访问。
+
+在仓库根目录运行，无需先 `source`：
 
 ```bash
 vi env.env
 bash run_perf_scenarios.sh ./env.env
 ```
 
-`env.env` 上半部分填写模型名、权重路径、服务地址、NPU 数和指标端点；下半部分的 `SCENARIOS_JSON` 填写测试场景。仓库中提供的是公开示例，使用前改为实际配置。显式传入文件时，脚本自动加载该文件的全局参数，并直接读取同一文件的场景 JSON；场景无需 `export`。
-
-原来不传配置文件的用法仍兼容：
+默认配置包括两组 64K 输入场景、固定并发和摸高。只验证流程时先改小规模示例中的模型和地址：
 
 ```bash
-source ./env.env
-bash run_perf_scenarios.sh
+vi automation/examples/test_a.env
+bash run_perf_scenarios.sh automation/examples/test_a.env
 ```
 
-零参数模式沿用当前 shell 的全局参数，直接读取 `add/env.env` 的场景；它不会自动加载全局参数。每次修改配置后，建议使用上面的显式文件方式运行，避免沿用上次加载的值。
+该示例为输入 1024、输出 512、固定并发 4，默认主测试请求数为 16，不摸高。原生数据准备、预热或前缀准备不应与主测试请求数混为一谈。
 
-| 项目 | 当前 `env.env` 的值 |
-|---|---|
-| `MODEL_NAME` | `your-model` |
-| `MODEL_HOST_PATH` | `/mnt/models/your-model` |
-| `HOST_IP` / `HOST_PORT` | `192.168.1.10` / `8000` |
-| `NPU_NUM` | `1`，按实际统计口径修改 |
-| `MAX_CONTEXT_LEN` | `133120` |
-| `POD_INFO` | 空；需要前缀指标时填写实际 prefill metrics 端点 |
-| `PEAK_HARD_CAP` | `1`，沿用原增补仓加载 env 后到顶即停的策略 |
-
-`NPU_NUM` 是吞吐归一化的分母：`single_output_throughput = output_throughput / NPU_NUM`，`single_E2E_throughput = E2E_throughput / NPU_NUM`；全局吞吐保持整轮统计值。用户必须按报告单位填写参与测试的设备总数：按物理卡报告就填物理卡数，按 NPU 芯片报告就填芯片数，并在报告中注明口径。A3 一张物理卡包含 2 颗 NPU 芯片，两种口径对应的归一化吞吐相差 2 倍。默认 `1` 是示例值，脚本不会自动探测硬件。`POD_INFO` 的端点数量也不会自动设置 `dp`；当前场景没有显式设置 `dp`，底层默认是 `1`。
-
-### 一次启动 1 到 N 份配置
-
-可以传入任意数量的完整配置文件。每份自动加载自己的全局参数和场景，一份配置对应一个任务和一个压测容器；同一任务内的固定并发及摸高仍顺序执行：
+N 份完整配置可一次启动，文件名不写死：
 
 ```bash
-vi test_a.env
-vi test_b.env
-bash run_perf_scenarios.sh ./test_a.env ./test_b.env
+bash run_perf_scenarios.sh automation/examples/test_a.env automation/examples/test_b.env
 ```
 
-需要三组、四组或更多组时，继续添加配置文件参数即可，例如：
+也可使用自己的文件名，例如 `./prefill.env`、`./decode.local.env`；路径含空格时加引号。任务名取文件名，去掉 `.env` 或 `.local.env` 后，须以英文字母或数字开始，只包含英文字母、数字、点、下划线和短横线。
 
-```bash
-bash run_perf_scenarios.sh ./a.env ./b.env ./c.env ./d.env
-```
+每份配置启动一个专用 AISBench 客户端容器；默认名为 `aisbench-<任务名>-<批次号>`。模型服务由用户管理。各任务并行，单个任务中的测试轮次顺序执行。容器名与输出标签中的过长或特殊名称会截短并附校验后缀，索引保留原始名称。
 
-`a`、`b`、`c`、`d` 只是示例，任务名从实际配置文件名派生，不是写死的组别。每份文件必须包含完整全局参数和一个 `SCENARIOS_JSON` 块。`test_a.env`、`test_b.env` 两份公开示例都是 1K 输入、512 输出、4 并发，无摸高和前缀预热；固定请求倍率为 `4`，每组发出 `16` 条主测试请求。填写实际模型别名、权重路径、服务地址和 NPU 数后再运行。
+## 配置加载与优先级
 
-默认压测容器名为 `aisbench-<task>-<batch_id>`，如 `aisbench-test_a-<batch_id>`；同一批任务共享批次标记，重跑会创建新容器，保留此前批次容器。结果目录和命名文件仍同时包含任务名与模型名，如 `test_a__your-model-a`、`test_b__your-model-b`。配置文件名须以字母或数字开头，只含字母、数字、点、下划线和短横线；任务名从文件名去掉 `.env` 或 `.local.env` 后缀得到。任务名和模型名按脚本规则生成安全名称，任务与模型输出身份冲突会被拒绝。每组拥有自己的配置、容器、日志、CSV、摸高报告和 `latest`，不同任务即使含同名场景也分别保存。需要固定容器名或结果根目录时，可在各自文件中设置独立的 `CONTAINER_NAME`、`HOST_OUTPUT_DIR`；批次结果表会记录实际路径。
+一份配置包含全局参数和一个 `SCENARIOS_JSON` 块。全局参数由 Bash 加载一次；场景 JSON 由工具从同一份冻结配置中直接读取，不需要导出为环境变量。配置文件会执行其中的 Shell 语句，只运行自己信任的文件。
 
-启动前统一校验全部配置、服务身份和资源锁。配置非法、容器重名、结果目录重叠、指向同一服务，或服务/容器/目录正在被另一批任务占用时，整批报错，不启动压测。一组运行失败时，其余组继续；所有组成功才返回 `0`，任一失败则整批返回非零。
-
-### 同一服务不能同时测试
-
-服务身份优先依据实际 `API_URL`，未设置时依据 `HOST_IP/HOST_PORT`。相同 host 和端口即判为同一端点，更换模型别名、URL 路径或鉴权信息不会把它变成另一服务。一个服务同时承受多组压测会影响结果，因此脚本拒绝这种配置。
-
-不同代理地址如果仍指向同一后端，在对应配置里填写相同的可选 `SERVICE_ID`，例如：
-
-```bash
-export SERVICE_ID=shared-backend-01
-```
-
-`SERVICE_ID` 用于补充后端身份；不能用不同的 `SERVICE_ID` 绕过同端点检查。相同 IP 的不同端口只有确实对应独立模型实例时才适合并行；脚本无法自动识别代理后的部署拓扑。不同服务共享缓存指标端点时，指标仍可能混合，应按实际拓扑解释。
-
-锁在当前压测主机上跨批次生效，防止本机另一轮占用相同服务、容器或输出目录；它不是跨主机中央锁。多台压测主机仍需自行协调，避免同时请求同一后端。
-
-取消或异常退出后，如果无法确认原压测进程及容器停止，任务标记为 `cleanup_failed`，本机对应服务、容器和输出目录会保持资源隔离，后续冲突任务被拒绝。再次启动时，只在相同 Docker daemon 中按原完整容器 ID 只读确认该工具容器已停止或不存在后，才自动解除隔离；无法查询、daemon 不同或身份不明时继续阻断。请按批次记录检查原固定 ID 的工具容器，不要删除锁文件、隔离记录，或通过换名绕过。隔离记录无法写入时，管理进程会保留资源锁并重试，需先恢复锁目录可写。
-
-### 批次状态与结果
-
-显式传入 1 到 N 份文件时，批次目录位于 `outputs/parallel/<批次标记>/`，包含 `batch_results.json`、`batch_results.csv` 和跨任务的 `merged_metrics.csv`。状态表记录每个任务、模型、退出码、实际输出位置及日志路径；时间同时标明时区。配置保存脱敏快照，用于核对本批使用的设置，鉴权值等敏感信息不写入快照。
-
-默认每组位于批次的 `tasks/<task__model>/` 下，直接提供带任务和模型名的 `<task__model>__all_results.csv`、`<task__model>__launcher.log`；原来的 `scenario_results/<运行标记>/all_results.csv` 和详细归档仍保留。设置 `HOST_OUTPUT_DIR` 后以状态表指向的实际目录为准。详细结构及合并规则见第 7 节。
-
-启动时固定本批各配置文件内容；运行中编辑文件在下次启动时生效。配置路径按启动目录解析，建议使用绝对路径；不要依赖配置文件里的 `BASH_SOURCE` 定位相邻文件。
-
-按 `Ctrl+C` 会停止本批任务的压测进程和专用压测容器，避免继续发送请求，保留容器及已有产物；不停止模型服务容器。
-
-## 3. 先用小场景验证流程
-
-当前 `env.env` 中的场景会执行多轮 64K 测试和摸高搜索。只想检查配置与流程时，将所用配置文件末尾的 `SCENARIOS_JSON` 块替换为下面的小场景；这是文件内容，无需 `export`：
-
-```bash
-SCENARIOS_JSON=$(cat <<'JSON'
-[
-  {
-    "name": "smoke",
-    "input_len": "1024",
-    "output_len": "512",
-    "concurrency": [4],
-    "request_rate": "0",
-    "data_num": "4"
-  }
-]
-JSON
-)
-```
-
-保存后按第 2 节将所用配置文件传给脚本运行；无需手动加载。上例是 1K 输入、512 输出、4 并发，共 4 条主测试请求，没有 `"max"`，不会摸高，也没有前缀预热。出现结果文件和 `passed` 只能确认该轮流程检查通过，回答内容仍需另外核验。
-
-旧版 `SCENARIOS_JSON_OVERRIDE` 已不再支持；如果当前环境仍设置了它，脚本会报错停止。先 `unset SCENARIOS_JSON_OVERRIDE`，再把场景移到所用配置文件。
-
-## 4. 全局环境变量与文件配置优先级
-
-下表是**未设置对应环境变量时，脚本自身使用的回退值**。模型、路径和地址均为公开示例。显式传入 1 到 N 份配置时，脚本分别加载每份完整文件；未指定容器名时按第 2 节以任务名和批次派生，结果目录以任务名、模型名和批次派生。零参数兼容模式仍以当前环境值为准。
-
-| 环境变量 | 脚本回退值 | 用途 |
+| 启动方式 | 全局参数来源 | 场景来源 |
 |---|---|---|
-| `MODEL_NAME` | `your-model` | 服务识别的模型名称 |
-| `MODEL_HOST_PATH` | `/mnt/models/your-model` | 宿主机权重目录，用于 tokenizer |
-| `HOST_IP` | `192.168.1.10` | 推理服务地址 |
-| `HOST_PORT` | `8000` | 推理服务端口 |
-| `NPU_NUM` | `1` | `single_*` 吞吐的分母；按报告单位填写物理卡数或 NPU 芯片数 |
-| `POD_INFO` | 空 | 逗号分隔的 metrics 地址；生成配置时转为列表 |
-| `API_KEY` | 空 | 鉴权 Key |
-| `API_URL` | 空 | 自定义服务 URL，映射到容器内 `config.py` 的 `URL`，并优先用于服务身份检查 |
-| `SERVICE_ID` | 未设置 | 不同代理共用同一后端时填写相同值，补充本机互斥检查 |
-| `FAILED_REQ_LIMIT` | `0` | 解析到的失败请求数超过此值时判失败 |
-| `MAX_CONTEXT_LEN` | `512000` | 场景的输入加输出长度上限；加载当前 env 后为 `133120` |
-| `CONTAINER_NAME` | `ais_bench-example` | 压测容器名 |
-| `EXPECTED_IMAGE` | `ghcr.io/aisbench/aisbench_benchmark:v3.1-20261013-master-openeuler24.03-py311` | 压测镜像 |
-| `HOST_OUTPUT_DIR` | `${PROJECT_ROOT}/outputs/default` | 宿主机结果根目录 |
-| `TOOLS_HOST_DIR` | `$PROJECT_ROOT` | 同步到容器的工具目录 |
-| `DATA_NUM_MULTIPLIER` | `4` | 固定并发主测试请求数倍率，须为正整数 |
-| `PEAK_MIN_CONCURRENCY` | `1` | 场景未指定时的摸高初始下界 |
-| `PEAK_MAX_MULTIPLIER` | `20` | 未指定 `peak_max_cc` 时，首个固定并发 × 此值；无固定档时为全局 `PEAK_MIN_CONCURRENCY` × 此值 |
-| `PEAK_DATA_MULTIPLIER` | `4` | 场景未指定时的摸高请求数倍率 |
-| `PEAK_WAIT_SECONDS` | `10` | 场景未指定时的摸高轮间等待秒数 |
-| `PEAK_TTFT_LIMIT` | `5` | 场景未指定时的 TTFT 阈值，单位秒 |
-| `PEAK_TPOT_LIMIT` | `50` | 场景未指定时的 TPOT 阈值，单位毫秒 |
-| `PEAK_HARD_CAP` | `0` | `0` 保留自动扩容；`1` 以各场景的 `peak_max_cc` 为硬上限 |
+| `bash run_perf_scenarios.sh ./env.env` | 指定文件；受支持全局参数不继承调用者的同名值 | 指定文件的 JSON 块 |
+| `bash run_perf_scenarios.sh ./a.env ./b.env` | 每份文件独立加载，彼此隔离 | 每份文件自己的 JSON 块 |
+| `bash run_perf_scenarios.sh` | 先自动加载根目录 `env.env`，再按“是否已导出”保留父进程的受支持全局覆盖值 | 根目录 `env.env` 的 JSON 块 |
 
-`PROJECT_ROOT` 是脚本定位到的项目根目录。容器内固定路径为 `/workspace/model`、`/workspace/aisbench_dataset`、`/workspace/aisbench_outputs` 和 `/workspace/aisbench_auto_tools_prefix-main`，它们不是上述环境变量的宿主机路径。
+零参数模式兼容已有 `export` 用法，例如父进程已导出的 `PEAK_HARD_CAP=0` 会覆盖文件中的 `1`。空 `API_KEY` 也按存在性保留；随后各参数的空值校验和默认回退仍按参数类型处理。推荐显式传文件，避免旧 shell 中的值影响复现。
 
-配置按下面的规则生效：
+未提供的参数使用代码默认值；场景中的对应字段覆盖该场景的全局默认。每份配置的内容及 SHA 在启动时冻结，运行中编辑文件只影响下一批次。配置相对路径和用户填写的相对宿主机路径按启动时工作目录解析；配置会从冻结副本加载，不应依靠 `BASH_SOURCE` 在临时位置查找相邻文件。
 
-1. 显式传入文件时，每份完整配置自动加载，全局参数与场景使用同一文件；请直接在对应文件里填写组内参数。零参数兼容模式使用当前 shell 已加载的全局参数，场景始终读取 `add/env.env`。场景 JSON 不从环境变量取值。
-2. 场景显式填写的 `ttft_limit`、`tpot_limit`、`peak_min_cc`、`peak_max_cc`、`peak_data_multiplier`、`peak_wait` 优先于相应的 `PEAK_*` 环境默认。
-3. shell 把最终场景值作为命令行参数传给摸高引擎，覆盖 `aisbench_perf_matrix_config.py` 中对应的默认值。场景填写 `npu_num` 时，也会优先于全局 `NPU_NUM`。
+`env.env` 和两个示例的末尾都附有**仅作注释、不会执行**的完整参数参考，覆盖 31 个公开全局参数、场景 JSON 字段及独立摸高 CLI。每项说明默认值、单位、作用域、覆盖、空值和示例。应区分：
 
-例如，当前场景已写入 TTFT=15 秒、TPOT=60 毫秒，仅设置 `PEAK_TTFT_LIMIT=5`、`PEAK_TPOT_LIMIT=50` 不会改变它们。请直接修改所用配置文件中的场景字段。
+- **代码默认值**：未配置时采用，例如 `PEAK_HARD_CAP=0`、`MAX_CONTEXT_LEN=512000`。
+- **本文件有效赋值**：公开默认文件明确设置 `PEAK_HARD_CAP=1`、`MAX_CONTEXT_LEN=133120`，场景设置 TTFT 15 秒、TPOT 60 毫秒。
+- **实际运行值**：以本批次的脱敏配置快照和计划为准；编辑配置后，末尾参考中的示例不会自动变化。
 
-### 使用其他配置文件
+固定轮次未指定 `data_num` 时，使用 `配置并发 × DATA_NUM_MULTIPLIER`，该全局倍数默认 `4`。重复并发合法，如 `[1, 10, 10, 20, "max"]`；重复的固定轮次使用独立名称和归档，不覆盖前一轮。`"max"` 表示增加一次摸高，不是一个固定并发数。
 
-普通使用继续编辑 `env.env` 即可；需要保存多套配置时，可以使用任意合法文件名。被 Git 忽略的 `env.local.env` 可保存本地真实配置，在 `add/` 目录直接执行：
+`NPU_NUM` 是归一化吞吐分母，不自动发现硬件。按物理卡报告就填物理卡数，按芯片报告就填芯片数，并在报告注明。A3 一张物理卡含两颗 NPU 芯片，两种分母的结果不同。`POD_INFO` 数量不自动设置 `dp`；指标端点共享时，缓存计数也可能包含其他流量。
 
-```bash
-bash run_perf_scenarios.sh ./env.local.env
-```
+## 服务隔离、容器与取消
 
-该文件也必须同时包含完整全局参数和一个 `SCENARIOS_JSON=$(cat <<'JSON' ... JSON )` 场景块。脚本自动加载全局参数，并直接读取其中的字面 JSON 场景；不需要单独 `source`。
+所有配置先完成预检，再开始请求负载。同批次和本机不同批次之间均检查服务、容器和输出资源：
 
-### 零参数兼容模式：临时覆盖全局参数
+- 有效服务地址来自 `API_URL`；未配置时使用 `HOST_IP`、`HOST_PORT`。同一有效主机和端口禁止同时压测，换 URL 路径、协议或鉴权不能绕过。
+- 同一后端可能有不同 DNS 名或代理入口；应显式填写相同的 `SERVICE_ID`。不同 `SERVICE_ID` 也不能绕过已识别的同主机同端口冲突。
+- 锁只协调同一压测主机上的本工具，不是跨宿主机的中心锁；其他客户端流量仍需自行协调。不同端口也须确认确实对应独立服务。
+- `CONTAINER_NAME`、`HOST_OUTPUT_DIR`、`TOOLS_HOST_DIR` 可按参考设置。输出路径不允许重叠，也不允许指向原生目录或通过符号链接进入原生目录。
 
-需要继续使用旧的零参数方式时，加载配置后可以临时覆盖变量，例如：
+工具操作容器时核对管理标签、镜像、挂载和固定的完整容器 ID。未知同名容器会报错；不会因为名称相同就停止或删除其他容器。每轮执行还要确认当前名称仍指向原容器，避免中途重建后错误归属结果。
 
-```bash
-source ./env.env
-DATA_NUM_MULTIPLIER=7 CONTAINER_NAME=ais_bench_check bash run_perf_scenarios.sh
-```
+普通单任务失败后，其他独立任务可继续；批次公共日志不可写时，整个批次停止。`Ctrl+C` 或 `SIGTERM` 取消本批次负载，按已确认的固定 ID 停止本工具拥有的负载及容器，保留容器、结果和日志，不操作模型服务。
 
-`source env.env` 会覆盖该文件中定义的同名变量，因此临时覆盖应放在加载之后。显式文件模式会自动加载对应文件，请直接修改文件中的组内参数。
+无法确认负载已停止时，任务进入 `cleanup_failed` 并持久隔离相关资源。下次启动必须先确认同一 Docker daemon 上记录的原完整 ID、管理身份及停止/不存在状态。不要删除锁或隔离记录、改名绕过；先根据日志只读核对原容器。
 
-### API 与缓存指标
+## 摸高算法与终态
 
-`API_URL` 为空时，由 AISBench 根据 `HOST_IP/HOST_PORT` 构造接口地址。它的接线是 `API_URL` → 容器 `config.URL` → 模型配置 `url`。指定镜像的 chat 客户端使用 `urljoin(base_url, "v1/chat/completions")`：例如 `API_URL=http://192.168.1.10:8000/` 最终请求 `/v1/chat/completions`，带网关前缀时也应按此规则保留末尾斜杠并核验最终路径。需要鉴权时，在对应配置中填写 `API_KEY`。
+摸高的目标是在本场景、请求率、指标口径和预算下，寻找满足所选延迟 SLO 的已验证并发边界。它不代表模型在其他输入、输出、缓存或流量条件下的通用容量。
 
-终端摘要在指定 `API_URL` 时显示它的scheme、host、port和path，省略userinfo、query和fragment；未指定时显示 `HOST_IP:HOST_PORT`。摘要不改变请求接线。
+流程为：初始并发测量 → 必要时向下找可通过点 → 向上扩展形成通过/不通过区间 → 区间内二分 → 新一轮复测确认边界。`peak_min_cc` 是初始测量点，允许向下搜索到 `peak_floor_cc`；它不是永不下探的硬下限。
 
-`POD_INFO` 写入容器配置，覆盖基础 `config.py` 原来的同名值。空值生成 `[]`，底层回退到 `HOST_IP:HOST_PORT`。只有 `dataset_type=prefix_cache` 且开启 `prefix_test` 时，这条测试链路才查询缓存指标。PD 分离时应按要观察的角色填写端点；公开 env 不包含任何真实 P/D 地址；例如 `POD_INFO="192.168.1.10:9081,192.168.1.11:9081"`。
+TTFT 阈值用**秒**，TPOT 阈值用**毫秒**，从 CSV 的毫秒值换算后比较；等于阈值视为通过。某阈值不大于零时关闭该项 SLO；两项都关闭时，结果仅表示预算内的执行观测，不可解读为延迟容量。请求率大于零时，还受该请求率约束。摸高要求流式测试且输出至少 2 个 token。
 
-## 5. 当前 env 场景与请求数量
+`PEAK_HARD_CAP=1` 时不超过计划的最大并发；最大并发确认通过后标记 `peak_capped`。设为 `0` 时允许超过该上限继续扩展，例如从 200 到 400，但仍受轮次数和总时间预算约束。
 
-| 场景名 | 输入 / 输出 token | 固定并发 | 摸高初始范围 | TTFT / TPOT 阈值 |
-|---|---|---|---|---|
-| `0_ai_coding_64k256` | `65536` / `256` | `1, 10, 20, 50, 100` | `1～200` | `15 秒` / `60 毫秒` |
-| `0_ai_coding_64k1k` | `65536` / `1024` | `1, 10, 20, 50, 100` | `1～200` | `15 秒` / `60 毫秒` |
+新增的控制量可通过全局参数或对应场景字段调整：
 
-两组场景都使用 `prefix_cache`、`prefix_num=1`、`repeat_rate=0.9`、`prefix_test=true`、`request_rate=0`，摸高倍率 `4`、轮间等待 `10` 秒。`request_rate=0` 表示不限请求发送速率。
+| 全局参数 | 场景字段 | 默认值及含义 |
+|---|---|---|
+| `PEAK_PRECISION` | `peak_precision` | `1`，边界并发差精度 |
+| `PEAK_CONFIRM_RUNS` | `peak_confirm_runs` | `3`，确认阶段的新执行次数 |
+| `PEAK_CONFIRM_MIN_REQUESTS` | `peak_confirm_min_requests` | `100`，确认轮次最少主测试请求数 |
+| `PEAK_MAX_TRIALS` | `peak_max_trials` | `40`，单场景总尝试数预算，含复测和无效重试 |
+| `PEAK_TRIAL_TIMEOUT` | `peak_trial_timeout` | `1800` 秒，单次执行超时 |
+| `PEAK_TOTAL_TIMEOUT` | `peak_total_timeout` | `14400` 秒，单场景总时间预算 |
+| `PEAK_INVALID_RETRIES` | `peak_invalid_retries` | `1`，无效测量的重试次数 |
+| `PEAK_FLOOR_CONCURRENCY` | `peak_floor_cc` | `1`，允许下探的最低并发 |
 
-**固定并发**：场景写了 `data_num` 就使用该值；否则为并发数 × `DATA_NUM_MULTIPLIER`。默认倍率为 `4`，所以每个场景的五档主测试分别发出 `4、40、80、200、400` 条请求。
+普通探索轮次的主测试请求数由并发和 `peak_data_multiplier` 决定；确认阶段至少取 `max(并发 × 倍数, 最少请求数)`。这与原生 `repeat` 不同，后者保留其正常/前缀分支语义。无效或不完整数据只按限制重试；请求失败、容器故障和日志/证据错误不当作“延迟已越界”用于收缩区间。最少样本量和复测次数也不是统计置信度保证。
 
-**摸高**：每档主测试请求数为该档并发 × `peak_data_multiplier`，当前为 `4`。它独立于固定倍率；场景额外写入的 `data_num` 不会覆盖摸高引擎计算的请求数。
+| 最终 CSV 状态 | 含义 |
+|---|---|
+| `peak_confirmed` | 新复测确认的通过/失败边界达到配置精度 |
+| `peak_capped` | 硬上限已确认通过；尚未观察到更高处的失败边界 |
+| `peak_budget` | 次数或总时间预算耗尽，边界未完成确认 |
+| `peak_unstable` | 确认阶段结果发生变化或混合，无法稳定确认 |
+| `peak_no_pass` | 搜索到最低并发仍无确认通过点；不推断未测点的结果 |
+| `peak_request_error` | 请求失败超过允许值，不能当作延迟上限 |
+| `peak_error` | 进程、基础设施、日志或证据异常 |
+| `peak_cancelled` | 摸高引擎收到取消；整进程取消也可能只有批次取消状态 |
 
-因此默认流程包含 10 轮固定测试和 2 组摸高搜索，摸高探测轮数不固定。开启 `prefix_test` 的调用还会先执行前缀预热；上述请求数只指主测试。
+`peak_round` 是中间测量行，不计入最终场景成功数。当前版本仅 `peak_confirmed`、`peak_capped` 作为成功摸高终态；兼容读取旧结果中的 `peak`。预算、错误或不稳定等状态即使保留已确认点的数值，也不能改写成成功。没有确认通过点时，最终指标留空，观察值留在搜索轨迹。
 
-场景中的数字并发表示固定测试，`"max"` 表示摸高。例如只保留 `"concurrency": [1, 10]` 就不摸高。额外的底层参数可写在场景里，如 `dataset_type`、`prefix_num`、`repeat_rate`、`prefix_test`、`seed`、`dp`、`test_type`；布尔开关使用 JSON 的 `true/false`。
+选中结果来自已确认并发的一次实际主测试作用域，并记录试验和作用域身份；不拼接不同轮次的最优字段，不平均各轮 P90。每次测量的执行判定、轨迹和选中依据可在 `evaluation.json`、`search_trace.*`、`case_summary.json` 和 `peak_summary.json` 中追溯。
 
-固定并发可以重复，按数组中的顺序逐轮执行，不会去重。例如 `"concurrency": [1, 10, 10, 20, 20, 50, 100, "max"]` 会执行 7 轮固定测试，再进行 1 组摸高。相同并发首次使用 `<场景>_c10`，后续依次使用 `<场景>_c10_run2`、`<场景>_c10_run3`，CSV 和归档分别保留每轮结果；`1` 和 `"1"` 会归一化为同一并发的两轮测试。每轮仍独立应用 `data_num` 或固定请求倍率。每个场景只能写一个 `"max"`；不同场景之间的同名或归档名称冲突仍会报错。
+## 结果与数值口径
 
-固定测试支持 `test_type: "text"` 非流式模式：汇总中的四个TTFT/TPOT字段留空、终端显示N/A，保留E2E、请求计数和吞吐。非流式只有完整响应时间，即使原生误显示正TTFT，也不能用作首token延迟。流式实际只生成1个token时没有token间隔，两项TPOT同样留空，即使原生写出正值也不展示为TPOT；不伪造0。这些不适用字段仍先检查原值为空或有限非负，拒绝垃圾、NaN、inf和负数。模式写入归档manifest供后续验收，旧归档未记录模式时按stream严格读取。
-
-## 6. 摸高搜索和通过条件
-
-摸高默认比较 `TTFT avg` 和 `TPOT avg`，不是 P90。列名可在 `aisbench_perf_matrix_config.py` 的 `TTFT_COLUMN`、`TPOT_COLUMN` 中修改。
-
-摸高要求 `test_type: "stream"` 且配置输出长度至少2；shell会在初始化容器前拒绝不符合的场景，独立matrix也会在发送首个请求前检查全部case的最终参数。即使关闭SLO，也不能用非流式或无TPOT的单token响应判定通过。
-
-- CSV 中 TTFT 是毫秒，比较时除以 1000，再与秒单位的 `ttft_limit` 比较；TPOT 的数值和阈值都是毫秒。
-- 超过阈值才不满足，等于阈值可通过。阈值 ≤0 时关闭该项 SLO 比较，但仍拒绝缺失、非数字、NaN、inf、负数和 `99999` 等无效指标。
-- 进程执行失败、结果异常、缺少可靠的 `Failed Requests` 计数，或该计数超过 `FAILED_REQ_LIMIT`，都会判为不满足；已知成功请求数为零也会被拒绝。
-
-搜索先测初始区间中点。中点通过时继续探测初始上界，上界通过后通常继续翻倍；失败时向下寻找通过档位，必要时可探到并发 1，再在通过/失败边界间做整数二分。同一并发在一次搜索中使用已缓存的测量结果。
-
-**是否超过 `peak_max_cc` 继续摸高，由 `PEAK_HARD_CAP` 控制。** 脚本未收到该变量时回退为 `0`，保留自动扩容：初始上界 200 通过后可以继续探到 400、800 等。当前 `env.env` 沿用原增补仓的 `export PEAK_HARD_CAP=1`：加载后以每个场景的 `peak_max_cc` 为硬上限，到顶通过即停止；到顶失败时仍会向下搜索满足 SLO 的并发。
-
-```bash
-source ./env.env
-PEAK_HARD_CAP=1 bash run_perf_scenarios.sh
-```
-
-底层引擎还支持 `aisbench_perf_matrix_config.py` 中的 `AUTO_EXPAND_MAX_CONCURRENCY` 和命令行 `--auto-expand-max-concurrency`。数值 `0` 表示不限制扩容，正数限制后续向上探测；它本身不裁剪已指定的初始区间。shell 的 `PEAK_HARD_CAP=1` 会根据当前场景上界设置该参数。
-
-硬顶模式会在额外透传参数之后锁定初始上界和扩容上限，并拒绝额外的 `cases-json` 覆盖，以保证单个场景的上界有效。不开启硬顶时，保留底层引擎的数值上限及额外参数行为。
-
-二分和扩容依赖通过状态随并发大致单调。服务波动或非单调结果下，最终best仅是本次已测通过档位中的最高并发，不保证所有未测档位满足，更不证明真正容量极限或经过多轮重复验证的稳定容量。
-
-本镜像的原生 CSV 还提供单请求 `PrefillTokenThroughput` 统计均值，它与整轮的全局吞吐口径不同。上游未提取到全局 prefill 吞吐时会写入 `9999` 哨兵，add 汇总将其显示为空，表示该指标不可用；原始 CSV 保留用于核查。输出吞吐、输入吞吐、总 token 吞吐采用原生 JSON 的整轮指标。
-
-## 7. 结果目录、指标和状态
-
-显式配置模式默认按批次和任务保存，便于直接识别每份配置对应的模型：
+单份与多份配置使用同一结构：
 
 ```text
-outputs/parallel/<批次标记>/
-├─ batch_results.csv / batch_results.json
-├─ merged_metrics.csv
-└─ tasks/
-   ├─ test_a__your-model-a/
-   │  ├─ test_a__your-model-a__all_results.csv
-   │  ├─ test_a__your-model-a__launcher.log
-   │  ├─ scenario_results/<运行标记>/all_results.csv
-   │  └─ ...各轮详细归档
-   └─ test_b__your-model-b/
-      ├─ test_b__your-model-b__all_results.csv
-      ├─ test_b__your-model-b__launcher.log
-      ├─ scenario_results/<运行标记>/all_results.csv
-      └─ ...各轮详细归档
+outputs/default/<批次号>/
+├── batch_state.json                 # 全局阶段、原因和退出码，包括早期预检失败
+├── batch_results.json               # 任务、终态、实际路径及快照入口
+├── batch_results.csv                # 每任务状态与计数
+├── merged_metrics.csv               # 带任务身份的各任务指标行
+├── .generations/<代号>/             # 一次完整发布的不可变快照
+├── logs/
+│   ├── batch.log                    # 面向人的批次关键日志
+│   ├── events.jsonl                 # 批次结构化事件
+│   ├── archive_index.json           # 管理日志封存来源、分段顺序及原始/gzip校验值
+│   ├── archive/<封存号>/            # gzip字节段，原始日志继续保留
+│   └── preflight/                   # 配置加载、预检和 Docker 诊断
+└── tasks/<配置名>__<模型名>/
+    ├── config.redacted.json
+    ├── result_index.json
+    ├── <配置名>__<模型名>__all_results.csv
+    ├── <配置名>__<模型名>__execution.log
+    ├── <配置名>__<模型名>__launcher.log
+    ├── .launcher/<运行号>/
+    │   ├── runtime.json             # 完整容器 ID、运行身份、进度和结果位置
+    │   ├── launcher.log
+    │   ├── stdout.raw.log
+    │   └── stderr.raw.log
+    ├── scenario_results/<运行号>/
+    │   ├── all_results.csv
+    │   ├── result_scopes.json
+    │   ├── execution.log
+    │   ├── events.jsonl
+    │   └── fixed_<轮次>/...          # evaluation、作用域、原始文件及校验清单
+    └── peak_<场景和运行标识>/...       # 每轮原始结果、搜索轨迹及最终摘要
 ```
 
-`merged_metrics.csv` 在每组原始 23 列之外增加任务、模型、配置和结果来源等身份字段，逐行保留原始指标；不对不同服务的吞吐做相加或平均。摸高的 `peak_round` 仍是探测过程，最终 `peak` 才是该次搜索选出的 best；不能把每条 `peak_round` 当成一个新的场景计数。任务失败和没有生成有效结果的情况以 `batch_results.*` 为准，不能只看合并文件里已有的指标行。
+自定义输出目录时，批次索引仍是入口，任务原始文件可位于自定义路径。`latest.json` 及可用时的 `latest` 符号链接用于快速访问；失败或中断后不可仅凭 `latest` 判断本批次结果，应核对批次号、运行号和状态。
 
-零参数兼容模式默认结果根目录仍为项目下的 `outputs/default`。各模式均允许用每份配置的 `HOST_OUTPUT_DIR` 覆盖实际结果根目录，显式配置模式由批次状态表记录它。每组内部仍保留以下结构：
+批次 JSON 的 `generation_dir` 和 `generation_hashes` 指向一次一致快照；需要严格一致的机器读取，应从该入口读取同一代文件。顶层 CSV 为便捷入口。合并视图增加 `task,model,endpoint,service_id,run_id,source_csv` 六个身份字段，随后保留 23 列指标；不合并不同服务的测量口径。
 
-```text
-<HOST_OUTPUT_DIR>/
-├─ scenario_results/<本轮时间戳>/
-│  ├─ all_results.csv
-│  └─ execution.log
-├─ scenario_results/latest -> <本轮结果目录>
-├─ performance_<场景>_c<并发>_<归档时间>/
-│  ├─ aisbench_result.csv
-│  ├─ aisbench.log
-│  ├─ captured_outputs/
-│  └─ archive_manifest.json
-└─ peak_<场景>_peak_<搜索时间>_<本轮标记>/
-   ├─ peak_search_report.json
-   ├─ peak_search_report.csv
-   ├─ peak_search_report_all.csv
-   ├─ peak_search_report.md
-   ├─ peak_search.log
-   ├─ archive_manifest.json
-   └─ <场景>_peak/
-      ├─ search_trace.csv / search_trace.json / search_trace.md
-      ├─ best_result.csv
-      ├─ case_summary.json
-      └─ run_001_cc_<并发>/
-         ├─ command.txt
-         ├─ request_meta.json
-         ├─ process.log
-         ├─ aisbench_result.csv
-         └─ evaluation.json
-```
-
-`captured_outputs/` 仅在存在符合条件的本轮新产物时生成。`execution.log` 保存测试容器输出和最后的汇总表，不包含所有宿主机初始化及进度信息。固定测试在 benchmark 非零退出时可能尚未归档；不能假定每个失败任务都已有完整 `performance_*` 目录。归档清单记录文件列表，不提供内容哈希校验。
-
-源 CSV 兼容旧版 20 列和当前上游 24 列，按列名投影；原始 CSV 保留在归档中，场景汇总固定为以下 **23 列**：
+每任务汇总保留以下 **23 列及顺序**，按原生表头名称读取，支持相应旧/新原生列格式，不按位置盲取：
 
 ```text
 scenario,current_time,input_len,output_len,total_req,max_cc,cc,rr,TTFT avg,TTFT P90,TPOT avg,TPOT SLO_P90,E2E_time,output_throughput,single_output_throughput,E2E_throughput,single_E2E_throughput,qps,qpm,input_token_throughput,prefill_token_throughput,repeat_rate,status
 ```
 
-| 字段 | 含义与单位 |
+| 字段 | 解释与单位 |
 |---|---|
-| `scenario` / `current_time` | 测试任务名 / 结果采集时间 |
-| `input_len` / `output_len` | 上游记录的输入 / 输出长度统计，token；以实际记录为准 |
-| `total_req` / `rr` | 主测试总请求数 / 配置的请求发送速率 |
-| `TTFT avg` / `TTFT P90` | 平均 / P90 首字延迟，**毫秒** |
-| `TPOT avg` / `TPOT SLO_P90` | 平均 / P90 每输出 token 时延，毫秒 |
+| `scenario`, `current_time` | 展开的轮次名、原始测量的时间标识；重复轮次独立标识 |
+| `input_len`, `output_len` | 原始测量得到的 token 长度；可能因 tokenizer/模板与配置目标不同 |
+| `total_req` | 选定主测试作用域的请求数，不累加预热、其他尝试或其他轮次 |
+| `max_cc`, `cc` | 原生测得的最大/平均并发，不是填写的目标并发；目标见场景与摸高摘要 |
+| `rr` | 原生请求率字段，保留其数值口径 |
+| `TTFT avg`, `TTFT P90` | 首 token 延迟，毫秒 |
+| `TPOT avg`, `TPOT SLO_P90` | token 间延迟及其 P90，毫秒 |
 | `E2E_time` | 整轮 Benchmark Duration，秒；不是单请求 E2EL |
-| `output_throughput` / `E2E_throughput` | 输出 / 总 token 吞吐，token/s |
-| `single_output_throughput` / `single_E2E_throughput` | 上述全局吞吐除以 `NPU_NUM`；按所填物理卡数或芯片数解释，并注明报告单位 |
-| `qps` / `qpm` | 请求吞吐，每秒 / 每分钟 |
-| `input_token_throughput` / `prefill_token_throughput` | 输入 / prefill 吞吐，token/s |
-| `cc` / `max_cc` | 上游测量的 Concurrency / Max Concurrency；不保证 `cc` 等于配置档位，固定任务名 `_cN` 中的 N 表示指定并发 |
-| `repeat_rate` | 场景配置的前缀重复率，**不是实测缓存命中率** |
+| `output_throughput`, `E2E_throughput` | 全局输出/输入加输出吞吐，token/s |
+| `single_output_throughput`, `single_E2E_throughput` | 对应全局吞吐除以 `NPU_NUM`，分母口径必须注明 |
+| `qps`, `qpm` | 请求/s、请求/min |
+| `input_token_throughput`, `prefill_token_throughput` | 原生对应吞吐，token/s；不拿不同分母的字段互相填充 |
+| `repeat_rate` | 配置的前缀重复比例，不是实测缓存命中率 |
+| `status` | 固定轮次执行判定、摸高中间轮次或最终状态 |
 
-新版源 CSV 的 `model_name`、`E2EL avg/P90` 没有加入这张 23 列汇总；查看原始 CSV 可获得这些字段。
+不适用的值留空，不写成零。文本模式没有流式 TTFT/TPOT；只有一个输出 token 的流式结果没有有效 TPOT；缺失的原生 prefill 吞吐占位值不作为真实吞吐。精度测试使用独立精度证据，不能把缺失性能项伪造为有效性能值。原生新增的 E2EL 等额外字段保留在原始文件中，不悄悄改变 23 列兼容接口。
 
-| `status` | 实际含义 |
-|---|---|
-| `passed` | 固定测试执行、按模式适用的结果字段检查通过，成功请求数非零且失败数未超限；text的四延迟及单token缺失TPOT可为空；**不检查 TTFT/TPOT SLO** |
-| `peak_round` | 一次摸高探测的实时记录，可能满足，也可能不满足；是否通过及原因见 `search_trace.*`、`evaluation.json` |
-| `peak` | 摸高搜索成功完成后选出的最终 best 行 |
-| `failed` | 执行、归档或结果校验失败，失败请求数超限，或摸高未找到满足档位等 |
-| `no_result` | 流程返回成功但汇总未提取到结果，属于异常 |
+固定轮次 `passed` 表示执行和适用的数据/请求完整性检查通过，不表示已经按摸高 SLO 筛选。`failed`、`no_result` 表示执行或结果失败。中间摸高行及最终摸高状态见上一节。控制台为可读性格式化，数值核验以保存的原始作用域和 CSV 为准。
 
-场景和已知参数先校验，非法值在 Docker 初始化和发请求前报错。单个测试失败记录状态后继续后续任务；只要出现 `failed/no_result`，整批最终返回非零退出码。全部任务成功才返回 `0`；容器准备或文件同步失败也会立即退出。最终打印“全部测试完成”不代表所有行通过，应同时检查退出码、CSV 和搜索明细。
+## 日志排查与保留
 
-计数从标签后的值解析，支持时间戳日志和表格格式，日期不会被拼入失败数。CSV 的写入与读取使用标准 CSV 规则，场景名可以包含逗号和双引号；场景名不接受单引号、竖线、换行或空值。非法开关、非整数并发/请求数、负倍率、非有限 SLO，以及冲突的归档名称会明确报错。
+日志在加载配置和进行预检前建立，因此配置语法错误、预检失败也应有批次目录和原因。推荐依次查看：
 
-## 8. 检查结果
+1. `batch_state.json`、`batch_results.json` 与 `logs/batch.log`：哪份配置、哪个阶段、为什么结束。
+2. 对应任务 `__execution.log` 和 `__launcher.log`：场景、固定并发或摸高轮次及其失败原因。
+3. `logs/preflight/`、`.launcher/<运行号>/stdout.raw.log`、`stderr.raw.log`：配置加载和进程原始输出。
+4. 该轮 `evaluation.json`、`result_scopes.json`、原始 CSV/JSON/SQLite/NPY 和清单：核对请求数、指标、选中作用域及文件校验值。
+5. 摸高 `search_trace.*` 与 `peak_summary.json`：区分 SLO 不通过、无效测量、请求错误、预算和基础设施问题。
 
-零参数兼容模式在 `add/` 目录查看本轮汇总：
+人类关键日志带时间、级别、任务和事件；`events.jsonl` 保留序号、批次及结构化原因，任务事件由任务自身写入，不让多个进程混写一个文件。配置加载的 stdout/stderr 和任务 stdout/stderr 分别保真保存；人类日志另行解码、脱敏及压缩重复进度，避免把完整私有输出直接打印到终端。
 
-```bash
-OUTPUT_ROOT="${HOST_OUTPUT_DIR:-$(cd .. && pwd)/outputs/default}"
-cat "$OUTPUT_ROOT/scenario_results/latest/all_results.csv"
-tail -n 30 "$OUTPUT_ROOT/scenario_results/latest/execution.log"
-```
+日志和原始证据属于私有运行材料：可能含真实 IP、模型路径、请求内容或输出的凭据。脱敏配置及人类日志也不等于可以直接公开；分享前单独审查。源码仓示例只用 `192.168.1.x` 地址，不提交真实配置和输出。
 
-显式配置模式先查看终端打印的批次目录中的 `batch_results.json` 或 `batch_results.csv`，核对所有任务状态和退出码，再按记录的实际路径查看带 `<task__model>` 的汇总、日志及 `merged_metrics.csv`。默认结果位于批次的 `tasks/` 下；使用 `HOST_OUTPUT_DIR` 时按状态表记录的实际根目录检查。下面的产物校验命令应分别对每个任务执行，将 `OUTPUT_ROOT` 改为该任务的实际输出根目录。
+任务日志读写或原始流保存失败会传给监督器并停止受影响负载，公共批次日志失败停止整个批次；不能一边丢日志一边报告成功。正常日志位置无法创建时，会尝试建立应急日志并打印位置；全部持久位置都不可用时，不启动压测。关键身份及状态事件落盘，关闭也检查写入错误。强杀或掉电仍可能丢失尚未刷盘的尾部，遗留 `running` 状态不等于成功。
 
-离线检查插件本身，不调用 Docker、不请求模型：
+容器退出时，先从 `runtime.json` 取故障时的**完整 ID**，再只读核查，例如：
 
 ```bash
-python3 validate_addon.py
-python3 -m unittest discover -s . -p 'test_*.py'
+docker inspect '<原完整容器ID>' --format 'ID={{.Id}} OOM={{.State.OOMKilled}} Exit={{.State.ExitCode}} Started={{.State.StartedAt}} Finished={{.State.FinishedAt}} Restarts={{.RestartCount}}'
 ```
 
-它使用合成样本检查代码接线、配置、CSV 和搜索结果解析，生成本地 `VALIDATION_REPORT.md`；有 Bash 时还做 shell 语法检查。通过不代表真实镜像或服务已验证。
+退出码 137 本身不能证明 OOM；还需对应容器状态及宿主机证据。当前同名容器显示 `Up`，也不能证明故障时是同一容器。保留原 ID、时间线和原始错误，不把一次 `docker exec` 错误中的容器 ID 无证据归给更早的失败轮次。
 
-真实运行后再检查产物：
+执行阶段结束、日志流关闭后，现有日志模块把批次/预检及任务管理日志按最多 16 MiB 的**原始字节段**额外封存为 gzip，不按行或字符切分。`logs/archive_index.json` 记录每个原文件的字节数/SHA256、各段顺序/偏移、原始段及 gzip 的字节数/SHA256；按顺序解压拼接可还原坏编码、NUL、CR 和没有换行的长输出。索引仅在完整封存后提交；进行中或失败的目录保留 `archive_state.json`。发生写入错误或源日志仍在变化时不报告完整封存，批次以非零结束，原始文件保留。
+
+`batch_workload_finished` 表示执行阶段已结束、日志等待封存；最终结论以 `batch_state.json` 的终态、退出码和 `log_archive` 为准，终端会在封存后再次打印批次结论。封存范围是管理日志；各测量作用域里的模型原始产物继续按其独立清单归档，不混入日志索引。
+
+运行中不自动删除、截断原始日志或清理其他批次。由于原始文件保留，额外 gzip 需要额外磁盘空间；封存不会减少当前 raw 占用。容量应在启动前规划并监控，长场景、复测和重复测试会增加体积。批次结束并核验后，可按完整批次目录归档，连同自定义任务目录、索引指向的文件、日志封存、原始校验清单和 `.generations` 一起保留。确认没有运行负载、没有待处理隔离状态且留存策略允许后，再人工清理；不要只删最大原始文件造成索引失效。
+
+## 验证与发布
+
+以下命令从仓库根目录在 Linux 上执行；完整离线门禁不接受跳过必需测试：
 
 ```bash
-OUTPUT_ROOT="${HOST_OUTPUT_DIR:-$(cd .. && pwd)/outputs/default}"
-RESULT_DIR="$OUTPUT_ROOT/scenario_results/latest"
-python3 validate_e2e_outputs.py \
-  --result-dir "$RESULT_DIR" --host-output-dir "$OUTPUT_ROOT"
-python3 validate_result_integrity.py \
-  --result-dir "$RESULT_DIR" --host-output-dir "$OUTPUT_ROOT"
+bash automation/tools/check_all.sh
 ```
 
-两者可加 `--report-file /已有目录/report.md` 保存报告；检查失败返回非零。有 `failed/no_result` 的汇总会被拒绝。`validate_e2e_outputs.py` 的 `--expected-statuses` 要与全部行的状态和顺序完全一致，包括所有 `peak_round`，一般运行可以省略。
-
-端到端产物检查只检查最后一个摸高报告的首个 best；字段追溯检查比对固定行和最终 peak 行，不逐项验收 `peak_round`。这些检查不替代回答内容、物理缓存命中和长期稳定性验证。
-
-## 9. 常见问题
-
-| 现象 | 检查方法 |
-|---|---|
-| 使用了错误模型、地址或 NPU 数 | 检查传入的完整配置文件与脱敏快照；显式文件模式自动加载，零参数模式才需要先 source |
-| 只改 `PEAK_*`，摸高阈值没有变化 | 当前场景显式字段优先，直接修改所用配置文件中的场景 |
-| 自定义 env 的场景未生效 | 使用 `bash run_perf_scenarios.sh ./env.local.env` 直接指定完整文件，并核对批次记录的配置来源 |
-| 多份配置被判为同一服务 | 核对实际 `API_URL` 或 `HOST_IP/HOST_PORT`；更换模型别名或路径不隔离服务，不同代理共用后端需设置相同 `SERVICE_ID` |
-| 服务正被另一批任务占用 | 在同一压测主机查看占用任务；本机锁不是跨主机中央锁，不要通过改名或换输出目录绕过服务互斥 |
-| 改固定倍率后，摸高请求数没变化 | `DATA_NUM_MULTIPLIER` 只控制固定测试；摸高使用独立的 `peak_data_multiplier` |
-| 场景超过 MAX_CONTEXT_LEN | 检查输入加输出长度；脚本回退值 512000，当前 env 为 133120；该设置不会扩大模型服务的上下文能力 |
-| 容器内模型路径不存在 | 检查宿主机 `MODEL_HOST_PATH` 及容器 `/workspace/model` 的实际挂载；复用容器时不能仅凭路径存在就认定挂载的是正确权重 |
-| 99999、无结果或请求失败 | 检查模型名、接口、网关路径、鉴权和各轮 `process.log` / `aisbench.log` |
-| 没有缓存命中信息 | 检查前缀场景是否启用 `prefix_test`，以及 `POD_INFO`、各端点 `/metrics` 和计数变化；重复率不等于命中率 |
-| 摸高超过 200 | 200 是初始上界，按第 6 节配置扩容限制 |
-| 一轮失败但脚本最后正常结束 | 这是逐任务继续的行为，检查 `all_results.csv` 各行状态，勿只看最终退出提示 |
-
-## 10. 文件与调用关系
-
-| 文件 | 作用 |
-|---|---|
-| [env.env](env.env) | 完整全局参数与场景配置；显式传入时自动加载 |
-| [test_a.env](test_a.env) / [test_b.env](test_b.env) | 两份完整公开示例，可单独运行或与更多配置一起运行 |
-| [run_perf_scenarios.sh](run_perf_scenarios.sh) | 主入口；显式传入 1 到 N 份完整配置自动加载运行，零参数保留旧用法 |
-| [aisbench_perf_matrix.py](aisbench_perf_matrix.py) | 并发搜索、逐档执行及证据保存 |
-| [aisbench_perf_matrix_config.py](aisbench_perf_matrix_config.py) | 搜索引擎默认配置、指标列名和扩容限制 |
-| [aisbench_result_adapter.py](aisbench_result_adapter.py) | 按列名读取源 CSV、检查关键指标并投影汇总字段 |
-| [aisbench_artifact_archive.py](aisbench_artifact_archive.py) | 保存固定测试原始产物和本轮输出快照 |
-| [upstream_manifest.json](upstream_manifest.json) | 固定上游提交、外层文件清单、SHA256 和 Git 文件模式基线 |
-| [validate_publication.py](validate_publication.py) | 外层基线一致性、公开地址、凭据和产物发布检查 |
-| [validate_addon.py](validate_addon.py) | 离线插件检查 |
-| [validate_e2e_outputs.py](validate_e2e_outputs.py) | 运行后产物检查 |
-| [validate_result_integrity.py](validate_result_integrity.py) | 运行后汇总与源结果字段追溯 |
-
-调用顺序：shell 准备容器和配置 → 固定测试调用根目录 `aisbench_test.py`、归档及结果适配器 → 摸高由 matrix 多次调用同一基础入口 → 汇总。`aisbench_perf_matrix_config.py` 中的独立默认案例不是 `env.env` 当前两组 64K 场景，二者不要混用。
-
-本版已完成离线检查；指定镜像内的真实端到端运行、tokenizer 加载、业务回答和性能仍须在目标环境验证。
-
-## 公开发布检查
-
-本工具自己的 `add/` 配置、注释和文档统一使用 `192.168.1.x` 示例地址。`127.0.0.1` 等回环地址和 `0.0.0.0` 监听地址保留其程序语义。外层上游文件中原本公开的示例地址保持上游原样；它们与用户部署地址分开处理，不能为替换示例而修改外层文件。
-
-`add/upstream_manifest.json` 记录可信上游提交的完整外层文件清单、SHA256 和 Git 模式。发布检查先确认外层完整匹配，只有通过该检查的上游原文件才豁免本工具的示例地址规则；任何外层新增、删除、改动或换行变化均会被拒绝。`add/` 中的新增内容仍严格检查示例网段、凭据及产物，不能通过改写清单或扩大地址白名单绕过审查。更新基线前必须先核对实际上游提交。
-
-真实部署地址、鉴权信息、日志和压测产物留在本地配置或输出目录。`add/` 下本地配置由其忽略规则保护，仓库根目录生成物可在本机 `.git/info/exclude` 中忽略；该文件是本机 Git 元数据，不加入发布内容，也不改变外层上游文件。提交时只添加本轮需要的 `add/` 文件，并检查暂存清单。
-
-提交前在仓库根目录执行以下检查；如果当前位于 `add/` 目录，先执行 `cd ..`：
+需要逐项运行时：
 
 ```bash
-python3 -B add/validate_publication.py
-python3 -B add/validate_addon.py
-python3 -B -m unittest discover -s add -p 'test_*.py'
-git diff --cached --name-status
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="$PWD/automation/core:$PWD/automation/tools${PYTHONPATH:+:$PYTHONPATH}"
+python3 -B automation/tools/validate_publication.py --root "$PWD"
+bash -n run_perf_scenarios.sh
+python3 -B -m unittest discover -s automation/tests -p 'test_*.py'
 ```
 
-发布扫描检查 Git 实际跟踪的文件；无 `.git` 的交付包按公开源码目录和基线检查。提交本地配置、日志、压测产物或用户真实网络地址会被拒绝。为了保持上游外层原样，本分支不在仓库根目录新增 GitHub Actions 工作流；可用 `bash add/check_all.sh` 一次执行上述检查。本版需实际执行本地检查，不能以旧分支的 CI 状态代替。
+`validate_publication.py` 检查公开文件、敏感内容、原生清单/模式和禁止的原生新增文件。`check_all.sh` 还在内存编译全部自动化 Python 文件、检查入口 Bash 语法，并且只运行一次完整 unittest。参数、场景、CSV 和写盘合同集中在现有测试内，不另设重复自测工具。测试覆盖正常、边界和注入故障，但本地/模拟通过不能代替真实 Docker 和模型验收。
+
+正式提交完成后，还应检查将要发布的确切 Git 树和工作区，避免只检查工作区却发布另一份内容：
+
+```bash
+python3 -B automation/tools/validate_publication.py --root "$PWD" --ref HEAD --require-clean
+```
+
+对一次实际任务，用 `result_index.json` 中记录的真实目录运行；下面的批次号和运行号需替换：
+
+```bash
+BATCH_DIR="outputs/default/<批次号>"
+TASK_OUTPUT="$BATCH_DIR/tasks/test_a__your-model-a"
+RESULT_DIR="$TASK_OUTPUT/scenario_results/<运行号>"
+python3 -B automation/core/aisbench_result_validation.py \
+  --result-dir "$RESULT_DIR" --host-output-dir "$TASK_OUTPUT" --require-scopes
+```
+
+这个统一入口检查结果结构、适用字段、作用域、请求计数、原始清单与最终选中证据；可用 `--expected-statuses` 指定完整 CSV 的按行状态列表（包括中间 `peak_round`）。失败终态不是“校验通过的性能结果”，但失败证据仍应完整。验证器和实现共享部分合同，正式数值验收还应从真实原始 JSON/SQLite/NPY 独立复算，逐项对照 CSV，不能只用程序自校验宣称数值全部正确。
+
+发布验收至少要形成这些证据：
+
+- 目标镜像及实际服务的小规模固定测试、重复并发、文本/流式与适用字段、正常/前缀/精度等保留接口。
+- 两个及更多独立服务并行，分别生成任务 CSV/日志；同服务、同容器、重叠目录及跨批次冲突被阻止。
+- 摸高扩展、下探、二分、硬上限开/关、精度、重新确认、不稳定、无效重试、请求失败、超时/预算和取消，轨迹与终态一致。
+- 所有 23 列按实际原始证据核对，重复测试作用域、归一化分母、选中轮次及空值适用性正确，归档损坏能够检出。
+- 配置加载失败、启动异常、容器丢失/替换、日志及磁盘错误、终端断开、取消和停止失败均有明确状态及证据，不碰其他服务。
+- 发布树、原生文件字节和模式、公开隐私扫描、离线门禁及实机证据使用同一候选版本；未覆盖项明确列出。
+
+只有完成实际验收后，才能把候选版改为正式发布并创建 `v2026.10.19` 标签。README 中的示例、测试名称或命令不是验收通过记录。
+
+## 更新原生仓
+
+当前锁定 [rayn-zzz/aisbench_auto_tools_prefix 提交 ef2b6d8](https://github.com/rayn-zzz/aisbench_auto_tools_prefix/commit/ef2b6d8653d57487b622b0dc9db458f8a1e8dec6)。本仓通过 subtree 关联原生历史，维护时选定具体新提交，再同步整个原生子树；运行时不自动跟随浮动分支。
+
+先确认工作区干净、处于升级维护分支，按需添加上游 remote（已有则省略第一条）：
+
+```bash
+git remote add upstream https://github.com/rayn-zzz/aisbench_auto_tools_prefix.git
+git fetch upstream main
+TARGET_UPSTREAM="$(git rev-parse upstream/main)"
+git log --oneline ef2b6d8653d57487b622b0dc9db458f8a1e8dec6.."$TARGET_UPSTREAM"
+git subtree merge --prefix=aisbench_auto_tools_prefix "$TARGET_UPSTREAM"
+git diff --exit-code "$TARGET_UPSTREAM^{tree}" HEAD:aisbench_auto_tools_prefix
+```
+
+使用完整历史，不添加 `--squash`；命令含义见 [Git subtree 官方文档](https://github.com/git/git/blob/master/contrib/subtree/git-subtree.adoc)。合并后原生目录应与选定提交的整棵树一致，包含文件内容和模式。出现冲突时先查明来源；不要把自动化兼容修改留在原生目录。
+
+随后独立核对新上游，更新 `automation/metadata/upstream_manifest.json` 及发布验证器锁定的提交、清单校验值，审查原生配置/CLI/结果接口变化，在 `core/` 适配并补测试。清单更新只是记录信任基线，不能替代字节/模式比对；最后重新执行离线、真实镜像和数值验收，保留对应上游提交号及证据。

@@ -1,9 +1,15 @@
 import importlib.util
 import os
+import sys
+
+sys.dont_write_bytecode = True
 
 
 ADD_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.path.dirname(ADD_DIR)
+AUTOMATION_ROOT = os.path.dirname(ADD_DIR) if os.path.basename(ADD_DIR) == "core" else ADD_DIR
+RELEASE_ROOT = os.path.dirname(AUTOMATION_ROOT)
+_NATIVE_DEFAULT = os.path.join(RELEASE_ROOT, "aisbench_auto_tools_prefix")
+BASE_DIR = os.environ.get("AISBENCH_NATIVE_ROOT", _NATIVE_DEFAULT if os.path.isdir(_NATIVE_DEFAULT) else os.path.join(RELEASE_ROOT, "native"))
 
 
 def _load_runtime_config():
@@ -66,6 +72,14 @@ DEFAULT_CASE = {
     "wait_seconds": DEFAULT_WAIT_SECONDS,
     "args": {},
     "forward_args": [],
+    "precision": 1,
+    "confirm_runs": 3,
+    "confirm_min_requests": 100,
+    "max_trials": 40,
+    "trial_timeout": 1800,
+    "total_timeout": 14400,
+    "invalid_retries": 1,
+    "floor_concurrency": 1,
 }
 
 

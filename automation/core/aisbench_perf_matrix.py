@@ -8,21 +8,25 @@ import os
 import re
 import shlex
 import shutil
-import subprocess
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from aisbench_artifact_archive import snapshot_recent_output_files, write_archive_manifest
+from aisbench_artifact_archive import write_archive_manifest
 from aisbench_result_adapter import invalid_result_reason, read_last_result
+from aisbench_execution import execute_native, atomic_json, request_count_file
+sys.dont_write_bytecode = True
 
 
 ADD_DIR = Path(__file__).resolve().parent
-BASE_DIR = ADD_DIR.parent
+AUTOMATION_ROOT = ADD_DIR.parent if ADD_DIR.name == "core" else ADD_DIR
+RELEASE_ROOT = AUTOMATION_ROOT.parent
+_native_default = RELEASE_ROOT / "aisbench_auto_tools_prefix"
+BASE_DIR = Path(os.environ.get("AISBENCH_NATIVE_ROOT", str(_native_default if _native_default.is_dir() else RELEASE_ROOT / "native"))).resolve()
 DEFAULT_CONFIG_FILE = str(ADD_DIR / "aisbench_perf_matrix_config.py")
 RUNTIME_CONFIG_FILE = "config.py"
 AISBENCH_TEST_SCRIPT = BASE_DIR / "aisbench_test.py"
@@ -48,6 +52,16 @@ AISBENCH_FLAG_OPTIONS = {
     "--test_accuracy",
     "--prefix_test",
 }
+PEAK_SETTINGS = {
+    "precision": (1, "peak_precision"),
+    "confirm_runs": (3, "peak_confirm_runs"),
+    "confirm_min_requests": (100, "peak_confirm_min_requests"),
+    "max_trials": (40, "peak_max_trials"),
+    "trial_timeout": (1800, "peak_trial_timeout"),
+    "total_timeout": (14400, "peak_total_timeout"),
+    "invalid_retries": (1, "peak_invalid_retries"),
+    "floor_concurrency": (1, "peak_floor_cc"),
+}
 
 
 @dataclass
@@ -64,6 +78,14 @@ class SearchCase:
     wait_seconds: int
     args: Dict[str, Any] = field(default_factory=dict)
     forward_args: List[str] = field(default_factory=list)
+    precision: int = 1
+    confirm_runs: int = 3
+    confirm_min_requests: int = 100
+    max_trials: int = 40
+    trial_timeout: float = 1800
+    total_timeout: float = 14400
+    invalid_retries: int = 1
+    floor_concurrency: int = 1
 
     @property
     def slug(self) -> str:
@@ -108,6 +130,12 @@ class EvaluationResult:
     aisbench_all_log: str
     result_csv: str
     captured_outputs_dir: str
+    state: str = ""
+    profile: str = "explore"
+    trial_id: str = ""
+    selected_scope_id: str = ""
+    scopes: List[Dict[str, Any]] = field(default_factory=list)
+    evaluation_file: str = ""
 
 
 def parse_args() -> Tuple[argparse.Namespace, List[str]]:
@@ -142,6 +170,10 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
     )
     parser.add_argument("--live-results-csv", type=str, default="", help="append completed peak rounds to a shared CSV")
     parser.add_argument("--repeat-rate", type=str, default="0", help="repeat rate written to live peak-round rows")
+    for name in ("precision", "confirm-runs", "confirm-min-requests", "max-trials", "invalid-retries", "floor-concurrency"):
+        parser.add_argument("--" + name, type=int, default=None)
+    for name in ("trial-timeout", "total-timeout"):
+        parser.add_argument("--" + name, type=float, default=None)
     args, forwarded = parser.parse_known_args()
     return args, forwarded
 
@@ -178,7 +210,10 @@ def setup_logger(log_path: Path) -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.handlers = []
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    class PersistentHandler(logging.FileHandler):
+        def handleError(self, record):
+            raise OSError("persistent peak log write failed")
+    file_handler = PersistentHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
@@ -268,6 +303,17 @@ def build_case(raw_case: Dict[str, Any], default_case: Dict[str, Any], index: in
     request_rate = str(merged.get("request_rate", default_case.get("request_rate", "0")))
     if finite_setting(request_rate, "request_rate") < 0:
         raise ValueError("request_rate must be >= 0")
+    settings = {}
+    for key, (default, scene_key) in PEAK_SETTINGS.items():
+        value = merged.get(scene_key, merged.get(key, default))
+        if key.endswith("timeout"):
+            settings[key] = finite_setting(value, key)
+            if settings[key] <= 0:
+                raise ValueError(key + " must be positive")
+        else:
+            settings[key] = integer_setting(value, key, 0 if key in {"invalid_retries", "confirm_min_requests"} else 1)
+    if settings["floor_concurrency"] > min_concurrency:
+        raise ValueError("floor_concurrency must not exceed initial min_concurrency")
     return SearchCase(
         name=name,
         input_len=input_len,
@@ -281,6 +327,7 @@ def build_case(raw_case: Dict[str, Any], default_case: Dict[str, Any], index: in
         wait_seconds=wait_seconds,
         args=case_args,
         forward_args=forward_args,
+        **settings,
     )
 
 
@@ -305,12 +352,14 @@ def cli_case_override_requested(args: argparse.Namespace) -> bool:
 def resolve_runtime_output_dir() -> str:
     runtime_path = BASE_DIR / RUNTIME_CONFIG_FILE
     if not runtime_path.exists():
-        return str((BASE_DIR / "outputs").resolve())
+        return str((RELEASE_ROOT / "outputs/default").resolve())
     module = load_python_config(str(runtime_path))
     raw_output_dir = str(getattr(module, "OUTPUT_DIR", "./outputs/default") or "./outputs/default")
     output_path = Path(raw_output_dir)
     if not output_path.is_absolute():
-        output_path = (BASE_DIR / output_path).resolve()
+        output_path = (RELEASE_ROOT / output_path).resolve()
+    if output_path == BASE_DIR or BASE_DIR in output_path.parents:
+        raise ValueError("output directory must not be inside native source")
     return str(output_path)
 
 
@@ -383,6 +432,22 @@ def load_runner_config(args: argparse.Namespace, forwarded: Sequence[str]) -> Ru
     )
 
     global_forward_args.extend(str(item) for item in forwarded)
+    for case in cases:
+        for key in PEAK_SETTINGS:
+            value = getattr(args, key, None)
+            if value is not None:
+                setattr(case, key, value)
+        for key in PEAK_SETTINGS:
+            value = getattr(case, key)
+            if key.endswith("timeout"):
+                if finite_setting(value, key) <= 0:
+                    raise ValueError(key + " must be positive")
+            else:
+                integer_setting(value, key, 0 if key in {"invalid_retries", "confirm_min_requests"} else 1)
+        if case.floor_concurrency > case.min_concurrency:
+            raise ValueError("floor_concurrency exceeds initial minimum")
+        if auto_expand_max_concurrency and auto_expand_max_concurrency < case.floor_concurrency:
+            raise ValueError("hard cap is below concurrency floor")
     names = [case.name for case in cases]
     slugs = [case.slug for case in cases]
     if len(set(names)) != len(names) or len(set(slugs)) != len(slugs):
@@ -409,32 +474,6 @@ def load_runner_config(args: argparse.Namespace, forwarded: Sequence[str]) -> Ru
 
 def calculate_num_prompts(concurrency: int, multiplier: int) -> int:
     return max(concurrency * multiplier, concurrency)
-
-
-def cleanup_stale_artifacts(logger: logging.Logger) -> None:
-    for filename in ARTIFACT_FILES:
-        path = BASE_DIR / filename
-        if path.exists():
-            try:
-                if path.is_file() or path.is_symlink():
-                    path.unlink()
-                elif path.is_dir():
-                    shutil.rmtree(path)
-            except OSError as exc:
-                logger.warning("清理旧文件失败 %s: %s", path, exc)
-
-
-def copy_if_exists(source: Path, target: Path) -> str:
-    if not source.exists():
-        return ""
-    ensure_dir(target.parent)
-    if source.is_dir():
-        if target.exists():
-            shutil.rmtree(target)
-        shutil.copytree(source, target)
-    else:
-        shutil.copy2(source, target)
-    return str(target)
 
 
 def read_last_csv_row(csv_path: Path) -> Dict[str, Any]:
@@ -504,36 +543,13 @@ def convert_ttft_ms_to_seconds(value_ms: float) -> float:
 
 
 def parse_request_count(log_path: Path, label: str) -> Optional[int]:
-    """Read the last labelled count without including timestamps or ANSI codes."""
-    if not log_path or not Path(log_path).exists():
+    """Compatibility API using the execution layer's shared counter grammar."""
+    if not log_path or not Path(log_path).is_file():
         return None
-    value: Optional[int] = None
     try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
-                labelled = re.search(r"\b" + re.escape(label) + r"\b", plain)
-                if not labelled:
-                    continue
-                value = None
-                match = re.fullmatch(
-                    r"\s*(?:[|│]\s*(?:total\s*[|│]\s*)?|[:=]\s*)?"
-                    r"([+\-]?\d[\d,]*(?:\.\d+)?)\s*(?:[|│].*)?",
-                    plain[labelled.end():].strip(),
-                )
-                if match:
-                    token = match.group(1)
-                    if "," in token and not re.fullmatch(r"[+\-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?", token):
-                        value = None
-                        continue
-                    try:
-                        number = Decimal(token.replace(",", ""))
-                        value = int(number) if number >= 0 and number == number.to_integral_value() else None
-                    except (InvalidOperation, ValueError, OverflowError):
-                        value = None
+        return request_count_file(log_path, label)
     except OSError:
         return None
-    return value
 
 
 def parse_failed_requests(log_path: Path) -> Optional[int]:
@@ -573,6 +589,8 @@ def resolve_threshold_reason(case: SearchCase, csv_row: Dict[str, Any], ttft_col
 
 
 def validate_aisbench_arguments(tokens: Sequence[str]) -> None:
+    if "--test_accuracy" in tokens:
+        raise ValueError("peak search cannot use test_accuracy; fixed-concurrency accuracy remains supported")
     numeric_options = {
         "--input_len", "--output_len", "--data_num", "--concurrency", "--npu_num", "--dp",
         "--prefix_num", "--repeat", "--seed", "--request_rate", "--repeat_rate",
@@ -612,8 +630,7 @@ def validate_aisbench_arguments(tokens: Sequence[str]) -> None:
     for first, second in (("--length_mean", "--length_std"), ("--length_min", "--length_max")):
         if (first in values) != (second in values):
             raise ValueError(f"{first} and {second} must be supplied together")
-    if "--length_min" in values and int(values["--length_min"]) > int(values["--length_max"]):
-        raise ValueError("--length_min must not exceed --length_max")
+    # Native sampling deliberately swaps reversed length bounds.
     for option, choices in (("--test_type", {"stream", "text"}), ("--dataset_type", {"normal", "prefix_cache"})):
         if option in values and values[option] not in choices:
             raise ValueError(f"invalid {option}")
@@ -653,112 +670,80 @@ def build_run_command(config: RunnerConfig, case: SearchCase, concurrency: int, 
 
 
 def run_single_evaluation(
-    case: SearchCase,
-    config: RunnerConfig,
-    case_dir: Path,
-    sequence_id: int,
-    concurrency: int,
-    logger: logging.Logger,
+    case: SearchCase, config: RunnerConfig, case_dir: Path, sequence_id: int,
+    concurrency: int, logger: logging.Logger, profile: str = "explore", timeout=None,
 ) -> EvaluationResult:
     num_prompts = calculate_num_prompts(concurrency, case.request_multiplier)
-    run_dir = case_dir / f"run_{sequence_id:03d}_cc_{concurrency}"
-    ensure_dir(run_dir)
-    process_log_path = run_dir / "process.log"
+    if profile == "confirm":
+        num_prompts = max(num_prompts, case.confirm_min_requests)
+    run_dir = case_dir / f"run_{sequence_id:03d}_cc_{concurrency}_{profile}"
     command = build_run_command(config, case, concurrency, num_prompts)
-    (run_dir / "command.txt").write_text(format_command(command) + "\n", encoding="utf-8")
-    (run_dir / "request_meta.json").write_text(
-        json.dumps(
-            {
-                "case": asdict(case),
-                "sequence_id": sequence_id,
-                "concurrency": concurrency,
-                "num_prompts": num_prompts,
-                "ttft_column": config.ttft_column,
-                "tpot_column": config.tpot_column,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    cleanup_stale_artifacts(logger)
-    output_root = Path(config.output_dir)
-    start_ts = time.time()
-    logger.info("开始执行 case=%s, cc=%s, num_prompts=%s", case.name, concurrency, num_prompts)
-    logger.info("执行命令: %s", format_command(command))
-
-    with open(process_log_path, "w", encoding="utf-8") as process_log:
-        process = subprocess.Popen(
-            command,
-            cwd=str(BASE_DIR),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            process_log.write(line)
-            process_log.flush()
-            logger.info("[cc=%s] %s", concurrency, line.rstrip("\n"))
-        process.stdout.close()
-        return_code = process.wait()
-
-    aisbench_log = copy_if_exists(BASE_DIR / "aisbench.log", run_dir / "aisbench.log")
-    aisbench_all_log = copy_if_exists(BASE_DIR / "aisbench_all.log", run_dir / "aisbench_all.log")
-    result_csv = copy_if_exists(BASE_DIR / "aisbench_result.csv", run_dir / "aisbench_result.csv")
-    captured_outputs_dir = snapshot_recent_output_files(output_root, run_dir / "captured_outputs", start_ts)
-    csv_row = read_last_csv_row(run_dir / "aisbench_result.csv") if result_csv else {}
-
-    if return_code != 0:
-        passed = False
-        reason = f"执行失败，退出码 {return_code}"
-        metrics = dict(csv_row)
-    else:
-        passed, reason, metrics = resolve_threshold_reason(case, csv_row, config.ttft_column, config.tpot_column)
-
-    # A valid CSV and exit code alone do not prove that requests succeeded.
-    failed_req = parse_failed_requests(process_log_path)
-    if failed_req is None and aisbench_log:
-        failed_req = parse_failed_requests(Path(aisbench_log))
-    success_req = parse_success_requests(process_log_path)
-    if success_req is None and aisbench_log:
-        success_req = parse_success_requests(Path(aisbench_log))
-    if passed and failed_req is None:
-        passed = False
-        reason = "缺少或无法解析 Failed Requests 计数"
-    elif passed and failed_req > config.failed_req_limit:
-        passed = False
-        reason = f"Failed Requests={failed_req} 超过限制 {config.failed_req_limit}"
-    if passed and success_req == 0:
-        passed = False
-        reason = "Success Requests=0，未完成任何成功请求"
-
+    logger.info("开始执行 case=%s cc=%s requests/scope=%s profile=%s", case.name, concurrency, num_prompts, profile)
+    report = execute_native(BASE_DIR, run_dir, command[2:],
+                            timeout=timeout or case.trial_timeout,
+                            failed_req_limit=config.failed_req_limit,
+                            python_bin=config.python_bin, native_script=AISBENCH_TEST_SCRIPT)
+    state, reason = report["state"], report["reason"]
+    main_scopes = report["main_scopes"]
+    if state == "PASS":
+        outcomes = []
+        for scope in main_scopes:
+            raw = scope.get("raw_row", {})
+            invalid = invalid_result_reason(raw, (config.ttft_column, config.tpot_column))
+            if profile == "confirm" and case.confirm_min_requests > 0:
+                counts = scope.get("counts", {})
+                success = parse_metric_float(counts.get("success", scope.get("success_requests", "")))
+                failed = parse_metric_float(counts.get("failed", scope.get("failed_requests", "")))
+                total = parse_metric_float(raw.get("total_req", ""))
+                if (success is None or failed is None or total is None or
+                        any(value < 0 or value != int(value) for value in (success, failed, total)) or
+                        success + failed != total):
+                    invalid = "confirmation scope lacks reconciled actual completed request counters: " + scope.get("scope_id", "unknown")
+                elif total < case.confirm_min_requests:
+                    invalid = ("confirmation scope " + scope.get("scope_id", "unknown")
+                               + " completed " + str(int(total)) + " requests, below confirm_min_requests="
+                               + str(case.confirm_min_requests)
+                               + "; provide a larger explicit dataset or lower the configured confirmation minimum")
+            if invalid:
+                scope.update(metric_state="INVALID", metric_reason=invalid)
+            else:
+                passed, why, _ = resolve_threshold_reason(case, raw, config.ttft_column, config.tpot_column)
+                scope.update(metric_state="PASS" if passed else "SLO_FAIL", metric_reason=why)
+            outcomes.append(scope["metric_state"])
+        if not outcomes:
+            state, reason = "INVALID", "no main measurement scope for peak evaluation"
+        elif "INVALID" in outcomes:
+            state = "INVALID"
+            reason = "; ".join(scope["metric_reason"] for scope in main_scopes if scope["metric_state"] == "INVALID")
+        elif all(value == "PASS" for value in outcomes):
+            state, reason = "PASS", "all main scopes satisfy configured constraints"
+        elif all(value == "SLO_FAIL" for value in outcomes):
+            state, reason = "SLO_FAIL", "all main scopes exceed configured SLO"
+        else:
+            state, reason = "UNSTABLE", "repeat scopes disagree under the same trial"
+    row = dict(report.get("raw_row", {}))
+    if state in {"ERROR", "INVALID"}:
+        row = {}
+    last_scope = main_scopes[-1] if main_scopes else {}
     result = EvaluationResult(
-        sequence_id=sequence_id,
-        concurrency=concurrency,
-        num_prompts=num_prompts,
-        passed=passed,
-        reason=reason,
-        return_code=return_code,
-        metrics=metrics,
-        csv_row=csv_row,
-        command=command,
-        run_dir=str(run_dir),
-        process_log=str(process_log_path),
-        aisbench_log=aisbench_log,
-        aisbench_all_log=aisbench_all_log,
-        result_csv=result_csv,
-        captured_outputs_dir=captured_outputs_dir,
+        sequence_id=sequence_id, concurrency=concurrency, num_prompts=num_prompts,
+        passed=state == "PASS", reason=reason, return_code=report.get("return_code") or 0,
+        metrics=row, csv_row=row, command=command, run_dir=str(run_dir),
+        process_log=report["stdout_log"], aisbench_log=last_scope.get("stdout_log", ""),
+        aisbench_all_log=report["stderr_log"], result_csv=last_scope.get("result_csv", ""),
+        captured_outputs_dir=last_scope.get("artifact_dir", ""), state=state, profile=profile,
+        trial_id=report["trial_id"], selected_scope_id=report.get("selected_scope_id", ""),
+        scopes=report["scopes"], evaluation_file=str(run_dir / "evaluation.json"),
     )
-    (run_dir / "evaluation.json").write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("单轮完成 case=%s, cc=%s, passed=%s, reason=%s", case.name, concurrency, passed, reason)
-    if case.wait_seconds > 0:
-        logger.info("等待 %s 秒后进入下一轮", case.wait_seconds)
-        time.sleep(case.wait_seconds)
+    # Keep execution details and searchable peak policy together in one document.
+    report.update(peak_evaluation=asdict(result), state=state, reason=reason, profile=profile)
+    atomic_json(run_dir / "evaluation.json", report)
+    atomic_json(run_dir / "request_meta.json", dict(case=asdict(case), sequence_id=sequence_id,
+                                                   concurrency=concurrency, num_prompts=num_prompts,
+                                                   profile=profile, ttft_column=config.ttft_column,
+                                                   tpot_column=config.tpot_column))
+    (run_dir / "command.txt").write_text(format_command(command) + "\n", encoding="utf-8")
+    logger.info("单轮完成 case=%s cc=%s state=%s reason=%s", case.name, concurrency, state, reason)
     return result
 
 
@@ -787,109 +772,212 @@ def trace_row(case: SearchCase, result: EvaluationResult, config: RunnerConfig) 
             "aisbench_all_log": result.aisbench_all_log,
             "result_csv": result.result_csv,
             "captured_outputs_dir": result.captured_outputs_dir,
+            "state": result.state,
+            "profile": result.profile,
+            "trial_id": result.trial_id,
+            "selected_scope_id": result.selected_scope_id,
+            "evaluation_file": result.evaluation_file,
         }
     )
     return row
 
 
+class SearchStop(Exception):
+    def __init__(self, termination, reason):
+        super().__init__(reason)
+        self.termination, self.reason = termination, reason
+
+
 class PeakSearcher:
-    def __init__(self, case: SearchCase, config: RunnerConfig, case_dir: Path, logger: logging.Logger, on_evaluation=None) -> None:
-        self.case = case
-        self.config = config
-        self.case_dir = case_dir
-        self.logger = logger
+    """Bounded exponential bracketing and bisection with independent confirmation."""
+    def __init__(self, case, config, case_dir, logger, on_evaluation=None):
+        self.case, self.config, self.case_dir, self.logger = case, config, case_dir, logger
         self.on_evaluation = on_evaluation
-        self.cache: Dict[int, EvaluationResult] = {}
-        self.history: List[EvaluationResult] = []
+        self.cache = {}
+        self.history = []
+        self.profile = "explore"
+        self.started = time.monotonic()
+        self.confirmed_pass = {}
+        self.confirmed_fail = {}
+        self.termination = ""
+        self.reason = ""
 
-    def evaluate(self, concurrency: int) -> EvaluationResult:
-        if concurrency in self.cache:
-            self.logger.info("复用已执行结果 case=%s, cc=%s, passed=%s", self.case.name, concurrency, self.cache[concurrency].passed)
-            return self.cache[concurrency]
-        result = run_single_evaluation(
-            case=self.case,
-            config=self.config,
-            case_dir=self.case_dir,
-            sequence_id=len(self.history) + 1,
-            concurrency=concurrency,
-            logger=self.logger,
-        )
-        self.cache[concurrency] = result
-        self.history.append(result)
-        if self.on_evaluation is not None:
-            self.on_evaluation(result, self.history)
-        return result
+    @property
+    def remaining(self):
+        return self.case.total_timeout - (time.monotonic() - self.started)
 
-    def binary_between(self, success_result: EvaluationResult, fail_result: EvaluationResult) -> EvaluationResult:
-        left = success_result.concurrency
-        right = fail_result.concurrency
-        best = success_result
-        while right - left > 1:
-            mid = (left + right) // 2
-            result = self.evaluate(mid)
-            if result.passed:
-                best = result
-                left = mid
-            else:
-                right = mid
-        return best
+    def _check_budget(self):
+        if len(self.history) >= self.case.max_trials or self.remaining <= 0:
+            raise SearchStop("budget_limit", "trial count or total elapsed time budget exhausted")
 
-    def find_downward_success(self, failing_result: EvaluationResult) -> Tuple[Optional[EvaluationResult], EvaluationResult]:
-        current_fail = failing_result
-        probe = max(1, current_fail.concurrency // 2)
-        while True:
-            result = self.evaluate(probe)
-            if result.passed:
-                return result, current_fail
-            current_fail = result
-            if probe == 1:
-                return None, current_fail
-            probe = max(1, probe // 2)
+    def evaluate(self, concurrency, fresh=False):
+        cap = self.config.auto_expand_max_concurrency
+        if concurrency < self.case.floor_concurrency or (cap and concurrency > cap):
+            raise ValueError("probe outside hard floor/cap")
+        key = (self.profile, concurrency)
+        if not fresh and key in self.cache:
+            return self.cache[key][-1]
+        for attempt in range(self.case.invalid_retries + 1):
+            self._check_budget()
+            result = run_single_evaluation(
+                case=self.case, config=self.config, case_dir=self.case_dir,
+                sequence_id=len(self.history) + 1, concurrency=concurrency, logger=self.logger,
+                profile=self.profile, timeout=min(self.case.trial_timeout, self.remaining),
+            )
+            if not result.state:  # Compatibility for independent injected evaluators.
+                result.state = "PASS" if result.passed else "SLO_FAIL"
+            result.profile = self.profile
+            self.history.append(result)
+            if self.on_evaluation:
+                self.on_evaluation(result, self.history)
+            if result.state in {"PASS", "SLO_FAIL"}:
+                self.cache.setdefault(key, []).append(result)
+            if self.case.wait_seconds:
+                wait = min(self.case.wait_seconds, max(0, self.remaining))
+                if wait:
+                    time.sleep(wait)
+            if result.state == "INVALID":
+                if attempt < self.case.invalid_retries:
+                    continue
+                raise SearchStop("error", "invalid measurement after bounded retry: " + result.reason)
+            if result.state == "REQUEST_ERROR":
+                raise SearchStop("request_error", result.reason)
+            if result.state == "ERROR":
+                raise SearchStop("error", result.reason)
+            if result.state == "UNSTABLE":
+                raise SearchStop("unstable", result.reason)
+            if result.state not in {"PASS", "SLO_FAIL"}:
+                raise SearchStop("error", "unknown measurement state: " + result.state)
+            return result
+        raise AssertionError("unreachable retry state")
 
-    def find_upward_failure(self, success_result: EvaluationResult) -> Tuple[EvaluationResult, Optional[EvaluationResult]]:
-        current_success = success_result
-        limit = self.config.auto_expand_max_concurrency
-        probe = current_success.concurrency * 2
-        while True:
-            if limit > 0 and probe > limit:
-                if current_success.concurrency >= limit:
-                    return current_success, None
-                probe = limit
-            result = self.evaluate(probe)
-            if result.passed:
-                current_success = result
-                if limit > 0 and current_success.concurrency >= limit:
-                    return current_success, None
-                probe = max(current_success.concurrency + 1, current_success.concurrency * 2)
-                continue
-            return current_success, result
-
-    def search(self) -> Tuple[Optional[EvaluationResult], List[EvaluationResult]]:
-        low = self.case.min_concurrency
-        high = self.case.max_concurrency
-        midpoint = (low + high) // 2
-        mid_result = self.evaluate(midpoint)
-
-        if mid_result.passed:
-            high_result = mid_result if high == midpoint else self.evaluate(high)
-            if high_result.passed:
-                success_result, fail_result = self.find_upward_failure(high_result)
-                if fail_result is None:
-                    return success_result, self.history
-                return self.binary_between(success_result, fail_result), self.history
-            return self.binary_between(mid_result, high_result), self.history
-
-        if low == midpoint:
-            low_result = mid_result
+    def confirm(self, concurrency):
+        self.profile = "confirm"
+        results = [self.evaluate(concurrency, fresh=True) for _ in range(self.case.confirm_runs)]
+        states = {item.state for item in results}
+        if states == {"PASS"}:
+            if concurrency in self.confirmed_fail or any(cc < concurrency for cc in self.confirmed_fail):
+                raise SearchStop("unstable", "confirmed lower failure contradicts higher pass")
+            self.confirmed_pass[concurrency] = results[-1]
+            self.confirmed_fail.pop(concurrency, None)
+        elif states == {"SLO_FAIL"}:
+            if concurrency in self.confirmed_pass or any(cc > concurrency for cc in self.confirmed_pass):
+                raise SearchStop("unstable", "confirmed higher pass contradicts lower failure")
+            self.confirmed_fail[concurrency] = results[-1]
+            self.confirmed_pass.pop(concurrency, None)
         else:
-            low_result = self.evaluate(low)
-        if low_result.passed:
-            return self.binary_between(low_result, mid_result), self.history
+            raise SearchStop("unstable", "fresh confirmation trials disagree")
+        return results[-1]
 
-        success_result, fail_result = self.find_downward_success(low_result)
-        if success_result is None:
-            return None, self.history
-        return self.binary_between(success_result, fail_result), self.history
+    def binary_between(self, success_result, fail_result):
+        left, right = success_result.concurrency, fail_result.concurrency
+        best = success_result
+        while right - left > self.case.precision:
+            result = self.evaluate((left + right) // 2)
+            if result.passed:
+                best, left = result, result.concurrency
+            else:
+                fail_result, right = result, result.concurrency
+        return best, fail_result
+
+    def find_downward_success(self, failing_result):
+        current = failing_result
+        floor = self.case.floor_concurrency
+        while current.concurrency > floor:
+            probe = max(floor, current.concurrency // 2)
+            result = self.evaluate(probe)
+            if result.passed:
+                return result, current
+            current = result
+        return None, current
+
+    def find_upward_failure(self, success_result):
+        current = success_result
+        cap = self.config.auto_expand_max_concurrency
+        while not cap or current.concurrency < cap:
+            probe = max(current.concurrency + 1, current.concurrency * 2)
+            if current.concurrency < self.case.max_concurrency < probe:
+                probe = self.case.max_concurrency
+            if cap:
+                probe = min(probe, cap)
+            result = self.evaluate(probe)
+            if not result.passed:
+                return current, result
+            current = result
+        return current, None
+
+    def _best_confirmed(self):
+        return max(self.confirmed_pass.values(), key=lambda item: item.concurrency, default=None)
+
+    def search(self):
+        try:
+            while True:
+                cap = self.config.auto_expand_max_concurrency
+                initial = min(self.case.min_concurrency, cap) if cap else self.case.min_concurrency
+                baseline = self.evaluate(initial)
+                if not baseline.passed:
+                    success, failure = self.find_downward_success(baseline)
+                    if success is None:
+                        floor_result = self.confirm(self.case.floor_concurrency)
+                        if not floor_result.passed:
+                            self.termination = "no_pass"
+                            self.reason = "no passing point found; hard floor independently reconfirmed"
+                            return None, self.history
+                        # Confirmation changed the floor classification; never reuse explore cache.
+                        continue
+                else:
+                    success, failure = self.find_upward_failure(baseline)
+                if failure is not None:
+                    candidate, failure = self.binary_between(success, failure)
+                    candidate_check = self.confirm(candidate.concurrency)
+                    failure_check = self.confirm(failure.concurrency)
+                    if candidate_check.passed and not failure_check.passed:
+                        self.termination, self.reason = "boundary_confirmed", "fresh boundary confirmed within configured precision"
+                        return candidate_check, self.history
+                    # Short profile invalidated: profile remains confirm permanently.
+                    continue
+                cap_check = self.confirm(success.concurrency)
+                if cap_check.passed:
+                    self.termination, self.reason = "capped", "configured hard cap passed; higher failure not observed"
+                    return cap_check, self.history
+                # Cap failed with confirmation samples; rebuild under this profile.
+        except SearchStop as stop:
+            self.termination, self.reason = stop.termination, stop.reason
+        except KeyboardInterrupt:
+            self.termination, self.reason = "cancelled", "search interrupted"
+        return self._best_confirmed(), self.history
+
+    def summary(self):
+        observed = max((item for item in self.history if item.passed),
+                       key=lambda item: item.concurrency, default=None)
+        confirmed = self._best_confirmed()
+        scopes = [scope for item in self.history for scope in item.scopes]
+        def complete_sum(key):
+            values = [scope.get(key) for scope in scopes]
+            return sum(values) if values and all(isinstance(value, int) for value in values) else None
+        return dict(
+            algorithm="exponential-bracket-bisection-confirmation-v1",
+            termination=self.termination, reason=self.reason,
+            profile=self.profile, trial_count=len(self.history),
+            elapsed_seconds=time.monotonic() - self.started,
+            highest_observed=observed.concurrency if observed else None,
+            highest_confirmed=confirmed.concurrency if confirmed else None,
+            failed_boundary=min(self.confirmed_fail) if self.confirmed_fail else None,
+            selected_trial_id=confirmed.trial_id if confirmed else "",
+            selected_scope_id=confirmed.selected_scope_id if confirmed else "",
+            evaluation_file=confirmed.evaluation_file if confirmed else "",
+            request_rate=self.case.request_rate,
+            mode="rps_limited_cc_search" if float(self.case.request_rate) > 0 else "concurrency_search",
+            constraints_enabled=self.case.ttft_limit > 0 or self.case.tpot_limit > 0,
+            initial_range=[self.case.min_concurrency, self.case.max_concurrency],
+            hard_cap=self.config.auto_expand_max_concurrency,
+            main_scope_count=sum(scope.get("phase") == "main" for scope in scopes),
+            prefix_scope_count=sum(scope.get("phase") == "prefix" for scope in scopes),
+            success_requests=complete_sum("success_requests"),
+            failed_requests=complete_sum("failed_requests"),
+            attempts=None,
+            settings={name: getattr(self.case, name) for name in PEAK_SETTINGS},
+        )
 
 
 def write_csv_report(csv_path: Path, rows: Sequence[Dict[str, Any]]) -> None:
@@ -974,8 +1062,8 @@ def append_live_peak_round(csv_path: str, case: SearchCase, result: EvaluationRe
     values = [
         case.name,
         metrics.get("current_time", ""), metrics.get("input_len", case.input_len),
-        metrics.get("output_len", case.output_len), metrics.get("total_req", result.num_prompts),
-        metrics.get("max_cc", result.concurrency), metrics.get("cc", ""), metrics.get("rr", ""),
+        metrics.get("output_len", case.output_len), metrics.get("total_req", ""),
+        metrics.get("max_cc", ""), metrics.get("cc", ""), metrics.get("rr", ""),
         metrics.get("TTFT avg", ""), metrics.get("TTFT P90", ""), metrics.get("TPOT avg", ""),
         metrics.get("TPOT SLO_P90", ""), metrics.get("E2E_time", ""), metrics.get("output_throughput", ""),
         metrics.get("single_output_throughput", ""), metrics.get("E2E_throughput", ""),
@@ -996,15 +1084,15 @@ def main() -> int:
     args, forwarded = parse_args()
     config = load_runner_config(args, forwarded)
 
-    tag = f"_{config.run_tag}" if config.run_tag else ""
+    tag = "_" + sanitize_output_name(config.run_tag) if config.run_tag else ""
     output_root = Path(config.output_dir)
     ensure_dir(output_root)
     session_name = sanitize_output_name(
         str(args.case_name or "").strip() or (config.cases[0].name if config.cases else "peak_search"),
         fallback="peak_search",
     )
-    session_dir = output_root / f"peak_{session_name}_{timestamp()}{tag}"
-    ensure_dir(session_dir)
+    session_dir = output_root / f"peak_{session_name}_{timestamp()}_{uuid.uuid4().hex[:10]}{tag}"
+    session_dir.mkdir(parents=True, exist_ok=False)
     logger = setup_logger(session_dir / "peak_search.log")
     shutil.copy2(config.config_file, session_dir / Path(config.config_file).name)
 
@@ -1017,6 +1105,7 @@ def main() -> int:
 
     best_rows: List[Dict[str, Any]] = []
     all_rows: List[Dict[str, Any]] = []
+    summaries: List[Dict[str, Any]] = []
     all_passed = True
     for case in config.cases:
         case_dir = session_dir / case.slug
@@ -1052,30 +1141,45 @@ def main() -> int:
                 live_best = best_rows + [current_best_row]
             write_csv_report(session_dir / "peak_search_report.csv", live_best)
             write_csv_report(session_dir / "peak_search_report_all.csv", all_rows)
-            (session_dir / "peak_search_report.json").write_text(
-                json.dumps({"best": live_best, "all": all_rows}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            atomic_json(session_dir / "peak_search_report.json",
+                {"best": best_rows, "observed": live_best, "all": all_rows, "complete": False})
             append_live_peak_round(args.live_results_csv, case, result, args.repeat_rate)
             logger.info("实时写入摸高轮次结果: case=%s, cc=%s, status=peak_round", case.name, result.concurrency)
 
         searcher = PeakSearcher(case, config, case_dir, logger, on_evaluation=on_evaluation)
         best_result, history = searcher.search()
         best_row = write_case_summary(case, config, case_dir, best_result, history)
+        search_summary = dict(case_name=case.name, **searcher.summary())
+        summaries.append(search_summary)
+        status = {
+            "boundary_confirmed": "peak_confirmed", "capped": "peak_capped",
+            "budget_limit": "peak_budget", "no_pass": "peak_no_pass",
+            "unstable": "peak_unstable", "request_error": "peak_request_error",
+            "error": "peak_error", "cancelled": "peak_cancelled",
+        }[searcher.termination]
+        best_row.update(status=status, termination=searcher.termination,
+                        selected_trial_id=search_summary["selected_trial_id"],
+                        selected_scope_id=search_summary["selected_scope_id"],
+                        evaluation_file=search_summary["evaluation_file"])
+        best_row["reason"] = searcher.reason
+        write_csv_report(case_dir / "best_result.csv", [best_row])
+        atomic_json(case_dir / "peak_summary.json", search_summary)
         best_rows.append(best_row)
         # on_evaluation already persisted every probe; retain compatibility for unusual cached paths.
         if not any(item.get("case_name") == case.name for item in all_rows):
             all_rows.extend(trace_row(case, item, config) for item in history)
-        if best_result is None:
+        if searcher.termination not in {"boundary_confirmed", "capped"}:
             all_passed = False
 
     write_csv_report(session_dir / "peak_search_report.csv", best_rows)
     write_csv_report(session_dir / "peak_search_report_all.csv", all_rows)
     write_markdown_report(session_dir / "peak_search_report.md", best_rows)
-    (session_dir / "peak_search_report.json").write_text(
-        json.dumps({"best": best_rows, "all": all_rows}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    atomic_json(session_dir / "peak_search_report.json",
+        {"best": best_rows, "all": all_rows, "summaries": summaries, "complete": True})
+    atomic_json(session_dir / "peak_summary.json", {"cases": summaries})
+    write_csv_report(session_dir / "peak_summary.csv", summaries)
+    logger.info("归档 manifest: %s", session_dir)
+    logger.info("摸高执行完成，汇总目录: %s", session_dir)
     manifest = write_archive_manifest(
         session_dir,
         task_kind="peak-search",
@@ -1090,10 +1194,36 @@ def main() -> int:
             "json_report": str(session_dir / "peak_search_report.json"),
         },
     )
-    logger.info("归档 manifest: %s", manifest.get("archive_dir", ""))
-    logger.info("摸高执行完成，汇总目录: %s", session_dir)
     return 0 if all_passed else 1
 
 
+def cli_main():
+    """Persist startup/report failures even before the search logger exists."""
+    try:
+        return main()
+    except (Exception, KeyboardInterrupt, SystemExit) as error:
+        if isinstance(error, SystemExit) and not error.code:
+            return 0
+        container_output = Path("/workspace/aisbench_outputs")
+        root = container_output if container_output.is_dir() else RELEASE_ROOT / "outputs" / "default"
+        diagnostic = root / "diagnostics" / ("peak_" + uuid.uuid4().hex + ".json")
+        try:
+            resolved = diagnostic.resolve()
+            if resolved == BASE_DIR or BASE_DIR in resolved.parents:
+                raise ValueError("diagnostics cannot be written inside native source")
+            atomic_json(diagnostic, dict(state="cancelled" if isinstance(error, KeyboardInterrupt) else "error",
+                                         exception=type(error).__name__, reason=str(error),
+                                         at=datetime.now().astimezone().isoformat()))
+            if os.name == "posix":
+                diagnostic.chmod(0o600)
+            print("peak execution failed (" + type(error).__name__ + "); private diagnostics=" + str(diagnostic),
+                  file=sys.stderr)
+        except (OSError, ValueError):
+            print("peak execution failed; persistent diagnostics unavailable", file=sys.stderr)
+        if isinstance(error, KeyboardInterrupt):
+            return 130
+        return error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli_main())
