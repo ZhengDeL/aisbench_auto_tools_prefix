@@ -228,19 +228,20 @@ class ResultContracts(IsolatedTest):
         self.assertNotEqual(self.cli("stream").returncode, 0)
         self.assertEqual(self.cli("text").returncode, 0)
 
-    def test_stream_single_actual_output_token_checks_then_clears_tpot(self):
+    def test_stream_low_average_output_preserves_real_tpot_and_only_clears_missing(self):
         for value in ("", "0", "99999", "99999.0", "20"):
             with self.subTest(value=value):
                 row = {**source_row(), "output_len": "1.0", "TPOT avg": value, "TPOT SLO_P90": value}
                 self.write(row=row)
                 normalized = adapter.read_last_result(self.path)
-                self.assertEqual(normalized["TPOT avg"], "")
-                self.assertEqual(normalized["TPOT SLO_P90"], "")
+                expected = value if value in ("0", "20") else ""
+                self.assertEqual(normalized["TPOT avg"], expected)
+                self.assertEqual(normalized["TPOT SLO_P90"], expected)
                 self.assertEqual(normalized["TTFT avg"], row["TTFT avg"])
                 self.assertEqual(self.cli().returncode, 0)
                 case = matrix.build_case(BASE_CASE, {}, 1)
                 case.ttft_limit = case.tpot_limit = 0
-                self.assertFalse(matrix.resolve_threshold_reason(case, normalized, "TTFT avg", "TPOT avg")[0])
+                self.assertEqual(matrix.resolve_threshold_reason(case, normalized, "TTFT avg", "TPOT avg")[0], bool(expected))
                 self.write(row={**row, "output_len": "2"})
                 if value not in ("0", "20"):
                     with self.assertRaises(ValueError):
@@ -251,6 +252,32 @@ class ResultContracts(IsolatedTest):
             self.write(row={**source_row(), "output_len": "1", name: "nan"})
             with self.assertRaises(ValueError):
                 adapter.read_last_result(self.path)
+
+    def test_stream_mixed_zero_and_two_token_average_one_keeps_valid_tpot(self):
+        # Independent hand calculation: each request E2EL=1s, TTFT=.25s;
+        # output counts 0 and 2 yield TPOT 0ms and 750ms, mean 375ms/P90 675ms.
+        raw={**source_row(),"output_len":"1","TPOT avg":"375","TPOT SLO_P90":"675"}
+        self.write(row=raw)
+        original=self.path.read_bytes()
+        for reader in (adapter.read_last_result,matrix.read_last_csv_row,integrity.read_last_source_result):
+            actual=reader(self.path)
+            self.assertEqual(actual['TPOT avg'],'375')
+            self.assertEqual(actual['TPOT SLO_P90'],'675')
+        self.assertEqual(self.path.read_bytes(),original)
+        self.assertEqual(adapter.read_last_result(self.path,test_type='text')['TPOT avg'],'')
+        for length in ('0','0.5','1'):
+            for missing in ('','99999','99999.0'):
+                self.write(row={**raw,'output_len':length,'TPOT avg':missing,'TPOT SLO_P90':missing})
+                self.assertEqual(adapter.read_last_result(self.path)['TPOT avg'],'')
+        for length in ('0','0.5','1','2'):
+            for field in ('TPOT avg','TPOT SLO_P90'):
+                for bad in ('nan','inf','-inf','-1','unknown'):
+                    self.write(row={**raw,'output_len':length,field:bad})
+                    with self.subTest(length=length,field=field,bad=bad),self.assertRaises(ValueError):
+                        adapter.read_last_result(self.path)
+        for missing in ('','99999','99999.0'):
+            self.write(row={**raw,'output_len':'2','TPOT avg':missing})
+            with self.assertRaises(ValueError):adapter.read_last_result(self.path)
 
 
 class ArchiveLookupContracts(IsolatedTest):

@@ -242,35 +242,49 @@ class Worker:
 
     def run_container(self, args, timeout, on_progress=None):
         self.assert_container_ready()
-        process = subprocess.Popen([*self.docker, 'exec', '-e', 'PYTHONUNBUFFERED=1', '-e', 'PYTHONDONTWRITEBYTECODE=1',
-            '-e', 'AISBENCH_NATIVE_ROOT=' + CONTAINER_NATIVE, '-e', 'PYTHONPATH=' + self.work_path,
-            self.container_id, *args])
-        deadline = time.monotonic() + timeout
-        try:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(process.args, timeout)
-                try:
-                    result = process.wait(timeout=min(1, remaining))
-                except subprocess.TimeoutExpired:
+        logs = self.result / 'process_logs' / ('call_' + uuid.uuid4().hex)
+        validate_output_path(logs, NATIVE_ROOTS)
+        logs.mkdir(parents=True, exist_ok=False, mode=0o700)
+        self.log('container_call_start', '启动容器内工具；调用原始输出保存到独立日志',
+                 stdout_log=str(logs / 'stdout.raw.log'), stderr_log=str(logs / 'stderr.raw.log'))
+        # Never let docker exec inherit the manager's console pipe: if only
+        # the manager is killed, the completed benchmark must still be able
+        # to emit its final summary and return its true exit status.
+        with private_binary(logs / 'stdout.raw.log', NATIVE_ROOTS) as stdout, \
+                private_binary(logs / 'stderr.raw.log', NATIVE_ROOTS) as stderr:
+            process = subprocess.Popen([*self.docker, 'exec', '-e', 'PYTHONUNBUFFERED=1', '-e', 'PYTHONDONTWRITEBYTECODE=1',
+                '-e', 'AISBENCH_NATIVE_ROOT=' + CONTAINER_NATIVE, '-e', 'PYTHONPATH=' + self.work_path,
+                self.container_id, *args], stdout=stdout, stderr=stderr)
+            deadline = time.monotonic() + timeout
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(process.args, timeout)
+                    try:
+                        result = process.wait(timeout=min(1, remaining))
+                    except subprocess.TimeoutExpired:
+                        if on_progress:
+                            on_progress()
+                        continue
                     if on_progress:
                         on_progress()
-                    continue
-                if on_progress:
-                    on_progress()
-                return result
-        except subprocess.TimeoutExpired:
-            self.log('trial_timeout', '调用超过预算，停止固定ID工具容器，结束本任务', level='ERROR')
-            self.checked(['stop', '--time', '3', self.container_id], timeout=20)
-            process.wait(timeout=15)
-            raise RuntimeError('工具调用超时，不将其视为SLO失败')
-        except BaseException:
-            # A logging/publication error must also stop this task's requests.
-            if process.poll() is None:
+                    return result
+            except subprocess.TimeoutExpired:
+                self.log('trial_timeout', '调用超过预算，停止固定ID工具容器，结束本任务', level='ERROR')
                 self.checked(['stop', '--time', '3', self.container_id], timeout=20)
                 process.wait(timeout=15)
-            raise
+                raise RuntimeError('工具调用超时，不将其视为SLO失败')
+            except BaseException:
+                # A logging/publication error must also stop this task's requests.
+                if process.poll() is None:
+                    self.checked(['stop', '--time', '3', self.container_id], timeout=20)
+                    process.wait(timeout=15)
+                raise
+            finally:
+                for stream in (stdout, stderr):
+                    stream.flush()
+                    os.fsync(stream.fileno())
 
     def save_rows(self):
         buffer = io.StringIO(newline='')

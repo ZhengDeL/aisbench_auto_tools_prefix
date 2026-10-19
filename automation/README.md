@@ -200,7 +200,8 @@ outputs/default/<批次号>/
     │   ├── result_scopes.json
     │   ├── execution.log
     │   ├── events.jsonl
-    │   └── fixed_<轮次>/...          # evaluation、作用域、原始文件及校验清单
+    │   ├── fixed_<轮次>/...          # evaluation、作用域、原始文件及校验清单
+    │   └── process_logs/call_<标识>/ # Docker 调用原始 stdout.raw.log / stderr.raw.log
     └── peak_<场景和运行标识>/...       # 每轮原始结果、搜索轨迹及最终摘要
 ```
 
@@ -232,7 +233,7 @@ scenario,current_time,input_len,output_len,total_req,max_cc,cc,rr,TTFT avg,TTFT 
 | `repeat_rate` | 配置的前缀重复比例，不是实测缓存命中率 |
 | `status` | 固定轮次执行判定、摸高中间轮次或最终状态 |
 
-不适用的值留空，不写成零。文本模式没有流式 TTFT/TPOT；只有一个输出 token 的流式结果没有有效 TPOT；缺失的原生 prefill 吞吐占位值不作为真实吞吐。精度测试使用独立精度证据，不能把缺失性能项伪造为有效性能值。原生新增的 E2EL 等额外字段保留在原始文件中，不悄悄改变 23 列兼容接口。
+不适用的值留空，不写成零。文本模式没有流式 TTFT/TPOT；流式测试中，每条请求都没有首 token 之后的输出 token 时，TPOT 不适用。平均输出长度为 1 不能单独判定 TPOT 不适用，例如 0 和 2 token 请求混合时仍可能存在有效 TPOT，脚本会保留原始有效数值；只有平均输出不超过 1 且原始 TPOT 缺失或为占位值时才留空。缺失的原生 prefill 吞吐占位值不作为真实吞吐。精度测试使用独立精度证据，不能把缺失性能项伪造为有效性能值。原生新增的 E2EL 等额外字段保留在原始文件中，不悄悄改变 23 列兼容接口。
 
 当前默认镜像的 total 统计时长从最早请求开始到最晚请求结束；吞吐和 `cc` 使用其未显示舍入的时长，界面/CSV 的时长值已按原生规则舍入。P90 是逐请求指标分布的线性分位数，不能用各轮 P90 求平均来代替。若采用其他原生统计窗口，应按该作用域原始定义核验，不能套用 total 的分母。token 数来源是实际原始记录中的服务 usage/原生 tokenizer 计数；聚合核对不能独立证明服务 usage 或 tokenizer 绝对正确。
 

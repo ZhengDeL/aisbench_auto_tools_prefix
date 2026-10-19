@@ -56,6 +56,26 @@ class LoggingContracts(unittest.TestCase):
         self.assertEqual([record['event'] for record in records], ['scope_end', 'task_end'])
         self.assertIn('finished', human.read_text(encoding='utf-8'))
 
+    def test_container_client_streams_survive_lost_manager_pipe(self):
+        # The stand-in client really writes both descriptors after its
+        # ancestor's readers close. Inheriting those pipes used to turn a
+        # successful inner benchmark into a failed docker exec/worker.
+        client = "import sys;sys.stdout.buffer.write(b'complete\\xff\\n');sys.stdout.flush();sys.stderr.buffer.write(b'diagnostic\\n');sys.stderr.flush()"
+        code = (
+            "import sys,time\nfrom pathlib import Path\n"
+            "sys.path.insert(0," + repr(str(CORE_ROOT)) + ")\n"
+            "from aisbench_worker import Worker\n"
+            "w=Worker.__new__(Worker);w.result=Path(" + repr(str(self.root)) + ")\n"
+            "w.docker=[sys.executable,'-B','-c'," + repr(client) + "];w.container_id='fixture';w.work_path='unused'\n"
+            "w.assert_container_ready=lambda:None;w.log=lambda *a,**kw:None\n"
+            "time.sleep(.2)\nraise SystemExit(w.run_container([],10))\n")
+        process = subprocess.Popen([sys.executable, '-B', '-c', code], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process.stdout.close()
+        process.stderr.close()
+        self.assertEqual(process.wait(timeout=20), 0)
+        self.assertEqual(next(self.root.glob('process_logs/*/stdout.raw.log')).read_bytes(), b'complete\xff\n')
+        self.assertEqual(next(self.root.glob('process_logs/*/stderr.raw.log')).read_bytes(), b'diagnostic\n')
+
     def test_critical_events_have_sequence_timezone_identity_and_fsync(self):
         log = BatchLog(self.root / "outputs" / "batch", "batch", [self.native])
         with mock.patch("aisbench_logging.os.fsync", wraps=os.fsync) as sync:

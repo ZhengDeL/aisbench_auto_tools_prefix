@@ -96,9 +96,10 @@ def normalize_result(row: Mapping[str, Any], test_type: str = "stream", test_acc
         pass
     if not last["current_time"].strip():
         raise ValueError("result CSV missing current_time")
-    optional_latencies = set(TOKEN_LATENCY_COLUMNS) if test_type == "text" else set()
+    text_latencies = set(TOKEN_LATENCY_COLUMNS) if test_type == "text" else set()
+    optional_latencies = set(text_latencies)
     try:
-        if float(last["output_len"]) == 1:
+        if float(last["output_len"]) <= 1:
             optional_latencies.update(TOKEN_LATENCY_COLUMNS[2:])
     except (TypeError, ValueError):
         pass  # The regular numeric checks below reject an invalid output_len.
@@ -110,9 +111,15 @@ def normalize_result(row: Mapping[str, Any], test_type: str = "stream", test_acc
             value = float(last[name])
         except (TypeError, ValueError) as error:
             raise ValueError(f"invalid or missing numeric result: {name}") from error
-        if name in optional_latencies:
+        if name in text_latencies:
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"invalid numeric result: {name}")
+            last[name] = ""
+            continue
+        # An average output count <= 1 can mix zero-token and multi-token
+        # requests. Preserve a real TPOT from those requests; only the native
+        # missing-value sentinel is inapplicable at this average length.
+        if name in optional_latencies and value == FAILURE_SENTINELS.get(name):
             last[name] = ""
             continue
         if not math.isfinite(value) or value < 0 or value == FAILURE_SENTINELS.get(name):
