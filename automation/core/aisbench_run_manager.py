@@ -639,7 +639,15 @@ class ResourceLocks:
         for path in self.directory.glob("*.active.json"):
             if path.is_symlink():
                 raise RunError("发现无法确认的活动记录，保留资源隔离")
-            record = read_json(path)
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                # An independent owner may normally release after glob.
+                continue
+            except (OSError, ValueError) as error:
+                raise RunError("活动记录无法读取或损坏，保留资源隔离") from error
+            if not isinstance(record, dict):
+                raise RunError("活动记录无效，保留资源隔离")
             resources, output = record.get("resources"), record.get("host_output_dir")
             if (record.get("schema_version") != 1 or not isinstance(resources, list) or not resources
                     or any(not isinstance(value, str) for value in resources)
@@ -736,7 +744,14 @@ class ResourceLocks:
         for path in self.directory.glob("*.blocked.json"):
             if path.is_symlink():
                 raise RunError("发现无法确认的资源隔离记录，本批次未启动")
-            record = read_json(path)
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as error:
+                raise RunError("资源隔离记录无法读取或损坏，保留隔离；本批次未启动") from error
+            if not isinstance(record, dict):
+                raise RunError("资源隔离记录无效，保留隔离；本批次未启动")
             resources = record.get("resources")
             output = record.get("host_output_dir")
             if (record.get("schema_version") != 1 or not isinstance(resources, list)

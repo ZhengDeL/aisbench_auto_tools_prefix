@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 AUTOMATION_ROOT = Path(__file__).resolve().parent.parent
@@ -922,6 +923,32 @@ class ParallelProcessContracts(unittest.TestCase):
                     state_path.unlink()  # The test owns this synthetic state; no Docker rm is called.
                 code, output = self.run_pair(config)
                 self.assertEqual(code, 0, output)
+
+    def test_isolation_record_scan_allows_normal_concurrent_removal_but_rejects_corruption_and_denial(self):
+        manager = importlib.import_module('aisbench_run_manager')
+        locks = manager.ResourceLocks()
+        locks.directory = self.root / 'record-scan'
+        locks.directory.mkdir()
+        for suffix, scanner in (('active', locks._check_active), ('blocked', locks._check_quarantines)):
+            with self.subTest(kind=suffix):
+                path = locks.directory / ('existing.' + suffix + '.json')
+                path.write_text('{}')
+                already_listed = list(locks.directory.glob('*.' + suffix + '.json'))
+                path.unlink()  # Owner released between directory listing and read.
+                with mock.patch.object(Path, 'glob', return_value=iter(already_listed)):
+                    scanner([])
+                path.write_text('{broken')
+                with mock.patch.object(Path, 'glob', return_value=iter([path])):
+                    with self.assertRaises(manager.RunError):
+                        scanner([])
+                with mock.patch.object(Path, 'glob', return_value=iter([path])):
+                    with mock.patch.object(Path, 'read_text', side_effect=PermissionError('fixture access denied')):
+                        with self.assertRaises(manager.RunError):
+                            scanner([])
+                path.write_text('[]')
+                with mock.patch.object(Path, 'glob', return_value=iter([path])):
+                    with self.assertRaises(manager.RunError):
+                        scanner([])
 
     def test_service_id_lock_conflicts_across_distinct_endpoints(self):
         a = self.config('a.env', extra='SERVICE_ID=shared-backend')
