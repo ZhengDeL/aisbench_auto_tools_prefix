@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/rayn-zzz/aisbench_auto_tools_prefix",
-  "commit": "ef2b6d8653d57487b622b0dc9db458f8a1e8dec6",
+  "commit": "ac06bd619726663ac8c7b0c84c9b3cdbb041b062",
   "files": {
     "GSM8K.jsonl": {
       "sha256": "fb581f0270b25988e071316835842a1c8449f4e27af6fc0f539ef270b987f9ff",
@@ -15,7 +15,7 @@
       "mode": "100755"
     },
     "aisbench_test.py": {
-      "sha256": "cdee0b15a5baa471740bcd69dd243b1cad3876b1bfaa1b5d3eac4aa9b97fa37a",
+      "sha256": "a90fa5eebfa40eb3ef166933fc959ade9e2f6013e1a7920794cdf329fd78fc90",
       "mode": "100644"
     },
     "cal_prefix_hit_rate.py": {

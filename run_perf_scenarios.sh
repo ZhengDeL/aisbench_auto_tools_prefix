@@ -66,10 +66,10 @@ main() {
         fi
     done
 
-    check_python || return 1
-
-    # 原生源码保持只读，Python 缓存也不能落入原生目录。
+    # 第一次调用 Python 前即禁用字节码缓存，原生目录始终只供读取。
     export PYTHONDONTWRITEBYTECODE=1
+
+    check_python || return 1
 
     # 管理器为隔离的子任务设置此内部标记；用户正常启动走下面的管理器。
     if [[ "${AISBENCH_MANAGED_WORKER:-0}" == "1" ]]; then

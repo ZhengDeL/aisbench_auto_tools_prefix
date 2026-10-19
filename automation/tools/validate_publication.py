@@ -23,8 +23,8 @@ PRIVATE_SUFFIXES = ('.local.env', '.local.json', '.log', '.bundle', '.tar', '.ta
 PRIVATE_NAMES = {'validation_report.md', 'aisbench_result.csv', 'temp_api.py', 'picked_ids.txt', 'publication-private-map.json'}
 SECRET = re.compile(r'(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9_-]{24,})')
 UPSTREAM_REPOSITORY = 'https://github.com/rayn-zzz/aisbench_auto_tools_prefix'
-UPSTREAM_COMMIT = 'ef2b6d8653d57487b622b0dc9db458f8a1e8dec6'
-TRUSTED_MANIFEST_SHA256 = 'f958ad0bc6b78518e7d5bd53af73d9ab94a405d02ac73a45314328c015635cad'
+UPSTREAM_COMMIT = 'ac06bd619726663ac8c7b0c84c9b3cdbb041b062'
+TRUSTED_MANIFEST_SHA256 = 'ee904c87de693a8a129b98fa41c73df42f06b1f9acc1c99caabe48b87da63950'
 
 
 def public_address(value: str) -> bool:

@@ -292,7 +292,7 @@ python3 -B automation/core/aisbench_result_validation.py \
 
 ## 更新原生仓
 
-当前锁定 [rayn-zzz/aisbench_auto_tools_prefix 提交 ef2b6d8](https://github.com/rayn-zzz/aisbench_auto_tools_prefix/commit/ef2b6d8653d57487b622b0dc9db458f8a1e8dec6)。本仓通过 subtree 关联原生历史，维护时选定具体新提交，再同步整个原生子树；运行时不自动跟随浮动分支。
+当前锁定 [rayn-zzz/aisbench_auto_tools_prefix 提交 ac06bd6](https://github.com/rayn-zzz/aisbench_auto_tools_prefix/commit/ac06bd619726663ac8c7b0c84c9b3cdbb041b062)。本仓通过 subtree 关联原生历史，维护时选定具体新提交，再同步整个原生子树；运行时不自动跟随浮动分支。
 
 先确认工作区干净、处于升级维护分支，按需添加上游 remote（已有则省略第一条）：
 
@@ -300,7 +300,7 @@ python3 -B automation/core/aisbench_result_validation.py \
 git remote add upstream https://github.com/rayn-zzz/aisbench_auto_tools_prefix.git
 git fetch upstream main
 TARGET_UPSTREAM="$(git rev-parse upstream/main)"
-git log --oneline ef2b6d8653d57487b622b0dc9db458f8a1e8dec6.."$TARGET_UPSTREAM"
+git log --oneline ac06bd619726663ac8c7b0c84c9b3cdbb041b062.."$TARGET_UPSTREAM"
 git subtree merge --prefix=aisbench_auto_tools_prefix "$TARGET_UPSTREAM"
 git diff --exit-code "$TARGET_UPSTREAM^{tree}" HEAD:aisbench_auto_tools_prefix
 ```

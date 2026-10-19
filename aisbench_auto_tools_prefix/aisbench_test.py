@@ -426,7 +426,8 @@ if __name__ == '__main__':
             
             logging.info(f"[开始] 前缀数据集测试")
             # 前缀测试: request rate 固定为 0
-            modify_aisbench_api(str(dp), "1", request_rate_param="0")
+            warmup_concurrency = prefix_num if dp == 1 else dp
+            modify_aisbench_api(str(warmup_concurrency), "1", request_rate_param="0")
             dst_file = generate_test_dataset(src_file_prefix, dst_dir)
 
             # 命中率计算
