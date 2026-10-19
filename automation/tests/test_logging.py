@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -30,6 +31,30 @@ class LoggingContracts(unittest.TestCase):
         self.root = Path(self.temporary.name).resolve()
         self.native = self.root / "aisbench_auto_tools_prefix"
         self.native.mkdir()
+
+    def test_worker_keeps_durable_logs_when_manager_console_pipes_close(self):
+        human = self.root / 'worker.log'
+        events = self.root / 'worker.events.jsonl'
+        code = (
+            "import sys,time\n"
+            "sys.path.insert(0," + repr(str(CORE_ROOT)) + ")\n"
+            "from aisbench_worker import Worker,console_message\n"
+            "from pathlib import Path\n"
+            "w=Worker.__new__(Worker)\n"
+            "w.values={'MODEL_NAME':'model'};w.sequence=0;w.phase='running';w.current='case'\n"
+            "w.human=open(" + repr(str(human)) + ",'wb');w.events=open(" + repr(str(events)) + ",'wb')\n"
+            "time.sleep(0.2)\n"
+            "w.log('scope_end','complete')\n"
+            "w.log('task_end','finished',exit_code=0)\n"
+            "console_message('optional stderr',stream=sys.stderr)\n"
+            "w.human.close();w.events.close()\n")
+        process = subprocess.Popen([sys.executable, '-B', '-c', code], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process.stdout.close()
+        process.stderr.close()
+        self.assertEqual(process.wait(timeout=20), 0)
+        records = [json.loads(line) for line in events.read_text(encoding='utf-8').splitlines()]
+        self.assertEqual([record['event'] for record in records], ['scope_end', 'task_end'])
+        self.assertIn('finished', human.read_text(encoding='utf-8'))
 
     def test_critical_events_have_sequence_timezone_identity_and_fsync(self):
         log = BatchLog(self.root / "outputs" / "batch", "batch", [self.native])

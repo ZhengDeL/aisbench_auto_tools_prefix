@@ -46,6 +46,8 @@ bash run_perf_scenarios.sh automation/examples/test_a.env
 
 该小示例默认主测试请求数为 `4 × DATA_NUM_MULTIPLIER(4) = 16`，不包含摸高。模型需要的 tokenizer、聊天模板和服务行为仍需实际验证。
 
+通常填写 `HOST_IP` 和 `HOST_PORT` 即可。使用 `API_URL` 时填写**服务基址**，例如 `http://192.168.1.10:8000/`；网关有路径前缀时可填 `http://192.168.1.10:8000/gateway/`。当前默认镜像会补齐路径尾斜杠，再追加 `v1/chat/completions`，因此不要把完整的 `/v1/chat/completions` 接口或 `/v1/` 写入基址。详见 [地址规则](automation/README.md#配置加载与优先级)。
+
 一次启动多个独立服务的测试：
 
 ```bash
@@ -91,6 +93,8 @@ outputs/default/<批次号>/
 每组有自己的 CSV 和日志；批次文件提供索引及合并视图，不会把不同服务的吞吐相加或把延迟平均。自定义 `HOST_OUTPUT_DIR` 时，以任务索引中的实际路径为准。
 
 先看 `batch_state.json`、`batch_results.json` 和 `logs/batch.log`，再按任务查看 `execution.log`、摸高报告和原始证据。结束时管理日志按 16 MiB 字节段额外封存为 gzip，`logs/archive_index.json` 保存来源及校验值，原始文件保留；封存失败会使批次失败。`passed` 表示固定测试通过执行及适用的数据完整性检查；摸高需区分 `peak_confirmed`、`peak_capped`、预算耗尽、请求失败和基础设施错误。字段单位、终态及排查顺序见 [自动化说明](automation/README.md#结果与数值口径)。
+
+管理器被 `SIGKILL` 强杀后，Docker 内的压测可能仍在执行。下次启动会检查执行前持久记录的活动资源；未确认原任务结束时继续隔离，不自动补跑旧批次。恢复检查会将旧 `batch_state.json` 标为 `interrupted / MANAGER_LOST`，旧的不可变快照或 `batch_results.json` 可能仍显示中断前的 `running`。此时以批次状态及原完整容器 ID 的证据排查；不要删锁、改容器名或换路径绕过隔离。详见 [恢复规则](automation/README.md#服务隔离容器与取消)。
 
 私有原始日志可能包含服务地址、请求内容或凭据，不能直接上传公开仓库。可以直接编辑默认配置；需要保留公开示例时，也可自行使用被 Git 忽略的 `*.local.env`，这只是可选用法。
 

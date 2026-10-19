@@ -237,7 +237,10 @@ def configure_dataset_profile(native_root, evidence_dir, arguments, source_root)
     parameters["tokenizer"] = dict(path=str(model_path), files=tokenizer_files)
     parameters["native_generation"] = {
         name: file_digest(native_root / name) for name in
-        ("generate_dataset.py", "data_picker.py", "GSM8K.jsonl") if (native_root / name).is_file()}
+        # Length sampling lives in the entry module, so upstream sampler
+        # changes must invalidate datasets just like generator changes.
+        ("aisbench_test.py", "generate_dataset.py", "data_picker.py", "GSM8K.jsonl")
+        if (native_root / name).is_file()}
     canonical = json.dumps(parameters, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     cache_root = Path(config.DATASET_PATH)

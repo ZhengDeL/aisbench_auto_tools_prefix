@@ -42,6 +42,23 @@ def command(args: list[str], *, input_bytes: bytes | None = None, timeout: float
     return subprocess.run(args, input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
 
 
+def console_message(message, stream=None):
+    """Console loss must not discard a task whose durable journal is healthy."""
+    stream = sys.stdout if stream is None else stream
+    try:
+        print(message, file=stream, flush=True)
+    except (OSError, UnicodeError):
+        # A killed manager closes the pipe. Redirect that descriptor as well:
+        # otherwise interpreter shutdown can retry the failed flush and turn
+        # a completed worker into exit 120. Persistent log failures still raise
+        # from Worker.log before reaching this optional console copy.
+        try:
+            with open(os.devnull, 'wb') as sink:
+                os.dup2(sink.fileno(), stream.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
 def assert_container_identity(docker: list[str], container_id: str, expected_name: str) -> dict:
     fixed = command([*docker, 'inspect', container_id], timeout=20)
     named = command([*docker, 'inspect', '--format', '{{.Id}}', expected_name], timeout=20)
@@ -122,7 +139,7 @@ class Worker:
         except OSError:
             self.runtime(False, logging_error='任务持久日志写入失败')
             raise
-        print(f'{now} {level} [{event}] {safe}', flush=True)
+        console_message(f'{now} {level} [{event}] {safe}')
 
     def checked(self, args, *, input_bytes=None, timeout=60):
         result = command([*self.docker, *args], input_bytes=input_bytes, timeout=timeout)
@@ -464,7 +481,7 @@ def main():
                 worker.runtime(False, 1)
             except (OSError, ValueError):
                 worker.runtime(False, 1, logging_error='任务日志或结果写入失败')
-        print('ERROR: ' + message, file=sys.stderr, flush=True)
+        console_message('ERROR: ' + message, stream=sys.stderr)
         return 1
 
 

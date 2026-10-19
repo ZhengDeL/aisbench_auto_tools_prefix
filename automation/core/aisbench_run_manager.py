@@ -215,6 +215,42 @@ def timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
+def process_identity(pid: int) -> dict[str, Any]:
+    """PID plus kernel start identity; a reused PID is never the old owner."""
+    identity = {"pid": pid, "start_identity": "", "boot_id": ""}
+    if os.name == "posix":
+        try:
+            raw = Path("/proc/{}/stat".format(pid)).read_text(encoding="utf-8")
+            fields = raw.rsplit(")", 1)[1].split()
+            if fields[0] == "Z":
+                return identity
+            identity["start_identity"] = fields[19]
+            identity["boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        except (OSError, IndexError):
+            pass
+    elif os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if handle:
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel.GetExitCodeProcess(handle, ctypes.byref(exit_code)) or exit_code.value != 259:
+                    return identity
+                times = [wintypes.FILETIME() for _ in range(4)]
+                if kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
+                    identity["start_identity"] = str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
+            finally:
+                kernel.CloseHandle(handle)
+    return identity
+
+
 def _signal_request(signum: int, _frame: Any) -> None:
     global _STOP_REQUESTED
     _STOP_REQUESTED = signum
@@ -459,6 +495,8 @@ class ResourceLocks:
         validate_output_path(self.directory, _NATIVE_ROOTS)
         self.handles: list[IO[bytes]] = []
         self.jobs: list[Job] = []
+        self.active: dict[str, Path] = {}
+        self.active_records: dict[str, dict[str, Any]] = {}
 
     @property
     def descriptors(self) -> tuple[int, ...]:
@@ -502,6 +540,7 @@ class ResourceLocks:
                     raise
                 self.handles.append(handle)
             self._check_quarantines(jobs)
+            self._check_active(jobs)
         except OSError as error:
             self.close()
             raise RunError("服务、容器名或输出目录已被其他压测占用；本批次未启动") from error
@@ -517,6 +556,175 @@ class ResourceLocks:
         if job.metadata.get("service_id"):
             resources.append("service-id\0" + job.metadata["service_id"])
         return resources
+
+    def activate(self, job: Job, batch_path: Path, batch_id: str) -> None:
+        """Commit before Popen: Docker exec can outlive every inherited flock."""
+        record = {"schema_version": 1, "created_at": timestamp(), "run_id": job.run_id,
+                  "task": job.alias, "batch_id": batch_id, "batch_path": str(batch_path),
+                  "runtime_path": str(job.runtime_path), "owner": process_identity(os.getpid()),
+                  "worker": {}, "daemon_id": job.daemon_id, "container_id": "",
+                  "container_name": job.metadata["container_name"],
+                  "image": job.metadata["expected_image"],
+                  "host_output_dir": job.metadata["host_output_dir"],
+                  "resources": self._exclusive_resources(job)}
+        name = hashlib.sha256((job.daemon_id + "\0" + job.run_id).encode()).hexdigest() + ".active.json"
+        target = self.directory / name
+        self._persist_record(target, record)
+        self.active[job.run_id], self.active_records[job.run_id] = target, record
+
+    @staticmethod
+    def _matching_runtime(record: dict[str, Any]) -> dict[str, Any]:
+        expected = Path(record["host_output_dir"]) / ".launcher" / record["run_id"] / "runtime.json"
+        if canonical_path(record.get("runtime_path", "")) != canonical_path(str(expected)):
+            return {}
+        runtime = read_json(expected)
+        if (runtime.get("run_id") != record["run_id"]
+                or runtime.get("container_name") != record["container_name"]
+                or runtime.get("image") != record["image"]):
+            return {}
+        return runtime
+
+    def refresh(self, job: Job) -> None:
+        record = self.active_records.get(job.run_id)
+        if record is None:
+            return
+        changed = False
+        if job.process is not None and not record["worker"]:
+            record["worker"] = process_identity(job.process.pid)
+            changed = True
+        runtime = self._matching_runtime(record)
+        identifier = runtime.get("container_id", "")
+        if isinstance(identifier, str) and re.fullmatch(r"[a-fA-F0-9]{64}", identifier) and not record["container_id"]:
+            record["container_id"] = identifier
+            changed = True
+        if changed:
+            self._persist_record(self.active[job.run_id], record)
+
+    @staticmethod
+    def _complete(record: dict[str, Any], runtime: dict[str, Any]) -> bool:
+        identifier = runtime.get("container_id", "")
+        return (runtime.get("complete") is True and type(runtime.get("worker_exit")) is int
+                and isinstance(identifier, str) and bool(re.fullmatch(r"[a-fA-F0-9]{64}", identifier))
+                and (not record.get("container_id") or record["container_id"] == identifier))
+
+    @staticmethod
+    def _fixed_stopped(record: dict[str, Any], inspector: Job, identifier: str) -> bool:
+        inspected = inspect_container(inspector, identifier)
+        if inspected is None:
+            return True
+        config, state = inspected.get("Config"), inspected.get("State")
+        return (inspected.get("Id") == identifier
+                and inspected.get("Name", "").lstrip("/") == record["container_name"]
+                and isinstance(config, dict) and config.get("Image") == record["image"]
+                and isinstance(config.get("Labels"), dict)
+                and config["Labels"].get(MANAGED_LABEL) == "true"
+                and isinstance(state, dict) and state.get("Running") is False)
+
+    @staticmethod
+    def _mark_interrupted(record: dict[str, Any], reason: str, identifier: str) -> None:
+        batch = Path(record["batch_path"]) / "batch_state.json"
+        state = read_json(batch)
+        if state.get("batch_id") != record["batch_id"]:
+            raise RunError("旧批次状态身份无法确认，保留资源隔离")
+        if state.get("state") in ("preflight", "running", "interrupted", "unknown"):
+            state.update(state="interrupted", reason_code="MANAGER_LOST",
+                         exit_code=None, recovery_observed_at=timestamp())
+            observations = state.setdefault("recovery_observations", {})
+            observations[record["run_id"]] = {"reason": reason, "container_id": identifier,
+                                             "runtime_path": record["runtime_path"]}
+            # Preserve original finish time (normally empty), raw logs and CSVs.
+            atomic_json(batch, state)
+
+    def _check_active(self, jobs: list[Job]) -> None:
+        for path in self.directory.glob("*.active.json"):
+            if path.is_symlink():
+                raise RunError("发现无法确认的活动记录，保留资源隔离")
+            record = read_json(path)
+            resources, output = record.get("resources"), record.get("host_output_dir")
+            if (record.get("schema_version") != 1 or not isinstance(resources, list) or not resources
+                    or any(not isinstance(value, str) for value in resources)
+                    or not isinstance(output, str) or not output):
+                raise RunError("活动记录无效，保留资源隔离")
+            matching = [job for job in jobs if set(resources).intersection(self._exclusive_resources(job))
+                        or paths_overlap(output, job.metadata["host_output_dir"])]
+            if not matching:
+                continue
+            message = "此前管理进程中断，旧任务未确认结束，资源保持隔离；请检查原固定ID工具容器"
+            if (any(not isinstance(record.get(key), str) or not record[key]
+                    for key in ("run_id", "runtime_path", "batch_path", "batch_id", "daemon_id", "container_name", "image"))
+                    or not isinstance(record.get("owner"), dict)):
+                raise RunError(message)
+            owner = record["owner"]
+            if (type(owner.get("pid")) is not int or not owner.get("start_identity")):
+                raise RunError(message)
+            if process_identity(owner["pid"]) == owner:
+                raise RunError(message)
+            runtime = self._matching_runtime(record)
+            identifier = record.get("container_id") or runtime.get("container_id", "")
+            complete = self._complete(record, runtime)
+            safe = complete
+            if not safe and isinstance(identifier, str) and re.fullmatch(r"[a-fA-F0-9]{64}", identifier):
+                inspector = next((job for job in matching if job.daemon_id == record["daemon_id"]), None)
+                if inspector is not None:
+                    try:
+                        safe = self._fixed_stopped(record, inspector, identifier)
+                    except (OSError, subprocess.SubprocessError, RunError):
+                        safe = False
+            reason = ("worker_completed_without_manager" if complete else
+                      "fixed_container_stopped_or_absent" if safe else
+                      "fixed_container_running_or_unknown" if identifier else "container_identity_unknown")
+            self._mark_interrupted(record, reason, identifier)
+            if not safe:
+                raise RunError(message)
+            path.unlink()
+            self._sync_directory()
+            emit("manager", "旧批次管理进程已中断；根据可信完成记录或原固定ID停止证据解除对应隔离")
+
+    def _sync_directory(self) -> None:
+        if os.name == "posix":
+            descriptor = os.open(self.directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+    def _persist_record(self, target: Path, record: dict[str, Any]) -> None:
+        temporary = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(record, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            self._sync_directory()
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _release_finished(self) -> None:
+        for job in self.jobs:
+            path = self.active.get(job.run_id)
+            if path is None:
+                continue
+            self.refresh(job)
+            record = self.active_records[job.run_id]
+            safe = job.process is None or self._complete(record, self._matching_runtime(record))
+            identifier = record.get("container_id", "")
+            if not safe and identifier:
+                try:
+                    safe = self._fixed_stopped(record, job, identifier)
+                except (OSError, subprocess.SubprocessError, RunError):
+                    safe = False
+            if safe:
+                path.unlink()
+                self._sync_directory()
+            else:
+                job.state, job.cleanup = "cleanup_failed", "active_lease_unconfirmed"
+                emit(job.alias, "本次工具任务结束未能确认，执行前活动记录保留，服务资源继续隔离")
 
     def _check_quarantines(self, jobs: list[Job]) -> None:
         """Only a verified stopped fixed ID can release a failed cleanup marker.
@@ -589,30 +797,16 @@ class ResourceLocks:
         identity = json.dumps([job.daemon_id, job.run_id, job.alias], ensure_ascii=True).encode("utf-8")
         name = hashlib.sha256(identity).hexdigest() + ".blocked.json"
         target = self.directory / name
-        temporary = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
-        try:
-            descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(record, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, target)
-            if os.name == "posix":
-                directory_descriptor = os.open(self.directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-                try:
-                    os.fsync(directory_descriptor)
-                finally:
-                    os.close(directory_descriptor)
-        finally:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+        self._persist_record(target, record)
 
     def _quarantine_failed_jobs(self) -> None:
         for job in self.jobs:
             if job.state != "cleanup_failed":
+                continue
+            if job.run_id in self.active and self.active[job.run_id].is_file():
+                # New runs already committed the stronger pre-execution lease.
+                # Keep legacy blocked markers readable without duplicating an
+                # unknown-ID marker over a known fixed ID retained in a lease.
                 continue
             last_warning = float("-inf")
             while True:
@@ -638,8 +832,11 @@ class ResourceLocks:
         return self
 
     def __exit__(self, *_args: Any) -> None:
-        self._quarantine_failed_jobs()
-        self.close()
+        try:
+            self._release_finished()
+            self._quarantine_failed_jobs()
+        finally:
+            self.close()
 
 
 def _windows_lock(descriptor: int, exclusive: bool) -> None:
@@ -733,6 +930,31 @@ def inspect_container(job: Job, identifier: str) -> dict[str, Any] | None:
         return payload[0]
     except (ValueError, IndexError, TypeError) as error:
         raise RunError("容器状态响应无效") from error
+
+
+def validate_container_preflight(job: Job, diagnostics: Path) -> None:
+    """Reject known startup errors before committing a workload lease.
+
+    The planned name is only inspected for this new launch. Recovery above
+    continues to use the previous lease's fixed ID, never a name lookup.
+    """
+    result = command([docker_executable(job.environment), "image", "inspect", "--format", "{{.Id}}",
+                      job.metadata["expected_image"]], job.environment, 30, diagnostics=diagnostics)
+    if result.returncode or not re.fullmatch(r"sha256:[a-fA-F0-9]{64}", result.stdout.strip()):
+        raise RunError(f"{job.alias}: 本地压测镜像不存在或无法读取，请先拉取配置镜像；未启动压测")
+    existing = inspect_container(job, job.metadata["container_name"])
+    if existing is None:
+        return
+    config, state = existing.get("Config"), existing.get("State")
+    if (not isinstance(existing.get("Id"), str) or not re.fullmatch(r"[a-fA-F0-9]{64}", existing["Id"])
+            or existing.get("Name", "").lstrip("/") != job.metadata["container_name"]
+            or not isinstance(config, dict) or not isinstance(config.get("Labels"), dict)
+            or config["Labels"].get(MANAGED_LABEL) != "true"
+            or not isinstance(config.get("Image"), str)
+            or not (config["Image"] == job.metadata["expected_image"]
+                    or config["Image"].startswith("ghcr.io/aisbench/aisbench_benchmark"))
+            or not isinstance(state, dict) or type(state.get("Running")) is not bool):
+        raise RunError(f"{job.alias}: 同名容器无法确认属于本工具或镜像不匹配，未启动压测，未修改容器")
 
 
 def stop_owned_container(job: Job) -> bool:
@@ -1065,6 +1287,11 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
             if _STOP_REQUESTED:
                 return 128 + _STOP_REQUESTED
             for job in jobs:
+                diagnostic = batch_path / "logs" / "preflight" / (job.output_label + ".image-inspect")
+                job.diagnostic_paths.update(image_stdout=str(diagnostic) + ".stdout.log",
+                                            image_stderr=str(diagnostic) + ".stderr.log")
+                validate_container_preflight(job, diagnostic)
+            for job in jobs:
                 prepare_task_outputs(Path(job.metadata["host_output_dir"]), job.output_label)
             if batch_path:
                 for job in jobs:
@@ -1106,9 +1333,11 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
                         options["pass_fds"] = locks.descriptors
                     job.started_at = timestamp()
                     job.started_monotonic = time.monotonic()
+                    locks.activate(job, batch_path, batch_id)
                     job.process = subprocess.Popen(
                         [bash_executable(), str(script), str(job.worker_config)],
                         env=worker_environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options)
+                    locks.refresh(job)
                     job.state = "running"
                     job.reader = threading.Thread(target=stream_output, args=(job,), daemon=True)
                     job.reader.start()
@@ -1130,6 +1359,7 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
                         remaining.clear()
                         break
                     for job in list(remaining):
+                        locks.refresh(job)
                         runtime = read_json(job.runtime_path)
                         if runtime.get("run_id") == job.run_id and runtime.get("logging_error"):
                             job.logging_error = "WORKER_LOG_WRITE_FAILED"
@@ -1261,6 +1491,7 @@ def supervise(script: Path, arguments: list[str]) -> int:
     jobs: list[Job] = []
     state = {"schema_version": 1, "batch_id": batch_id, "state": "preflight",
              "started_at": timestamp(), "finished_at": "", "exit_code": None,
+             "owner": process_identity(os.getpid()),
              "reason_code": "", "logging_error": "", "log_dir": str(_BATCH_LOG.directory),
              "configuration_count": len(arguments) or 1,
              "configurations": arguments or [str(script.parent / "env.env")]}

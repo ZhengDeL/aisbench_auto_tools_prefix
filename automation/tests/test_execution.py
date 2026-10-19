@@ -331,6 +331,13 @@ class ExecutionTests(unittest.TestCase):
         for trial in ("trial_1", "trial_2", "trial_3", "trial_4"):
             private_config = (self.root / trial / "native_runtime/config.py").read_text()
             self.assertIn("Runtime-only input-cache namespace", private_config)
+        # The native entry contains length sampling.  A new upstream sampler
+        # must never reuse the old dataset even when CLI arguments match.
+        changed_native = self.run_native(code + "\n# upstream sampler revision\n", base)
+        self.assertEqual(changed_native["state"], "PASS", changed_native["reason"])
+        self.assertNotEqual(changed_native["dataset_profile"]["fingerprint"], profile["fingerprint"])
+        observation5 = json.loads((self.root / "trial_5/native_runtime/cache_observation.json").read_text())
+        self.assertFalse(observation5["reused"])
 
     def test_external_dataset_bypasses_generated_cache_namespace(self):
         cache = self.root / "unused_cache"

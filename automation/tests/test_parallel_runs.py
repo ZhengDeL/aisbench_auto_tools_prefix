@@ -36,7 +36,7 @@ SHELL = RELEASE_ROOT / "run_perf_scenarios.sh"
 # remains the production implementation: its file loading, environment handling,
 # resource locks, process supervision and result serialization all run normally.
 FIXTURE = r'''
-import csv, hashlib, json, os, pathlib, re, signal, sys, time
+import csv, hashlib, json, os, pathlib, re, signal, sys, tempfile, time
 root = pathlib.Path(os.environ['AISBENCH_TEST_ROOT'])
 events = root / 'events'
 states = root / 'containers'
@@ -63,6 +63,12 @@ if sys.argv[1] == 'docker':
     event('docker', args=args)
     if args[0] == 'info':
         print('offline-daemon-' + root.name)
+        sys.exit(0)
+    if args[:2] == ['image', 'inspect']:
+        if os.environ.get('AISBENCH_TEST_IMAGE_MISSING') == '1':
+            print('Error: No such image', file=sys.stderr)
+            sys.exit(1)
+        print('sha256:' + hashlib.sha256(args[-1].encode()).hexdigest())
         sys.exit(0)
     if args[0] == 'inspect':
         path = state_path(args[-1])
@@ -123,6 +129,9 @@ if env.get('AISBENCH_PREFLIGHT_REPORT'):
 
 tag = env['AISBENCH_RUN_TAG']
 identity = hashlib.sha256((name + '|' + tag).encode()).hexdigest()
+lock_base = pathlib.Path('/tmp') if os.name == 'posix' else pathlib.Path(tempfile.gettempdir())
+lease_name = hashlib.sha256(('offline-daemon-' + root.name + '\0' + tag).encode()).hexdigest() + '.active.json'
+lease_on_entry = json.loads((lock_base / 'aisbench-auto-tools-locks' / lease_name).read_text())
 result = output / 'scenario_results' / tag
 result.mkdir(parents=True, exist_ok=False)
 container = {'Id': identity, 'Name': '/' + name,
@@ -132,6 +141,8 @@ container = {'Id': identity, 'Name': '/' + name,
 runtime = {'container_id': identity, 'container_name': name, 'image': image,
            'run_id': tag, 'result_dir': str(result), 'complete': False,
            'phase': 'benchmark', 'current_scenario': 'small_c1', 'test_index': 1}
+if env.get('AISBENCH_TEST_HIDE_RUNTIME_ID') == '1':
+    runtime['container_id'] = ''
 runtime_path = pathlib.Path(env['AISBENCH_RUNTIME_REPORT'])
 runtime_path.write_text(json.dumps(runtime))
 print('worker stdout started', flush=True)
@@ -140,6 +151,7 @@ if env.get('AISBENCH_TEST_RAW_BYTES'):
     os.write(1, b'raw-utf8-\xff\x00\r\n')
     print('API_KEY=' + env.get('API_KEY', ''), flush=True)
 event('start', model=model, name=name, output=str(output), tag=tag, identity=identity,
+      lease_on_entry=lease_on_entry,
       host=env.get('HOST_IP'), api_key=env.get('API_KEY'),
       multiplier=env.get('DATA_NUM_MULTIPLIER'), cap=env.get('PEAK_HARD_CAP'),
        peak_options={key: env.get(key) for key in ('PEAK_PRECISION', 'PEAK_CONFIRM_RUNS', 'PEAK_CONFIRM_MIN_REQUESTS', 'PEAK_MAX_TRIALS', 'PEAK_TRIAL_TIMEOUT', 'PEAK_TOTAL_TIMEOUT', 'PEAK_INVALID_RETRIES', 'PEAK_FLOOR_CONCURRENCY')},
@@ -202,6 +214,7 @@ class ParallelProcessContracts(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.processes: list[subprocess.Popen] = []
         self.config_hosts: dict[str, str] = {}
+        self.addCleanup(self.clear_fixture_leases)
         self.addCleanup(self.stop_children)
         self.binary = self.root / 'bin'
         self.binary.mkdir()
@@ -233,6 +246,17 @@ class ParallelProcessContracts(unittest.TestCase):
         (self.root / 'tools').mkdir()
         shutil.copyfile(RELEASE_ROOT / 'aisbench_auto_tools_prefix' / 'aisbench_test.py',
                         self.root / 'tools' / 'aisbench_test.py')
+
+    def clear_fixture_leases(self):
+        # Failed/unknown leases must persist in production. Remove only this
+        # test's synthetic-daemon records after its child processes are stopped.
+        base = Path('/tmp') if os.name == 'posix' else Path(tempfile.gettempdir())
+        for path in (base / 'aisbench-auto-tools-locks').glob('*.json'):
+            if path.is_symlink():
+                continue
+            record = json.loads(path.read_text(encoding='utf-8'))
+            if record.get('daemon_id') == 'offline-daemon-' + self.root.name:
+                path.unlink()
 
     def stop_children(self):
         for process in self.processes:
@@ -777,6 +801,127 @@ class ParallelProcessContracts(unittest.TestCase):
         code, output = self.run_pair(c, d, checkout=second_checkout)
         self.assertEqual(code, 0, output)
         self.assertEqual(len(self.events('start')), 4)
+
+    def test_abrupt_manager_and_worker_death_keeps_service_blocked_until_fixed_id_stops(self):
+        host = self.root.name.replace('_', '-') + '.killed.invalid'
+        first = self.config('killed.env', host=host)
+        process = self.start(first, env={'AISBENCH_TEST_DURATION': '30'})
+        self.wait_starts(1)
+        old, = self.events('start')
+        self.assertEqual(old['lease_on_entry']['owner']['pid'], process.pid)
+        self.assertEqual(old['lease_on_entry']['run_id'], old['tag'])
+        self.assertEqual(old['lease_on_entry']['container_id'], '')
+        self.assertIn('service\0' + host + ':8000', old['lease_on_entry']['resources'])
+        old_batch = next(path for path in self.checkout.glob('outputs/default/*/batch_state.json')
+                         if json.loads(path.read_text())['owner']['pid'] == process.pid)
+        initial = json.loads(old_batch.read_text())
+        self.assertTrue(initial['owner']['start_identity'])
+        self.assertEqual(initial['finished_at'], '')
+        old_state_path = self.root / 'containers' / (old['identity'] + '.json')
+        process.kill()
+        os.kill(old['pid'], getattr(signal, 'SIGKILL', signal.SIGTERM))
+        self.finish(process)
+        later = self.config('after_kill.env', host=host, model='later-model')
+        code, output = self.run_pair(later)
+        self.assertNotEqual(code, 0, 'orphaned fixed ID was running but service was admitted: ' + output)
+        self.assertEqual(len(self.events('start')), 1, output)
+        recovered = json.loads(old_batch.read_text())
+        self.assertEqual(recovered['state'], 'interrupted')
+        self.assertIsNone(recovered['exit_code'])
+        self.assertEqual(recovered['finished_at'], '')
+        independent = self.config('independent.env', host='different.' + host)
+        code, output = self.run_pair(independent)
+        self.assertEqual(code, 0, output)
+        state = json.loads(old_state_path.read_text())
+        self.assertTrue(state['State']['Running'])
+        state['State']['Running'] = False
+        old_state_path.write_text(json.dumps(state))
+        code, output = self.run_pair(later)
+        self.assertEqual(code, 0, output)
+
+    def test_manager_death_worker_completion_releases_active_lease_without_stopping_container(self):
+        host = self.root.name.replace('_', '-') + '.manager-only.invalid'
+        process = self.start(self.config('manager_only.env', host=host),
+                             env={'AISBENCH_TEST_DURATION': '1.5'})
+        self.wait_starts(1)
+        old, = self.events('start')
+        process.kill()
+        self.finish(process)
+        deadline = time.monotonic() + 8
+        while len(self.events('finish')) != 1 and time.monotonic() < deadline:
+            time.sleep(0.025)
+        self.assertEqual(len(self.events('finish')), 1)
+        docker_before = len(self.events('docker'))
+        code, output = self.run_pair(self.config('worker_completed.env', host=host))
+        self.assertEqual(code, 0, output)
+        self.assertFalse([row for row in self.events('docker')[docker_before:]
+                          if row['args'][0] == 'stop'], output)
+        state = json.loads((self.root / 'containers' / (old['identity'] + '.json')).read_text())
+        self.assertTrue(state['State']['Running'], 'idle completed tool container need not be stopped')
+        previous = next(json.loads(path.read_text()) for path in self.checkout.glob('outputs/default/*/batch_state.json')
+                        if json.loads(path.read_text())['owner']['pid'] == process.pid)
+        self.assertEqual(previous['state'], 'interrupted')
+        self.assertEqual(previous['recovery_observations'][old['tag']]['reason'], 'worker_completed_without_manager')
+        self.assertIsNone(previous['exit_code'])
+        self.assertEqual(previous['finished_at'], '')
+
+    def test_unknown_fixed_id_stays_isolated_even_when_unidentified_container_was_stopped(self):
+        host = self.root.name.replace('_', '-') + '.unknown-id.invalid'
+        process = self.start(self.config('unknown.env', host=host),
+                             env={'AISBENCH_TEST_DURATION': '30', 'AISBENCH_TEST_HIDE_RUNTIME_ID': '1'})
+        self.wait_starts(1)
+        old, = self.events('start')
+        process.kill()
+        os.kill(old['pid'], getattr(signal, 'SIGKILL', signal.SIGTERM))
+        self.finish(process)
+        old_state_path = self.root / 'containers' / (old['identity'] + '.json')
+        state = json.loads(old_state_path.read_text())
+        state['State']['Running'] = False
+        old_state_path.write_text(json.dumps(state))
+        later = self.config('after_unknown.env', host=host)
+        docker_before = len(self.events('docker'))
+        code, output = self.run_pair(later)
+        self.assertNotEqual(code, 0, output)
+        self.assertEqual(len(self.events('start')), 1)
+        self.assertFalse([row for row in self.events('docker')[docker_before:]
+                          if row['args'][0] in ('inspect', 'stop')], output)
+        # Restore the original fixed-ID evidence, never infer it by container name.
+        runtime_path = Path(old['output']) / '.launcher' / old['tag'] / 'runtime.json'
+        runtime = json.loads(runtime_path.read_text())
+        runtime['container_id'] = old['identity']
+        runtime_path.write_text(json.dumps(runtime))
+        code, output = self.run_pair(later)
+        self.assertEqual(code, 0, output)
+
+    def test_known_container_or_image_preflight_failure_creates_no_unknown_lease(self):
+        for reason in ('unmanaged-container', 'missing-image'):
+            with self.subTest(reason=reason):
+                before = len(self.events('start'))
+                alias = reason.replace('-', '_')
+                config = self.config(alias + '.env', container=alias)
+                environment = {}
+                state_path = None
+                if reason == 'unmanaged-container':
+                    identity = hashlib.sha256((alias + self.root.name).encode()).hexdigest()
+                    state_path = self.root / 'containers' / (identity + '.json')
+                    state_path.parent.mkdir(exist_ok=True)
+                    state_path.write_text(json.dumps(dict(Id=identity, Name='/' + alias,
+                        Config=dict(Image='offline-image', Labels={}), State=dict(Running=True))))
+                else:
+                    environment['AISBENCH_TEST_IMAGE_MISSING'] = '1'
+                code, output = self.run_pair(config, env=environment)
+                self.assertNotEqual(code, 0, output)
+                self.assertEqual(len(self.events('start')), before)
+                base = Path('/tmp') if os.name == 'posix' else Path(tempfile.gettempdir())
+                records = [json.loads(path.read_text()) for path in
+                           (base / 'aisbench-auto-tools-locks').glob('*.active.json')]
+                self.assertFalse([record for record in records if record.get('daemon_id') ==
+                                  'offline-daemon-' + self.root.name], 'preflight must precede any lease')
+                if state_path is not None:
+                    self.assertTrue(json.loads(state_path.read_text())['State']['Running'])
+                    state_path.unlink()  # The test owns this synthetic state; no Docker rm is called.
+                code, output = self.run_pair(config)
+                self.assertEqual(code, 0, output)
 
     def test_service_id_lock_conflicts_across_distinct_endpoints(self):
         a = self.config('a.env', extra='SERVICE_ID=shared-backend')
