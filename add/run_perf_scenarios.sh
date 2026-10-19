@@ -3,6 +3,14 @@
 # 与 set -e 不兼容（失败轮次会在记录 failed 行之前直接退出整个脚本）。故仅保留 -u 与 pipefail。
 set -uo pipefail
 
+# Public entry: the manager validates and reserves resources before any worker
+# can create/rebuild a container. The worker flag is private to this launcher.
+ADD_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$ADD_DIR/.." && pwd)"
+if [ "${AISBENCH_MANAGED_WORKER:-0}" != "1" ]; then
+    exec python3 "$ADD_DIR/aisbench_run_manager.py" "$ADD_DIR/run_perf_scenarios.sh" "$@"
+fi
+
 ######################## 配置区（按需修改） ########################
 # 使用前必须修改：
 #   HOST_IP       模型服务所在机器 IP
@@ -16,9 +24,6 @@ set -uo pipefail
 # 容器设置
 CONTAINER_NAME="${CONTAINER_NAME:-ais_bench-example}"
 EXPECTED_IMAGE="${EXPECTED_IMAGE:-ghcr.io/aisbench/aisbench_benchmark:v3.1-20261013-master-openeuler24.03-py311}"
-
-ADD_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$ADD_DIR/.." && pwd)"
 
 # 宿主机路径（默认取 add 的父目录，即原始工具根目录）
 HOST_OUTPUT_DIR="${HOST_OUTPUT_DIR:-${PROJECT_ROOT}/outputs/default}"
@@ -74,6 +79,40 @@ SCENARIO_CONFIG_FILE="${1:-$ADD_DIR/env.env}"
 ######################## 配置区（按需修改） ########################
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 fail() { log "ERROR: $*"; exit 1; }
+
+write_runtime_report() {
+    [ -n "${AISBENCH_RUNTIME_REPORT:-}" ] || return 0
+    python3 - "$AISBENCH_RUNTIME_REPORT" "${CURRENT_ID:-}" "$CONTAINER_NAME" \
+        "$EXPECTED_IMAGE" "${RUN_TIMESTAMP:-}" "${RESULTS_HOST_DIR:-}" "$1" "${2:-}" <<'PY'
+import json, os, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+data = dict(zip(('container_id', 'container_name', 'image', 'run_id', 'result_dir'), sys.argv[2:7]))
+data['complete'] = sys.argv[7] == 'true'
+if sys.argv[8]:
+    data['worker_exit'] = int(sys.argv[8])
+temporary = path.with_name(path.name + '.tmp')
+with temporary.open('w', encoding='utf-8') as handle:
+    json.dump(data, handle, ensure_ascii=False)
+os.replace(temporary, path)
+PY
+}
+
+assert_container_ready() {
+    local identity named_id
+    [ -n "${CURRENT_ID:-}" ] || { log "ERROR: 压测容器ID未绑定"; return 1; }
+    identity=$(docker inspect --format '{{.Id}}|{{.State.Running}}' "$CURRENT_ID" 2>/dev/null) || {
+        log "ERROR: 原压测容器不可访问: $CURRENT_ID"; return 1;
+    }
+    [ "$identity" = "$CURRENT_ID|true" ] || {
+        log "ERROR: 原压测容器已停止: $CURRENT_ID"; return 1;
+    }
+    named_id=$(docker inspect --format '{{.Id}}' "$CONTAINER_NAME" 2>/dev/null) || {
+        log "ERROR: 原压测容器名称已不可访问: $CONTAINER_NAME (原ID=$CURRENT_ID)"; return 1;
+    }
+    [ "$named_id" = "$CURRENT_ID" ] || {
+        log "ERROR: 压测容器已被替换: 原ID=$CURRENT_ID 当前ID=$named_id"; return 1;
+    }
+}
 
 append_empty_result() {
     python3 - "$RESULTS_CSV" "$CSV_HEADER" "$@" <<'PY'
@@ -355,9 +394,24 @@ PY
 }
 
 ######################## 0. 初始化结果保存目录 ########################
-RUN_TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+# The same production parser above is used by the parent's read-only preflight.
+# No output directory or Docker mutation has occurred at this point.
+if [ -n "${AISBENCH_PREFLIGHT_REPORT:-}" ]; then
+    [ -d "$MODEL_HOST_PATH" ] || fail "宿主机模型目录不存在: $MODEL_HOST_PATH"
+    [ -f "$TOOLS_HOST_DIR/aisbench_test.py" ] || fail "工具目录缺少 aisbench_test.py: $TOOLS_HOST_DIR"
+    python3 - "$AISBENCH_PREFLIGHT_REPORT" "$CONTAINER_NAME" "$HOST_OUTPUT_DIR" \
+        "$MODEL_HOST_PATH" "$TOOLS_HOST_DIR" "$EXPECTED_IMAGE" "$HOST_IP" "$HOST_PORT" "$MODEL_NAME" <<'PY'
+import json, pathlib, sys
+keys = ('container_name', 'host_output_dir', 'model_host_path', 'tools_host_dir',
+        'expected_image', 'host_ip', 'host_port', 'model_name')
+pathlib.Path(sys.argv[1]).write_text(json.dumps(dict(zip(keys, sys.argv[2:])), ensure_ascii=False), encoding='utf-8')
+PY
+    exit $?
+fi
+RUN_TIMESTAMP="${AISBENCH_RUN_TAG:-$(date '+%Y%m%d_%H%M%S')}"
 RESULTS_HOST_DIR="${HOST_OUTPUT_DIR}/scenario_results/${RUN_TIMESTAMP}"
-mkdir -p "$RESULTS_HOST_DIR"
+mkdir -p "${HOST_OUTPUT_DIR}/scenario_results" || fail "无法创建结果根目录"
+mkdir "$RESULTS_HOST_DIR" || fail "本轮结果目录已经存在或不可创建: $RESULTS_HOST_DIR"
 
 RESULTS_CSV="${RESULTS_HOST_DIR}/all_results.csv"
 RESULTS_LOG="${RESULTS_HOST_DIR}/execution.log"
@@ -420,28 +474,32 @@ if [ "$ACTION" != "reused" ]; then
     if [ "$ACTION" = "recreated" ]; then
         docker rm -f "$CURRENT_ID" >/dev/null 2>&1 || fail "移除已确认的工具容器失败"
     fi
-    DOCKER_RUN_CMD="docker run -d --name '$CONTAINER_NAME' --label io.aisbench-auto-tools-prefix.managed=true --ipc=host --net=host --privileged --shm-size=1g -v '$HOST_OUTPUT_DIR':'$CONTAINER_OUTPUT_DIR'"
-    [ -e "$MODEL_HOST_PATH" ] && DOCKER_RUN_CMD+=" -v '$MODEL_HOST_PATH':'$MODEL_CONTAINER_PATH'"
-    DOCKER_RUN_CMD+=" '$EXPECTED_IMAGE' bash -lc 'trap : TERM INT; while true; do sleep 3600; done'"
-    eval "$DOCKER_RUN_CMD" >/dev/null || fail "容器启动失败"
+    DOCKER_RUN_CMD=(docker run -d --name "$CONTAINER_NAME" --label io.aisbench-auto-tools-prefix.managed=true --ipc=host --net=host --privileged --shm-size=1g -v "$HOST_OUTPUT_DIR:$CONTAINER_OUTPUT_DIR")
+    [ -e "$MODEL_HOST_PATH" ] && DOCKER_RUN_CMD+=(-v "$MODEL_HOST_PATH:$MODEL_CONTAINER_PATH")
+    DOCKER_RUN_CMD+=("$EXPECTED_IMAGE" bash -lc 'trap : TERM INT; while true; do sleep 3600; done')
+    CURRENT_ID=$("${DOCKER_RUN_CMD[@]}") || fail "容器启动失败"
+    [ -n "$CURRENT_ID" ] || fail "新压测容器未返回ID"
 fi
 
-docker exec "$CONTAINER_NAME" bash -lc 'mkdir -p /workspace /workspace/aisbench_auto_tools_prefix-main /workspace/aisbench_dataset /workspace/aisbench_outputs' || true
-docker exec "$CONTAINER_NAME" bash -lc 'test -e '"$MODEL_CONTAINER_PATH"'' >/dev/null 2>&1 || fail "容器内模型路径不存在"
+write_runtime_report false || fail "无法记录本轮压测容器身份"
+log "压测容器ID: $CURRENT_ID"
+assert_container_ready || fail "压测容器身份/状态检查失败"
+docker exec "$CURRENT_ID" bash -lc 'mkdir -p /workspace /workspace/aisbench_auto_tools_prefix-main /workspace/aisbench_dataset /workspace/aisbench_outputs' || fail "准备容器目录失败"
+docker exec "$CURRENT_ID" bash -lc 'test -e '"$MODEL_CONTAINER_PATH"'' >/dev/null 2>&1 || fail "容器内模型路径不存在"
 
 printf '===PERF_CONTAINER_ACTION===\n%s\n' "$ACTION"
 printf '===PERF_CONTAINER_REASON===\n%s\n' "$REASON"
 
 ######################## 2. 同步工具 + 查询 WORK_PATH + 写入 config.py ########################
 log "同步工具目录..."
-docker exec "$CONTAINER_NAME" bash -lc 'mkdir -p /workspace/aisbench_auto_tools_prefix-main' || true
+docker exec "$CURRENT_ID" bash -lc 'mkdir -p /workspace/aisbench_auto_tools_prefix-main' || fail "准备工具目录失败"
 # 通过 tar 管道同步，排除 outputs/（结果目录，按运行累积，无需拷入容器）避免逐轮冗余拷贝
 tar -C "$TOOLS_HOST_DIR" --exclude='./outputs' -cf - . \
-    | docker exec -i "$CONTAINER_NAME" tar -C /workspace/aisbench_auto_tools_prefix-main -xf - \
+    | docker exec -i "$CURRENT_ID" tar -C /workspace/aisbench_auto_tools_prefix-main -xf - \
     || fail "同步失败"
 
 TOOL_ROOT="$TOOLS_CONTAINER_DIR"
-TOOL_ROOT=$(docker exec "$CONTAINER_NAME" bash -lc "
+TOOL_ROOT=$(docker exec "$CURRENT_ID" bash -lc "
     if [ -d '$TOOL_ROOT/aisbench_auto_tools_prefix-main' ]; then
         echo '$TOOL_ROOT/aisbench_auto_tools_prefix-main'
     else
@@ -449,7 +507,7 @@ TOOL_ROOT=$(docker exec "$CONTAINER_NAME" bash -lc "
     fi") || TOOL_ROOT="$TOOLS_CONTAINER_DIR"
 
 log "查询 ais-bench-benchmark 安装路径..."
-WORK_PATH_DETECTED=$(docker exec "$CONTAINER_NAME" bash -lc "
+WORK_PATH_DETECTED=$(docker exec "$CURRENT_ID" bash -lc "
     W=\$(python3 -m pip show ais-bench-benchmark 2>/dev/null | sed -n 's/^Editable project location: //p' | head -1)
     [ -z \"\$W\" ] && W=\$(python3 -m pip show ais-bench-benchmark 2>/dev/null | sed -n 's/^Location: //p' | head -1)
     [ -z \"\$W\" ] && { echo 'ERROR'; exit 1; }
@@ -477,7 +535,7 @@ PY
 CONFIG_JSON_B64=$(printf '%s' "$CONFIG_JSON" | base64 | tr -d '\n')
 
 log "写入 config.py..."
-docker exec "$CONTAINER_NAME" bash -lc "
+docker exec "$CURRENT_ID" bash -lc "
 export WORK_PATH_DETECTED='$WORK_PATH_DETECTED'
 cd '$TOOL_ROOT' || exit 1
 python3 - config.py '$CONFIG_JSON_B64' <<'PY'
@@ -510,7 +568,10 @@ log "start fixed concurrency tests ($FIXED_COUNT groups)"
 while IFS='|' read -r ARCHIVE_NAME CMD_PARAMS; do
     [ -z "$ARCHIVE_NAME" ] && continue
     TEST_INDEX=$((TEST_INDEX + 1))
-    log "[$TEST_INDEX/$TOTAL_TESTS] 开始测试: $ARCHIVE_NAME"
+    log "[$TEST_INDEX/$TOTAL_TESTS] 开始测试: $ARCHIVE_NAME (container_id=$CURRENT_ID)"
+    if [ -n "${AISBENCH_RUNTIME_REPORT:-}" ]; then
+        assert_container_ready || fail "原压测容器失效，停止本组测试"
+    fi
     ARCHIVE_SINCE_TS=$(python3 -c 'import time; print(time.time())')
 
     # 提取场景参数用于失败时的记录
@@ -533,7 +594,7 @@ PY
     # 执行测试 + 归档 + 结果提取
     # Capture container output in a temp file and tee it to the runtime log.
     CONTAINER_LOG_TMP=$(mktemp /tmp/container_output_XXXXXX.log)
-    docker exec "$CONTAINER_NAME" bash -lc "
+    docker exec "$CURRENT_ID" bash -lc "
         export PYTHONPATH='$WORK_PATH_DETECTED'\${PYTHONPATH:+:\$PYTHONPATH}
         cd '$TOOL_ROOT' || exit 1
         rm -f aisbench.log aisbench_result.csv temp_api.py
@@ -578,6 +639,9 @@ PY
         FAILED_COUNT=$((FAILED_COUNT + 1))
         log "[$TEST_INDEX/$TOTAL_TESTS] 失败: $ARCHIVE_NAME (退出码: $PERF_PIPE_RC)"
         append_empty_result "$ARCHIVE_NAME" "" "$SCENARIO_INPUT_LEN" "$SCENARIO_OUTPUT_LEN" "" "$SCENARIO_CONCURRENCY" "$SCENARIO_REQUEST_RATE" "$SCENARIO_REPEAT_RATE" "failed"
+        if [ -n "${AISBENCH_RUNTIME_REPORT:-}" ]; then
+            assert_container_ready || fail "原压测容器失效，停止后续场景"
+        fi
         continue
     fi
 
@@ -626,7 +690,10 @@ while IFS='|' read -r ARCHIVE_NAME PEAK_INPUT_LEN PEAK_OUTPUT_LEN PEAK_MIN_CC PE
     : "${PEAK_REPEAT_RATE:=0}"
     PEAK_CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
     TEST_INDEX=$((TEST_INDEX + 1))
-    log "[$TEST_INDEX/$TOTAL_TESTS] 摸高搜索: $ARCHIVE_NAME (并发 $PEAK_MIN_CC~$PEAK_MAX_CC, TTFT<$PEAK_TTFT s, TPOT<$PEAK_TPOT ms)"
+    log "[$TEST_INDEX/$TOTAL_TESTS] 摸高搜索: $ARCHIVE_NAME (并发 $PEAK_MIN_CC~$PEAK_MAX_CC, TTFT<$PEAK_TTFT s, TPOT<$PEAK_TPOT ms, container_id=$CURRENT_ID)"
+    if [ -n "${AISBENCH_RUNTIME_REPORT:-}" ]; then
+        assert_container_ready || fail "原压测容器失效，停止本组摸高"
+    fi
 
     # 构建 aisbench_perf_matrix.py 命令
     PEAK_RUN_TAG="${RUN_TIMESTAMP}_${TEST_INDEX}"
@@ -658,7 +725,7 @@ while IFS='|' read -r ARCHIVE_NAME PEAK_INPUT_LEN PEAK_OUTPUT_LEN PEAK_MIN_CC PE
     fi
 
     CONTAINER_LOG_TMP=$(mktemp /tmp/container_output_XXXXXX.log)
-    docker exec "$CONTAINER_NAME" bash -lc "
+    docker exec "$CURRENT_ID" bash -lc "
         export PYTHONPATH='$WORK_PATH_DETECTED'\${PYTHONPATH:+:\$PYTHONPATH}
         cd '$TOOL_ROOT' || exit 1
         $PEAK_CMD
@@ -685,6 +752,9 @@ while IFS='|' read -r ARCHIVE_NAME PEAK_INPUT_LEN PEAK_OUTPUT_LEN PEAK_MIN_CC PE
         FAILED_COUNT=$((FAILED_COUNT + 1))
         log "摸高失败: $ARCHIVE_NAME (退出码: $PEAK_RC)"
         append_empty_result "$ARCHIVE_NAME" "" "$PEAK_INPUT_LEN" "$PEAK_OUTPUT_LEN" "" "" "$PEAK_REQUEST_RATE" "$PEAK_REPEAT_RATE" "failed"
+        if [ -n "${AISBENCH_RUNTIME_REPORT:-}" ]; then
+            assert_container_ready || fail "原压测容器失效，停止后续场景"
+        fi
         continue
     fi
 
@@ -699,7 +769,7 @@ while IFS='|' read -r ARCHIVE_NAME PEAK_INPUT_LEN PEAK_OUTPUT_LEN PEAK_MIN_CC PE
     [ -n "$PEAK_REPORT_PATH" ] && log "peak_report_path=$PEAK_REPORT_PATH"
     if [ -n "$PEAK_REPORT_PATH" ]; then
         PEAK_METRICS_FILE=$(mktemp /tmp/peak_metrics_XXXXXX.txt)
-        docker exec -i "$CONTAINER_NAME" python3 - "$PEAK_REQUEST_RATE" "$PEAK_REPORT_PATH" > "$PEAK_METRICS_FILE" 2>>"$RESULTS_LOG" <<'PY' || true
+        docker exec -i "$CURRENT_ID" python3 - "$PEAK_REQUEST_RATE" "$PEAK_REPORT_PATH" > "$PEAK_METRICS_FILE" 2>>"$RESULTS_LOG" <<'PY' || true
 import json
 import sys
 
@@ -856,11 +926,17 @@ echo ""
 SUMMARY_PIPE_RC=${PIPESTATUS[0]}
 [ "$SUMMARY_PIPE_RC" -eq 0 ] || fail "汇总表格输出失败"
 
-ln -sf "$RESULTS_HOST_DIR" "${HOST_OUTPUT_DIR}/scenario_results/latest" 2>/dev/null || true
+ln -sfnT "$RESULTS_HOST_DIR" "${HOST_OUTPUT_DIR}/scenario_results/latest" || fail "更新 latest 结果链接失败"
 
 log "汇总 CSV: $RESULTS_CSV"
 log "执行日志: $RESULTS_LOG"
 log "全部测试完成"
 
-# Continue individual jobs, but report any failed/missing result to the caller.
-[ "$FAILED_COUNT" -eq 0 ]
+# Continue ordinary failed jobs, but report the group's final status to the
+# supervisor. A premature exit leaves complete=false so cleanup can stop execs.
+WORKER_EXIT=0
+[ "$FAILED_COUNT" -eq 0 ] || WORKER_EXIT=1
+if [ -n "${AISBENCH_RUNTIME_REPORT:-}" ]; then
+    write_runtime_report true "$WORKER_EXIT" || fail "无法记录本组完成状态"
+fi
+exit "$WORKER_EXIT"

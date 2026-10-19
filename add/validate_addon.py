@@ -204,7 +204,7 @@ def check_run_script() -> None:
         "peak REPORT_JSON lookup is active": r"^\s*REPORT_JSON=\\\$\(find '\$CONTAINER_OUTPUT_DIR'",
         "peak REPORT path marker is active": r"^\s*echo '===PEAK_REPORT_PATH==='\s*$",
         "peak REPORT path extraction is active": r"^\s*PEAK_REPORT_PATH=\$\(echo \"\$CONTAINER_OUTPUT\"",
-        "peak metrics parser uses docker exec stdin": r"^\s*docker exec -i \"\$CONTAINER_NAME\" python3 -",
+        "peak metrics parser uses fixed container ID and stdin": r"^\s*docker exec -i \"\$CURRENT_ID\" python3 -",
         "peak metrics output file is read": r"^\s*PEAK_RAW=\$\(tail -n 1 \"\$PEAK_METRICS_FILE\"",
         "peak JSON file load is active": r"^\s*report = json\.load\(f\)",
         "peak metrics vals list is active": r"^\s*vals = \[",
@@ -1065,7 +1065,7 @@ def simulate_shell_batch_failures() -> None:
                 "PEAK_COMBOS": scenario + '_peak|16|4|1|2|1|0|30|50|0|', "RUN_TIMESTAMP": "offline",
                 "HOST_OUTPUT_DIR": str(job_root), "RESULTS_HOST_DIR": str(job_root),
                 "RESULTS_CSV": str(job_root / "summary.csv"), "RESULTS_LOG": str(job_root / "execution.log"),
-                "WORK_PATH_DETECTED": "/unused", "TOOL_ROOT": "/unused", "CONTAINER_NAME": "offline",
+                "WORK_PATH_DETECTED": "/unused", "TOOL_ROOT": "/unused", "CONTAINER_NAME": "offline", "CURRENT_ID": "offline",
                 "CONTAINER_OUTPUT_DIR": "/unused", "HOST_IP": "localhost", "HOST_PORT": "8000",
                 "FAILED_REQ_LIMIT": str(limit), "MOCK_OUTPUT": output, "MOCK_EXIT": str(process_exit),
                 "MOCK_MIXED": "1" if name == "mixed batch" else "0", "NPU_NUM": "1", "PEAK_HARD_CAP": "0",
@@ -1135,7 +1135,7 @@ def simulate_scenario_validation() -> None:
         scenario = {"name": "validation", "input_len": 16, "output_len": 4, "concurrency": [1], "request_rate": 0, **changes}
         options = options.copy()
         scenarios = options.pop("fixture_scenarios", [scenario])
-        env = {**os.environ, "NPU_NUM": "1", "PEAK_HARD_CAP": "0",
+        env = {**os.environ, "AISBENCH_MANAGED_WORKER": "1", "NPU_NUM": "1", "PEAK_HARD_CAP": "0",
                "DATA_NUM_MULTIPLIER": "1", "FAILED_REQ_LIMIT": "0", "PEAK_DATA_MULTIPLIER": "1", **options}
         env.pop("SCENARIOS_JSON_OVERRIDE", None)
         with tempfile.TemporaryDirectory(prefix="addon_invalid_env_") as tmp:
@@ -1171,7 +1171,7 @@ def simulate_container_reuse_guards() -> None:
         add_check("actual container reuse guards", False, "Bash unavailable", warn=True)
         return
     text = read_text(RUN_SCRIPT)
-    block = text[text.index('ACTION="reused"'):text.index('docker exec "$CONTAINER_NAME" bash -lc \'mkdir -p /workspace /workspace/')]
+    block = text[text.index('ACTION="reused"'):text.index('write_runtime_report false || fail')]
     fake = r'''
 log() { printf '%s\n' "$*"; }
 fail() { log "ERROR: $*"; exit 1; }
@@ -1192,7 +1192,7 @@ docker() {
         start) return 7 ;;
         exec) return 0 ;;
         rm) printf '%s\n' "$3" > "$REMOVED_ID_FILE"; return 0 ;;
-        run) return 0 ;;
+        run) echo verified-created-id; return 0 ;;
     esac
 }
 '''

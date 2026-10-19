@@ -559,7 +559,7 @@ row.update(concurrency=2, passed='yes')
                "HOST_OUTPUT_DIR": output.as_posix(), "RESULTS_HOST_DIR": results.as_posix(),
                "RESULTS_CSV": (results / "all_results.csv").as_posix(), "RESULTS_LOG": (results / "execution.log").as_posix(),
                "WORK_PATH_DETECTED": add.as_posix(), "TOOL_ROOT": tools.as_posix(),
-               "CONTAINER_NAME": "offline", "CONTAINER_OUTPUT_DIR": output.as_posix(),
+               "CONTAINER_NAME": "offline", "CURRENT_ID": "offline", "CONTAINER_OUTPUT_DIR": output.as_posix(),
                "HOST_IP": "localhost", "HOST_PORT": "8000", "API_URL": "", "FAILED_REQ_LIMIT": "0",
                "NPU_NUM": "1", "PEAK_HARD_CAP": "0", "MOCK_CALLS": str(calls), "MOCK_OUTPUT_ROOT": str(output)}
         process = run_bash_code(bash, prefix + tail, env=env, timeout=90)
@@ -627,7 +627,7 @@ PY
 '''
         script = add / "run_perf_scenarios.sh"
         script.write_bytes((prelude + prefix + tail).encode("utf-8"))
-        env = {**os.environ, "NPU_NUM": "1", "DATA_NUM_MULTIPLIER": "7", "PEAK_HARD_CAP": "0",
+        env = {**os.environ, "AISBENCH_MANAGED_WORKER": "1", "NPU_NUM": "1", "DATA_NUM_MULTIPLIER": "7", "PEAK_HARD_CAP": "0",
                "MAX_CONTEXT_LEN": "512000", "PEAK_MIN_CONCURRENCY": "1", "PEAK_MAX_MULTIPLIER": "20",
                "PEAK_DATA_MULTIPLIER": "4", "PEAK_WAIT_SECONDS": "0", "PEAK_TTFT_LIMIT": "5",
                "PEAK_TPOT_LIMIT": "50", "FAILED_REQ_LIMIT": "0", "HOST_IP": "environment-host.invalid"}

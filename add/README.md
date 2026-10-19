@@ -19,7 +19,7 @@
 首次获取仓库：
 
 ```bash
-git clone --branch main-add-20261015 https://github.com/ZhengDeL/aisbench_auto_tools_prefix.git
+git clone --branch feat/parallel-tests-20261019 https://github.com/ZhengDeL/aisbench_auto_tools_prefix.git
 cd aisbench_auto_tools_prefix/add
 ```
 
@@ -47,6 +47,36 @@ bash run_perf_scenarios.sh
 
 `NPU_NUM` 是吞吐归一化的分母：`single_output_throughput = output_throughput / NPU_NUM`，`single_E2E_throughput = E2E_throughput / NPU_NUM`；全局吞吐保持整轮统计值。用户必须按报告单位填写参与测试的设备总数：按物理卡报告就填物理卡数，按 NPU 芯片报告就填芯片数，并在报告中注明口径。A3 一张物理卡包含 2 颗 NPU 芯片，两种口径对应的归一化吞吐相差 2 倍。默认 `1` 是示例值，脚本不会自动探测硬件。`POD_INFO` 的端点数量也不会自动设置 `dp`；当前场景没有显式设置 `dp`，底层默认是 `1`。
 
+### 双配置并行：一次启动两组测试
+
+需要同时运行两组测试时，在 `add/` 目录分别编辑两份配置，再用一条命令启动。**双配置模式自动分别加载全局参数和场景，无需先 `source`。**
+
+```bash
+vi test_a.env
+vi test_b.env
+bash run_perf_scenarios.sh ./test_a.env ./test_b.env
+```
+
+每份文件都包含完整的模型、路径、服务地址等全局参数，以及一个 `SCENARIOS_JSON` 场景块。两份公开示例都是 1K 输入、512 输出、4 并发，无摸高和前缀预热；固定请求倍率为 `4`，每组发出 `16` 条主测试请求。填写实际模型别名、权重路径、服务地址和 NPU 数后再运行。
+
+| 项目 | 测试 A | 测试 B |
+|---|---|---|
+| 配置文件 | `test_a.env` | `test_b.env` |
+| 默认压测容器 | `ais_bench-test_a` | `ais_bench-test_b` |
+| 默认结果根目录 | `outputs/test_a/` | `outputs/test_b/` |
+
+容器名和结果根目录默认根据配置文件名生成；需要指定时，在各自文件中设置独立的 `CONTAINER_NAME`、`HOST_OUTPUT_DIR`。两组分别使用自己的配置、镜像、压测容器、日志、CSV、摸高报告和 `latest`；每组内部仍按顺序执行固定测试和摸高。两份文件即使都含有同名场景，也不会共用结果目录。
+
+启动前统一校验两份配置和资源锁。容器重名、输出目录重叠、配置非法，或容器/结果目录正在被另一轮使用时，整批报错，不启动压测。一组运行失败时，另一组继续；两组全部成功才返回 `0`，任一失败则整批返回非零。
+
+批次状态保存在项目下 `outputs/parallel/<批次标记>/batch_results.json` 和 `batch_results.csv`，记录各组退出码、结果目录和启动日志路径。各组的启动日志保存在自己的结果根目录下 `.launcher/<运行标记>/launcher.log`，结束时还会复制到对应的 `scenario_results/<运行标记>/launcher.log`；指标汇总仍位于 `scenario_results/latest/all_results.csv`。
+
+双配置模式在启动时固定两份配置的文件内容，运行中修改配置会在下次启动时生效。路径按启动目录解析，建议填写绝对路径；配置文件不要依赖 `BASH_SOURCE` 定位相邻文件。
+
+按 `Ctrl+C` 会停止本批两组的压测进程和专用压测容器，避免继续发送请求，保留容器及已有产物；不停止模型服务容器。两组若指向同一个模型服务，负载会叠加；若共享缓存指标端点，采集值也可能混合，应据此解释性能和缓存结果。
+
+原来的零参数或单配置参数用法保持不变，仍按单测流程先 `source`。本节的自动加载仅用于双配置模式。
+
 ## 3. 先用小场景验证流程
 
 当前 `env.env` 中的场景会执行多轮 64K 测试和摸高搜索。只想检查配置与流程时，将所用配置文件末尾的 `SCENARIOS_JSON` 块替换为下面的小场景；这是文件内容，无需 `export`：
@@ -73,7 +103,7 @@ JSON
 
 ## 4. 全局环境变量与文件配置优先级
 
-下表是**未设置对应环境变量时，脚本自身使用的回退值**。模型、路径和地址均为公开示例；按第 2 节加载配置后，以环境值为准。
+下表是**未设置对应环境变量时，脚本自身使用的回退值**。模型、路径和地址均为公开示例。单测按第 2 节加载配置后，以环境值为准；双配置模式由脚本分别加载每份完整配置。并行模式未显式指定容器名、结果目录时，使用第 2 节所述的文件名派生值。
 
 | 环境变量 | 脚本回退值 | 用途 |
 |---|---|---|
@@ -104,13 +134,13 @@ JSON
 
 配置按下面的规则生效：
 
-1. 加载配置文件后，全局环境变量覆盖 shell 的回退值；后续的 `export` 或 `VAR=value bash ...` 可以再次覆盖这些全局参数。场景数组始终从脚本第一个参数指定的文件读取，未指定时读取 `add/env.env`，不从环境变量取值。
+1. 单测模式下，加载配置文件后，全局环境变量覆盖 shell 的回退值；后续的 `export` 或 `VAR=value bash ...` 可以再次覆盖这些全局参数。场景数组从脚本唯一参数指定的文件读取，未指定时读取 `add/env.env`，不从环境变量取值。双配置模式分别自动加载两份文件，各组的全局参数和场景使用自己的文件；请将组内参数直接写在对应文件中。
 2. 场景显式填写的 `ttft_limit`、`tpot_limit`、`peak_min_cc`、`peak_max_cc`、`peak_data_multiplier`、`peak_wait` 优先于相应的 `PEAK_*` 环境默认。
 3. shell 把最终场景值作为命令行参数传给摸高引擎，覆盖 `aisbench_perf_matrix_config.py` 中对应的默认值。场景填写 `npu_num` 时，也会优先于全局 `NPU_NUM`。
 
 例如，当前场景已写入 TTFT=15 秒、TPOT=60 毫秒，仅设置 `PEAK_TTFT_LIMIT=5`、`PEAK_TPOT_LIMIT=50` 不会改变它们。请直接修改所用配置文件中的场景字段。
 
-### 可选：使用其他配置文件
+### 单测可选：使用其他配置文件
 
 只有需要保留多套配置时，才使用其他文件。普通使用继续编辑 `env.env` 即可。
 
@@ -121,9 +151,9 @@ source ./env.local.env
 bash run_perf_scenarios.sh ./env.local.env
 ```
 
-两行使用同一个文件：第一行加载全局参数，第二行指定场景 JSON 的读取位置。其他配置文件也必须同时包含全局参数和一个 `SCENARIOS_JSON=$(cat <<'JSON' ... JSON )` 场景块。脚本只解析其中的场景，不自动加载全局参数。`env.local.env` 已被 Git 忽略，可保存本地真实配置。
+单配置模式的两行使用同一个文件：第一行加载全局参数，第二行指定场景 JSON 的读取位置。其他配置文件也必须同时包含全局参数和一个 `SCENARIOS_JSON=$(cat <<'JSON' ... JSON )` 场景块。单配置模式只解析其中的场景，不自动加载全局参数；双配置模式则按第 2 节自动分别加载。`env.local.env` 已被 Git 忽略，可保存本地真实配置。
 
-### 可选：临时覆盖全局参数
+### 单测可选：临时覆盖全局参数
 
 加载配置后可以继续覆盖变量，例如：
 
@@ -263,13 +293,15 @@ scenario,current_time,input_len,output_len,total_req,max_cc,cc,rr,TTFT avg,TTFT 
 
 ## 8. 检查结果
 
-在 `add/` 目录查看本轮汇总：
+单测在 `add/` 目录查看本轮汇总：
 
 ```bash
 OUTPUT_ROOT="${HOST_OUTPUT_DIR:-$(cd .. && pwd)/outputs/default}"
 cat "$OUTPUT_ROOT/scenario_results/latest/all_results.csv"
 tail -n 30 "$OUTPUT_ROOT/scenario_results/latest/execution.log"
 ```
+
+双配置模式先查看终端打印的批次目录中的 `batch_results.json` 或 `batch_results.csv`，再按其中的组内结果位置查看各组 `all_results.csv` 和日志。默认结果根目录分别是 `outputs/test_a` 和 `outputs/test_b`；下面的产物校验命令也应分别对两组执行。
 
 离线检查插件本身，不调用 Docker、不请求模型：
 
@@ -299,7 +331,7 @@ python3 validate_result_integrity.py \
 
 | 现象 | 检查方法 |
 |---|---|
-| 使用了错误模型、地址或 NPU 数 | 确认已编辑并 `source ./env.env`，临时覆盖放在加载之后 |
+| 使用了错误模型、地址或 NPU 数 | 单测确认已编辑并 `source ./env.env`；双配置模式分别检查两份文件，参数直接写入对应文件 |
 | 只改 `PEAK_*`，摸高阈值没有变化 | 当前场景显式字段优先，直接修改所用配置文件中的场景 |
 | 自定义 env 的场景未生效 | 确认加载全局参数后，使用 `bash run_perf_scenarios.sh ./env.local.env` 指定同一个完整配置文件 |
 | 改固定倍率后，摸高请求数没变化 | `DATA_NUM_MULTIPLIER` 只控制固定测试；摸高使用独立的 `peak_data_multiplier` |
@@ -314,8 +346,9 @@ python3 validate_result_integrity.py \
 
 | 文件 | 作用 |
 |---|---|
-| [env.env](env.env) | 全局参数与场景配置；全局参数先加载，场景由脚本直接读取 |
-| [run_perf_scenarios.sh](run_perf_scenarios.sh) | 主入口，含全局参数回退值并读取 env 文件中的场景数组 |
+| [env.env](env.env) | 单测全局参数与场景配置；全局参数先加载，场景由脚本直接读取 |
+| [test_a.env](test_a.env) / [test_b.env](test_b.env) | 双配置并行的完整公开示例，由脚本分别自动加载 |
+| [run_perf_scenarios.sh](run_perf_scenarios.sh) | 主入口；零/一个配置参数运行单测，两个配置参数并行运行两组 |
 | [aisbench_perf_matrix.py](aisbench_perf_matrix.py) | 并发搜索、逐档执行及证据保存 |
 | [aisbench_perf_matrix_config.py](aisbench_perf_matrix_config.py) | 搜索引擎默认配置、指标列名和扩容限制 |
 | [aisbench_result_adapter.py](aisbench_result_adapter.py) | 按列名读取源 CSV、检查关键指标并投影汇总字段 |
