@@ -1,10 +1,15 @@
 """Real child-process checks for immutable-source scope collection."""
+import ast
+import contextlib
 import csv
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import sys
 import subprocess
+import shutil
 import tempfile
 import time
 import unittest
@@ -17,7 +22,8 @@ RELEASE_ROOT = AUTOMATION_ROOT.parent
 for folder in (CORE_ROOT, TOOLS_ROOT):
     sys.path.insert(0, str(folder))
 
-from aisbench_execution import execute_native, request_count, split_native_pipeline, stream_process
+from aisbench_execution import (execute_native, request_count, restore_generation_template,
+                               split_native_pipeline, stream_process)
 from aisbench_result_adapter import CANONICAL_COLUMNS
 
 
@@ -418,6 +424,116 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(scope["runner_errors"][0]["return_code"], 1)
         self.assertTrue(scope["exception_evidence"][0]["file"].endswith("gsm8k.out"))
         self.assertTrue(Path(scope["exception_evidence"][0]["file"]).is_file())
+
+    def generation_copy(self, content=None):
+        original = (RELEASE_ROOT / 'aisbench_auto_tools_prefix/default_api.py').read_bytes()
+        (self.native / 'default_api.py').write_bytes(original if content is None else content)
+        self.number += 1
+        evidence = self.root / ('template_' + str(self.number))
+        runtime = evidence / 'native_runtime'
+        runtime.mkdir(parents=True)
+        shutil.copyfile(self.native / 'default_api.py', runtime / 'default_api.py')
+        shutil.copyfile(RELEASE_ROOT / 'aisbench_auto_tools_prefix/aisbench_test.py', runtime / 'aisbench_test.py')
+        return evidence, runtime
+
+    def render_actual_native_generation(self, runtime, *, accuracy=False, thinking=False):
+        # Compile the actual pinned native function, with only its environment
+        # and final symlink stubbed. No copied generation-selection algorithm.
+        text = (RELEASE_ROOT / 'aisbench_auto_tools_prefix/aisbench_test.py').read_text(encoding='utf-8')
+        tree = ast.parse(text)
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == 'modify_aisbench_api')
+        module = ast.Module(body=[function])
+        module.type_ignores = []  # Accepted by 3.7; required by newer CPython.
+        import logging
+        import re
+        namespace = dict(re=re, logging=logging, os=os, MODEL_PATH='/model', MODEL_NAME='offline',
+                         API_KEY='', HOST_IP='192.168.1.1', HOST_PORT='8000', URL='', WORK_PATH=str(runtime),
+                         api_test_type='FakeStream', api_test_abbr='offline', request_rate='0',
+                         test_accuracy=accuracy, enable_think=thinking, symlink_force=lambda *args: None)
+        exec(compile(module, '<actual-native-modify_aisbench_api>', 'exec'), namespace)
+        previous = Path.cwd()
+        try:
+            os.chdir(runtime)
+            with contextlib.redirect_stdout(io.StringIO()):
+                namespace['modify_aisbench_api']('4', '512')
+        finally:
+            os.chdir(previous)
+        rendered = ast.parse((runtime / 'temp_api.py').read_text(encoding='utf-8'))
+        call = next(node.value for node in ast.walk(rendered)
+                    if isinstance(node, ast.keyword) and node.arg == 'generation_kwargs')
+        return {keyword.arg: ast.literal_eval(keyword.value) for keyword in call.keywords}
+
+    def test_exact_template_restores_native_normal_thinking_and_accuracy_parameters(self):
+        before = (RELEASE_ROOT / 'aisbench_auto_tools_prefix/default_api.py').read_bytes()
+        for accuracy, thinking in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(accuracy=accuracy, thinking=thinking):
+                evidence, runtime = self.generation_copy()
+                arguments = (['--test_accuracy'] if accuracy else []) + (['--enable_think'] if thinking else [])
+                metadata = restore_generation_template(runtime, evidence, self.native, arguments)
+                self.assertEqual(metadata['action'], 'restored_known_ac06_placeholder')
+                self.assertEqual(metadata['original_sha256'], hashlib.sha256(before).hexdigest())
+                self.assertNotEqual(metadata['patched_sha256'], metadata['original_sha256'])
+                self.assertEqual(metadata['patched_sha256'], hashlib.sha256((runtime / 'default_api.py').read_bytes()).hexdigest())
+                self.assertEqual((evidence / 'generation_template.original.py').read_bytes(), before)
+                self.assertEqual((evidence / 'generation_template.patched.py').read_bytes(), (runtime / 'default_api.py').read_bytes())
+                expected = dict(temperature=0.6, top_p=0.95) if accuracy else dict(temperature=0, ignore_eos=True)
+                if thinking:
+                    expected['chat_template_kwargs'] = {'enable_thinking': True}
+                self.assertEqual(self.render_actual_native_generation(runtime, accuracy=accuracy, thinking=thinking), expected)
+                self.assertEqual((self.native / 'default_api.py').read_bytes(), before)
+        self.assertEqual((RELEASE_ROOT / 'aisbench_auto_tools_prefix/default_api.py').read_bytes(), before)
+
+    def test_legacy_placeholder_is_preserved_and_native_thinking_still_renders(self):
+        original = (RELEASE_ROOT / 'aisbench_auto_tools_prefix/default_api.py').read_bytes()
+        legacy = original.replace(b'temperature=0,\n            ignore_eos=True,', b'generation_kwargs_for_replace')
+        evidence, runtime = self.generation_copy(legacy)
+        metadata = restore_generation_template(runtime, evidence, self.native, ['--enable_think'])
+        self.assertEqual(metadata['action'], 'legacy_placeholder_preserved')
+        self.assertEqual(metadata['original_sha256'], metadata['patched_sha256'])
+        self.assertEqual((runtime / 'default_api.py').read_bytes(), legacy)
+        self.assertEqual(self.render_actual_native_generation(runtime, thinking=True),
+                         dict(temperature=0, ignore_eos=True, chat_template_kwargs={'enable_thinking': True}))
+
+    def test_unknown_multiple_and_ambiguous_generation_templates_fail_before_native_starts(self):
+        original = (RELEASE_ROOT / 'aisbench_auto_tools_prefix/default_api.py').read_bytes()
+        legacy = original.replace(b'temperature=0,\n            ignore_eos=True,', b'generation_kwargs_for_replace')
+        samples = [original.replace(b'temperature=0', b'temperature=1'),
+                   original + b'\nextra=dict(generation_kwargs=dict(temperature=0,ignore_eos=True))\n',
+                   legacy + b'\n# generation_kwargs_for_replace\n',
+                   original.replace(b'generation_kwargs=dict(', b'generation_kwargs=unknown(')]
+        marker = self.root / 'native_started'
+        for sample in samples:
+            with self.subTest(template_sha256=hashlib.sha256(sample).hexdigest()):
+                (self.native / 'default_api.py').write_bytes(sample)
+                report = self.run_native('from pathlib import Path\nPath(' + repr(str(marker)) + ").write_text('started')\n")
+                self.assertEqual(report['state'], 'ERROR')
+                self.assertFalse(marker.exists())
+                self.assertEqual(report['generation_template']['state'], 'invalid')
+                self.assertFalse(report['generation_template']['requests_started'])
+                self.assertEqual((self.root / ('trial_' + str(self.number)) / 'native_runtime/default_api.py').read_bytes(), sample)
+
+    def test_generation_compatibility_rejects_canonical_source_as_patch_target(self):
+        original = (RELEASE_ROOT / 'aisbench_auto_tools_prefix/default_api.py').read_bytes()
+        (self.native / 'default_api.py').write_bytes(original)
+        with self.assertRaisesRegex(ValueError, 'isolated per-trial'):
+            restore_generation_template(self.native, self.root / 'bad_trial', self.native, [])
+        self.assertEqual((self.native / 'default_api.py').read_bytes(), original)
+
+    def test_generation_provenance_is_bound_to_real_child_report_and_scope(self):
+        self.instrument_fixture()
+        original = (RELEASE_ROOT / 'aisbench_auto_tools_prefix/default_api.py').read_bytes()
+        (self.native / 'default_api.py').write_bytes(original)
+        code = ("import subprocess,sys\n"
+                "subprocess.run('\\\"'+sys.executable+'\\\" emit.py ais_bench ok',shell=True,check=True)\n")
+        report = self.run_native(code, ['--enable_think'])
+        self.assertEqual(report['state'], 'PASS', report['reason'])
+        metadata = report['generation_template']
+        self.assertEqual(metadata['action'], 'restored_known_ac06_placeholder')
+        self.assertTrue(metadata['requested']['enable_think'])
+        scope = report['main_scopes'][0]
+        for field in ('state', 'action', 'original_sha256', 'patched_sha256', 'evidence_file'):
+            self.assertEqual(scope['generation_template'][field], metadata[field])
 
 
 if __name__ == "__main__":

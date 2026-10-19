@@ -1,12 +1,13 @@
-"""Run an untouched native copy, recording each benchmark invocation separately.
+"""Run a private native copy, recording each benchmark invocation separately.
 
-The private child instruments subprocess.run in memory.  Native source files are
-never patched.  Each original repeat and prefix preparation remains an explicit
-scope with byte-preserving output and its own result and artifact evidence.
+The private child instruments subprocess.run and applies narrowly recorded
+compatibility changes only to its per-trial runtime copy. Original native source
+files remain untouched. Each repeat and prefix preparation has explicit evidence.
 """
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import hashlib
 import importlib
@@ -121,6 +122,83 @@ def file_digest(path):
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def restore_generation_template(native_root, evidence_dir, source_root, arguments):
+    """Restore only the pinned template's lost native substitution marker."""
+    native_root, evidence_dir, source_root = map(lambda p: Path(p).resolve(),
+                                               (native_root, evidence_dir, source_root))
+    metadata_file = evidence_dir / "generation_template.json"
+    target, source = native_root / "default_api.py", source_root / "default_api.py"
+    metadata = dict(schema_version=1, compatibility="ac06-generation-placeholder-v1",
+                    runtime_file=str(target), source_file=str(source),
+                    evidence_file=str(metadata_file), state="checking", action="none",
+                    original_sha256=None, patched_sha256=None, requests_started=False,
+                    stage="before_native_execution",
+                    requested=dict(enable_think="--enable_think" in arguments,
+                                   test_accuracy="--test_accuracy" in arguments))
+    try:
+        if (native_root != evidence_dir / "native_runtime" or native_root == source_root
+                or source_root in native_root.parents or source_root == evidence_dir
+                or source_root in evidence_dir.parents):
+            raise ValueError("generation compatibility requires an isolated per-trial native_runtime copy")
+        if target.is_symlink() or source.is_symlink():
+            raise ValueError("generation template must not be a symlink")
+        if not target.exists():
+            if source.exists():
+                raise ValueError("canonical generation template was not copied into the private runtime")
+            metadata.update(state="not_applicable", action="template_not_present")
+            atomic_json(metadata_file, metadata)
+            return metadata
+        if not source.is_file():
+            raise ValueError("generation template must be copied from a regular canonical source file")
+        original = target.read_bytes()
+        metadata.update(original_sha256=hashlib.sha256(original).hexdigest(),
+                        source_sha256=file_digest(source))
+        if metadata["original_sha256"] != metadata["source_sha256"]:
+            raise ValueError("private generation template differs from its canonical source before adaptation")
+        tree = ast.parse(original.decode("utf-8"), filename=str(target))
+        keywords = [node for node in ast.walk(tree) if isinstance(node, ast.keyword)
+                    and node.arg == "generation_kwargs"]
+        if len(keywords) != 1:
+            raise ValueError("generation template has missing or ambiguous generation_kwargs")
+        value = keywords[0].value
+        if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Name) or value.func.id != "dict":
+            raise ValueError("unsupported generation_kwargs template structure")
+        marker = b"generation_kwargs_for_replace"
+        if marker in original:
+            if (original.count(marker) != 1 or value.keywords or len(value.args) != 1
+                    or not isinstance(value.args[0], ast.Name) or value.args[0].id != marker.decode()):
+                raise ValueError("legacy generation marker is ambiguous or outside its dict argument")
+            patched, action = original, "legacy_placeholder_preserved"
+        else:
+            expected = "10bf4220fa786299c3b0f6296fce1e9ad830dc2c8f4aabe1865ef9812774c778"
+            block = (b"generation_kwargs=dict(\n            temperature=0,\n"
+                     b"            ignore_eos=True,\n        )")
+            replacement = (b"generation_kwargs=dict(\n            generation_kwargs_for_replace\n        )")
+            if metadata["original_sha256"] != expected or original.count(block) != 1:
+                raise ValueError("unknown generation template; only exact pinned ac06 bytes may be restored")
+            patched, action = original.replace(block, replacement, 1), "restored_known_ac06_placeholder"
+        original_file, patched_file = (evidence_dir / "generation_template.original.py",
+                                       evidence_dir / "generation_template.patched.py")
+        original_file.write_bytes(original)
+        patched_file.write_bytes(patched)
+        if patched != original:
+            target.write_bytes(patched)
+        # The canonical source remains byte-identical even if a future caller
+        # changes the runtime layout; never silently broaden the patch target.
+        if file_digest(source) != metadata["source_sha256"]:
+            raise ValueError("canonical generation template changed during private adaptation")
+        metadata.update(state="ready", action=action, patched_sha256=file_digest(target),
+                        original_snapshot=str(original_file), patched_snapshot=str(patched_file),
+                        native_modifier_sha256=file_digest(native_root / "aisbench_test.py")
+                        if (native_root / "aisbench_test.py").is_file() else None)
+        atomic_json(metadata_file, metadata)
+        return metadata
+    except (OSError, ValueError, SyntaxError, UnicodeError) as error:
+        metadata.update(state="invalid", reason=str(error))
+        atomic_json(metadata_file, metadata)
+        raise
 
 
 def prepare_accuracy_dataset(native_root, evidence_dir, arguments, source_root):
@@ -470,6 +548,7 @@ def _child(native_root, evidence_dir, arguments, native_script, source_root=None
         signal.signal(signal.SIGTERM, terminate_child)
     scopes = []
     source_root = Path(source_root or native_root).resolve()
+    generation_template = restore_generation_template(native_root, evidence_dir, source_root, arguments)
     arguments, accuracy_dataset = prepare_accuracy_dataset(native_root, evidence_dir, arguments, source_root)
     dataset_profile = configure_dataset_profile(native_root, evidence_dir, arguments,
                                                source_root)
@@ -494,6 +573,8 @@ def _child(native_root, evidence_dir, arguments, native_script, source_root=None
                      artifact_dir=str(root / "artifacts"), accuracy=accuracy,
                      started_at=time.time())
         scope["dataset_profile"] = {key: dataset_profile.get(key) for key in ("mode", "fingerprint", "directory")}
+        scope["generation_template"] = {key: generation_template.get(key) for key in
+                                        ("state", "action", "original_sha256", "patched_sha256", "evidence_file")}
         if accuracy_dataset:
             scope["accuracy_dataset"] = accuracy_dataset
         scope["planned_requests"] = (
@@ -645,6 +726,9 @@ def execute_native(native_root, evidence_dir, arguments, *, timeout=1800, failed
         rc, timed_out = stream_process(command, working_root, report["stdout_log"], report["stderr_log"],
                                        timeout=remaining, echo=echo, env=environment)
         report.update(return_code=rc, timed_out=timed_out)
+        generation_file = evidence_dir / "generation_template.json"
+        if generation_file.is_file():
+            report["generation_template"] = json.loads(generation_file.read_text(encoding="utf-8"))
         profile_file = evidence_dir / "dataset_profile.json"
         if profile_file.is_file():
             report["dataset_profile"] = json.loads(profile_file.read_text(encoding="utf-8"))
@@ -677,6 +761,8 @@ def execute_native(native_root, evidence_dir, arguments, *, timeout=1800, failed
         report.update(scopes=scopes, main_scopes=main)
         if rc or timed_out:
             report.update(state="ERROR", reason="trial timed out" if timed_out else "native process exited " + str(rc))
+            if not timed_out and report.get("generation_template", {}).get("state") == "invalid":
+                report["reason"] = "generation template compatibility rejected: " + report["generation_template"]["reason"]
             if report.get("accuracy_dataset", {}).get("state") == "invalid":
                 report["reason"] = report["accuracy_dataset"]["reason"]
         elif not main:
