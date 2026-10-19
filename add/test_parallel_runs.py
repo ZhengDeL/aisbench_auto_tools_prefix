@@ -29,7 +29,7 @@ SHELL = ADD_DIR / "run_perf_scenarios.sh"
 # remains the production implementation: its file loading, environment handling,
 # resource locks, process supervision and result serialization all run normally.
 FIXTURE = r'''
-import hashlib, json, os, pathlib, re, signal, sys, time
+import csv, hashlib, json, os, pathlib, re, signal, sys, time
 root = pathlib.Path(os.environ['AISBENCH_TEST_ROOT'])
 events = root / 'events'
 states = root / 'containers'
@@ -70,6 +70,10 @@ if sys.argv[1] == 'docker':
         if not path.exists():
             print('Error: No such container: ' + args[-1], file=sys.stderr)
             sys.exit(1)
+        if os.environ.get('AISBENCH_TEST_STOP_FAIL') == '1':
+            event('stop-refused', identity=args[-1])
+            print('Synthetic Docker stop failed', file=sys.stderr)
+            sys.exit(71)
         payload = json.loads(path.read_text())
         payload['State']['Running'] = False
         path.write_text(json.dumps(payload))
@@ -93,6 +97,9 @@ report = {
     'host_output_dir': str(output), 'model_host_path': str(root / 'model'),
     'tools_host_dir': str(root / 'tools'), 'host_ip': env.get('HOST_IP', 'default-host'),
     'host_port': env.get('HOST_PORT', '8000'), 'model_name': model,
+    'api_url': env.get('API_URL', ''), 'service_id': env.get('SERVICE_ID', ''),
+    'planned_tests': len(scenario_names), 'fixed_count': len(scenario_names), 'peak_count': 0,
+    'effective_config': {'scenarios': json.loads(scenario_block.group(1))},
 }
 if env.get('AISBENCH_PREFLIGHT_REPORT'):
     if model == 'invalid-config':
@@ -115,7 +122,8 @@ container = {'Id': identity, 'Name': '/' + name,
              'State': {'Running': True}}
 (states / (identity + '.json')).write_text(json.dumps(container))
 runtime = {'container_id': identity, 'container_name': name, 'image': image,
-           'run_id': tag, 'result_dir': str(result), 'complete': False}
+           'run_id': tag, 'result_dir': str(result), 'complete': False,
+           'phase': 'benchmark', 'current_scenario': 'small_c1', 'test_index': 1}
 runtime_path = pathlib.Path(env['AISBENCH_RUNTIME_REPORT'])
 runtime_path.write_text(json.dumps(runtime))
 event('start', model=model, name=name, output=str(output), tag=tag, identity=identity,
@@ -130,10 +138,24 @@ while time.monotonic() < end:
         event('stopped', model=model, identity=identity)
         sys.exit(143)
     time.sleep(0.025)
+if env.get('AISBENCH_TEST_ABNORMAL') == '1':
+    event('abnormal-exit', model=model, identity=identity)
+    sys.exit(9)  # No completion report or CSV: container cleanup is required.
 code = 7 if model == 'fail-after-start' else 0
+header = 'scenario,current_time,input_len,output_len,total_req,max_cc,cc,rr,TTFT avg,TTFT P90,TPOT avg,TPOT SLO_P90,E2E_time,output_throughput,single_output_throughput,E2E_throughput,single_E2E_throughput,qps,qpm,input_token_throughput,prefill_token_throughput,repeat_rate,status'.split(',')
+row = ['small_c1', '2026-10-19 12:34:56', '16.0000', '4.0', '4', '1', '0.9990', '0',
+       '123.' + hashlib.sha256(model.encode()).hexdigest()[:6].translate(str.maketrans('abcdef', '123456')),
+       '123.9000', '8.000', '8.1250', '0.2000', '80.0000', '40.0000', '400.0000', '200.0000',
+       '20.0000', '1200.0000', '320.0000', '', '0.90', 'passed' if code == 0 else 'failed']
+with (result / 'all_results.csv').open('w', encoding='utf-8', newline='') as handle:
+    writer = csv.writer(handle)
+    writer.writerow(header)
+    writer.writerow(row)
+(result / 'execution.log').write_text('fixture benchmark log\n')
 runtime['complete'] = True
+runtime['phase'] = 'completed'
+runtime['worker_exit'] = code
 runtime_path.write_text(json.dumps(runtime))
-(result / 'all_results.csv').write_text('scenario,status\nfixture,' + ('passed' if code == 0 else 'failed') + '\n')
 event('finish', model=model, tag=tag, code=code)
 sys.exit(code)
 '''
@@ -165,6 +187,7 @@ class ParallelProcessContracts(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         self.addCleanup(temporary.cleanup)
         self.processes: list[subprocess.Popen] = []
+        self.config_hosts: dict[str, str] = {}
         self.addCleanup(self.stop_children)
         self.binary = self.root / 'bin'
         self.binary.mkdir()
@@ -184,7 +207,9 @@ class ParallelProcessContracts(unittest.TestCase):
                         AISBENCH_TEST_DURATION='0.45')
         # Preserve no real user runtime paths in the synthetic workers.
         for key in ('CONTAINER_NAME', 'HOST_OUTPUT_DIR', 'MODEL_HOST_PATH', 'TOOLS_HOST_DIR',
-                    'SCENARIOS_JSON_OVERRIDE', 'SCENARIOS_JSON'):
+                    'SCENARIOS_JSON_OVERRIDE', 'SCENARIOS_JSON', 'MODEL_NAME', 'HOST_IP',
+                    'HOST_PORT', 'API_URL', 'API_KEY', 'SERVICE_ID', 'DATA_NUM_MULTIPLIER',
+                    'POD_INFO', 'EXPECTED_IMAGE', 'PEAK_HARD_CAP'):
             self.env.pop(key, None)
         (self.root / 'model').mkdir()
         (self.root / 'tools').mkdir()
@@ -211,10 +236,12 @@ class ParallelProcessContracts(unittest.TestCase):
                  + '[{"name":"small","input_len":16,"output_len":4,"concurrency":[1]}]\nJSON\n)\n')
         return checkout
 
-    def config(self, filename, *, model='model-a', output=None, container=None, extra='', checkout=None):
+    def config(self, filename, *, model='model-a', output=None, container=None, host=None, extra='', checkout=None):
         target = (checkout or self.checkout) / 'add' / filename
+        address = self.config_hosts.setdefault(str(target), '192.168.1.' + str(len(self.config_hosts) + 1))
         values = {'MODEL_NAME': model, 'MODEL_HOST_PATH': (self.root / 'model').as_posix(),
-                  'TOOLS_HOST_DIR': (self.root / 'tools').as_posix()}
+                  'TOOLS_HOST_DIR': (self.root / 'tools').as_posix(),
+                  'HOST_IP': host or address, 'HOST_PORT': '8000'}
         if output is not None:
             values['HOST_OUTPUT_DIR'] = Path(output).as_posix()
         if container is not None:
@@ -262,6 +289,100 @@ class ParallelProcessContracts(unittest.TestCase):
             time.sleep(0.025)
         self.fail('workers did not start: ' + repr([(p.poll(), p.communicate(timeout=1) if p.poll() is not None else '') for p in self.processes]))
 
+    def assert_not_started(self, output):
+        self.assertFalse(self.events('start'), output)
+        self.assertFalse([row for row in self.events('docker')
+                          if row['args'][0] in ('run', 'rm', 'start', 'stop', 'exec')], output)
+
+    def latest_batch(self):
+        paths = list(self.checkout.glob('outputs/parallel/*/batch_results.json'))
+        self.assertTrue(paths, 'no persisted batch result')
+        path = max(paths, key=lambda item: item.stat().st_mtime_ns)
+        return path, json.loads(path.read_text(encoding='utf-8'))
+
+    def test_one_two_three_and_four_explicit_configs_source_and_overlap(self):
+        for count in (1, 2, 3, 4):
+            with self.subTest(task_count=count):
+                before = len(self.events('start'))
+                configs = [self.config(f'batch{count}_task{index}.env', model=f'model-{index}')
+                           for index in range(count)]
+                code, output = self.run_pair(*configs, env={'AISBENCH_TEST_DURATION': '1.5',
+                                                           'MODEL_NAME': 'stale-parent-must-not-win'})
+                self.assertEqual(code, 0, output)
+                starts = self.events('start')[before:]
+                finishes = self.events('finish')[before:]
+                self.assertEqual(len(starts), count, output)
+                self.assertEqual(len(finishes), count, output)
+                self.assertEqual({row['model'] for row in starts}, {f'model-{index}' for index in range(count)})
+                self.assertLess(max(row['time'] for row in starts), min(row['time'] for row in finishes),
+                                'one invocation did not overlap all workers')
+                _, batch = self.latest_batch()
+                self.assertEqual(len(batch['tasks']), count)
+                expected_names = {'aisbench-' + task['task'] + '-' + batch['batch_id']
+                                  for task in batch['tasks']}
+                self.assertEqual({task['container_name'] for task in batch['tasks']}, expected_names)
+                self.assertEqual({row['name'] for row in starts}, expected_names)
+
+    def test_invalid_third_or_fourth_config_starts_no_worker(self):
+        for count in (3, 4):
+            with self.subTest(task_count=count):
+                configs = [self.config(f'candidate{index}.env', model=f'model-{index}')
+                           for index in range(count)]
+                configs[-1] = self.config(f'candidate{count - 1}.env', model='invalid-config')
+                code, output = self.run_pair(*configs)
+                self.assertNotEqual(code, 0, output)
+                self.assert_not_started(output)
+
+    def test_nonadjacent_config_alias_container_output_and_service_conflicts(self):
+        for conflict in ('same-file', 'hardlink-file', 'alias', 'container', 'same-output',
+                         'nested-output', 'service', 'service-id'):
+            with self.subTest(conflict=conflict):
+                shared = self.root / 'overlapping-root'
+                first_extra = 'SERVICE_ID=shared-service' if conflict == 'service-id' else ''
+                a = self.config('a.env', model='first-model', container='fixed-a',
+                                output=shared if conflict in ('same-output', 'nested-output') else None,
+                                host='192.168.1.100', extra=first_extra)
+                b = self.config('b.env', model='second-model')
+                c = self.config('c.env', model='third-model')
+                final_name = 'a.local.env' if conflict == 'alias' else 'd.env'
+                d = self.config(final_name, model='different-model',
+                                container='fixed-a' if conflict == 'container' else 'fixed-d',
+                                output=(shared if conflict == 'same-output' else shared / 'nested')
+                                if conflict in ('same-output', 'nested-output') else None,
+                                host='192.168.1.100' if conflict == 'service' else None,
+                                extra='SERVICE_ID=shared-service' if conflict == 'service-id' else '')
+                if conflict == 'same-file':
+                    d = a
+                elif conflict == 'hardlink-file':
+                    d.unlink()
+                    os.link(a, d)
+                code, output = self.run_pair(a, b, c, d)
+                self.assertNotEqual(code, 0, output)
+                self.assert_not_started(output)
+
+    def test_service_identity_normalizes_effective_api_endpoint(self):
+        cases = [
+            ('api-path', 'HOST_IP=192.168.1.11\nAPI_URL=http://api.invalid:8000/v1/chat/completions',
+             'HOST_IP=192.168.1.12\nAPI_URL=http://api.invalid:8000/alternate-path'),
+            ('host-case', 'API_URL=http://API.INVALID:8000/v1/chat/completions',
+             'API_URL=http://api.invalid:8000/other'),
+            ('http-default-port', 'API_URL=http://api.invalid/v1/chat/completions',
+             'API_URL=http://api.invalid:80/other'),
+            ('https-default-port', 'API_URL=https://api.invalid/v1/chat/completions',
+             'API_URL=https://api.invalid:443/other'),
+            ('ipv6-compression', 'API_URL=http://[2001:db8::1]:8000/v1/chat/completions',
+             'API_URL=http://[2001:0db8:0:0:0:0:0:1]:8000/other'),
+            ('api-vs-host-port', 'HOST_IP=192.168.1.11\nAPI_URL=http://192.168.1.90:8000/v1/chat/completions',
+             'HOST_IP=192.168.1.90\nHOST_PORT=8000'),
+        ]
+        for label, first_extra, second_extra in cases:
+            with self.subTest(identity=label):
+                a = self.config('endpoint_a.env', model='different-model-a', extra=first_extra)
+                b = self.config('endpoint_b.env', model='different-model-b', extra=second_extra)
+                code, output = self.run_pair(a, b)
+                self.assertNotEqual(code, 0, output)
+                self.assert_not_started(output)
+
     def test_two_workers_overlap_and_configuration_isolated_from_parent(self):
         a = self.config('test_a.local.env', extra='HOST_IP=host-a.invalid\nAPI_KEY=secret-a\nDATA_NUM_MULTIPLIER=3\nPEAK_HARD_CAP=1')
         b = self.config('test_b.local.env', model='model-b', extra='HOST_IP=host-b.invalid\nDATA_NUM_MULTIPLIER=5\nPEAK_HARD_CAP=0')
@@ -278,8 +399,9 @@ class ParallelProcessContracts(unittest.TestCase):
         self.assertEqual(set(by_model), {'model-a', 'model-b'})
         for model, alias, host, multiplier, cap in [('model-a', 'test_a', 'host-a.invalid', '3', '1'), ('model-b', 'test_b', 'host-b.invalid', '5', '0')]:
             row = by_model[model]
-            self.assertEqual(row['name'], 'ais_bench-' + alias)
-            self.assertEqual(Path(row['output']), self.checkout / 'outputs' / alias)
+            self.assertIn(alias, row['name'])
+            self.assertIn(alias + '__' + model, Path(row['output']).name)
+            self.assertEqual(Path(row['output']).parent.name, 'tasks')
             self.assertEqual((row['host'], row['multiplier'], row['cap']), (host, multiplier, cap))
             self.assertIsNone(row['exported_json'])
             self.assertNotEqual(row['pod_info'], 'stale-metrics')
@@ -396,24 +518,24 @@ class ParallelProcessContracts(unittest.TestCase):
                 self.assertFalse(self.events('start'), output)
 
     def test_failure_of_one_worker_does_not_stop_the_other(self):
-        a = self.config('fail.env', model='fail-after-start')
-        b = self.config('success.env', model='successful-peer')
-        code, output = self.run_pair(a, b)
+        configs = [self.config(f'failure_peer_{index}.env', model=model)
+                   for index, model in enumerate(('peer-a', 'fail-after-start', 'peer-c', 'peer-d'))]
+        code, output = self.run_pair(*configs, env={'AISBENCH_TEST_DURATION': '1.5'})
         self.assertNotEqual(code, 0, output)
         finishes = {row['model']: row['code'] for row in self.events('finish')}
-        self.assertEqual(finishes, {'fail-after-start': 7, 'successful-peer': 0})
+        self.assertEqual(finishes, {'peer-a': 0, 'fail-after-start': 7, 'peer-c': 0, 'peer-d': 0})
         path = next(self.checkout.glob('outputs/parallel/*/batch_results.csv'))
         with path.open(encoding='utf-8-sig', newline='') as handle:
             rows = list(csv.DictReader(handle))
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 4)
         self.assertEqual({int(row['exit_code']) for row in rows}, {0, 7})
 
     def test_container_lock_conflicts_across_checkouts_then_releases(self):
-        a, b = self.config('a.env'), self.config('b.env')
+        a, b = self.config('a.env', container='locked-container'), self.config('b.env')
         first = self.start(a, b, env={'AISBENCH_TEST_DURATION': '6'})
         self.wait_starts(2)
         second_checkout = self.create_checkout('another-checkout')
-        c = self.config('c.env', output=self.root / 'c-out', container='ais_bench-a', checkout=second_checkout)
+        c = self.config('c.env', output=self.root / 'c-out', container='locked-container', checkout=second_checkout)
         d = self.config('d.env', output=self.root / 'd-out', checkout=second_checkout)
         code, output = self.run_pair(c, d, checkout=second_checkout)
         self.assertNotEqual(code, 0, output)
@@ -449,15 +571,207 @@ class ParallelProcessContracts(unittest.TestCase):
         self.assertEqual(len({row['identity'] for row in starts}), 4)
         self.assertLess(max(row['time'] for row in starts), min(row['time'] for row in self.events('finish')))
 
-    def test_single_config_retains_legacy_parent_environment(self):
-        config = self.config('single.env', model='file-must-not-be-sourced')
-        for configs in ((), (config,)):
-            with self.subTest(config_arguments=len(configs)):
-                code, output = self.finish(self.start(*configs, env={'MODEL_NAME': 'legacy-parent-model',
-                                                                   'HOST_IP': 'legacy-parent-host', 'DATA_NUM_MULTIPLIER': '9'}))
+    def test_zero_config_retains_legacy_parent_environment(self):
+        code, output = self.finish(self.start(env={'MODEL_NAME': 'legacy-parent-model',
+                                                   'HOST_IP': 'legacy-parent.invalid', 'DATA_NUM_MULTIPLIER': '9'}))
+        self.assertEqual(code, 0, output)
+        start, = self.events('start')
+        self.assertEqual((start['model'], start['host'], start['multiplier']),
+                         ('legacy-parent-model', 'legacy-parent.invalid', '9'))
+
+    def test_explicit_single_config_loads_file_automatically_once(self):
+        marker = self.root / 'single-source-count'
+        config = self.config('single.env', model='explicit-file-model', host='192.168.1.42',
+                             extra='DATA_NUM_MULTIPLIER=3\nprintf x >> ' + shlex.quote(marker.as_posix()))
+        code, output = self.run_pair(config, env={'MODEL_NAME': 'stale-parent-model',
+                                                  'HOST_IP': 'stale.invalid', 'DATA_NUM_MULTIPLIER': '99'})
+        self.assertEqual(code, 0, output)
+        start, = self.events('start')
+        self.assertEqual((start['model'], start['host'], start['multiplier']),
+                         ('explicit-file-model', '192.168.1.42', '3'))
+        self.assertEqual(marker.read_text(), 'x')
+
+    def test_service_lock_conflicts_across_checkouts_then_releases(self):
+        a = self.config('a.env', host='192.168.1.90')
+        b = self.config('b.env')
+        first = self.start(a, b, env={'AISBENCH_TEST_DURATION': '7'})
+        self.wait_starts(2)
+        second_checkout = self.create_checkout('service-second-checkout')
+        c = self.config('c.env', model='different-model', output=self.root / 'c-output',
+                        container='different-container-c', host='192.168.1.90', checkout=second_checkout)
+        d = self.config('d.env', output=self.root / 'd-output', container='different-container-d',
+                        checkout=second_checkout)
+        code, output = self.run_pair(c, d, checkout=second_checkout)
+        self.assertNotEqual(code, 0, output)
+        self.assertEqual(len(self.events('start')), 2, output)
+        self.assertEqual(self.finish(first)[0], 0)
+        code, output = self.run_pair(c, d, checkout=second_checkout)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(self.events('start')), 4)
+
+    def test_service_id_lock_conflicts_across_distinct_endpoints(self):
+        a = self.config('a.env', extra='SERVICE_ID=shared-backend')
+        b = self.config('b.env')
+        first = self.start(a, b, env={'AISBENCH_TEST_DURATION': '7'})
+        self.wait_starts(2)
+        c = self.config('c.env', extra='SERVICE_ID=shared-backend')
+        d = self.config('d.env')
+        code, output = self.run_pair(c, d)
+        self.assertNotEqual(code, 0, output)
+        self.assertEqual(len(self.events('start')), 2, output)
+        self.assertEqual(self.finish(first)[0], 0)
+
+    def test_cleanup_failure_quarantines_service_until_old_fixed_id_is_proven_stopped_or_absent(self):
+        for proof in ('stopped', 'absent'):
+            with self.subTest(recovery_proof=proof):
+                before = len(self.events('start'))
+                # Unique synthetic service avoids sharing a failed cleanup marker
+                # with unrelated tests that use the public example IP range.
+                host = proof + '.' + self.root.name.replace('_', '-') + '.invalid'
+                first = self.config('unclean_' + proof + '.env', host=host)
+                code, output = self.run_pair(first, env={'AISBENCH_TEST_DURATION': '0.05',
+                                                         'AISBENCH_TEST_ABNORMAL': '1',
+                                                         'AISBENCH_TEST_STOP_FAIL': '1'})
+                self.assertNotEqual(code, 0, output)
+                _, failed_batch = self.latest_batch()
+                failed, = failed_batch['tasks']
+                self.assertEqual(failed['state'], 'cleanup_failed', output)
+                old, = self.events('start')[before:]
+                old_path = self.root / 'containers' / (old['identity'] + '.json')
+                old_state = json.loads(old_path.read_text())
+                self.assertTrue(old_state['State']['Running'])
+                self.assertTrue(self.events('stop-refused'), output)
+
+                # A new default container and new output path must not bypass
+                # the persistent service block after the process lock releases.
+                later = self.config('later_' + proof + '.env', model='new-worker', host=host)
+                docker_before = len(self.events('docker'))
+                code, output = self.run_pair(later)
+                self.assertNotEqual(code, 0, output)
+                self.assertEqual(len(self.events('start')), before + 1, output)
+                inspections = [row['args'] for row in self.events('docker')[docker_before:]
+                               if row['args'][0] == 'inspect']
+                self.assertTrue(inspections, output)
+                self.assertTrue(all(args[-1] == old['identity'] for args in inspections), output)
+                self.assertFalse([row for row in self.events('docker')[docker_before:]
+                                  if row['args'][0] in ('run', 'rm', 'start', 'stop', 'exec')], output)
+
+                if proof == 'stopped':
+                    old_state['State']['Running'] = False
+                    old_path.write_text(json.dumps(old_state))
+                else:
+                    old_path.unlink()
+                code, output = self.run_pair(later)
                 self.assertEqual(code, 0, output)
-                start = self.events('start')[-1]
-                self.assertEqual((start['model'], start['host'], start['multiplier']), ('legacy-parent-model', 'legacy-parent-host', '9'))
+                self.assertEqual(len(self.events('start')), before + 2, output)
+                _, recovered = self.latest_batch()
+                self.assertEqual(recovered['tasks'][0]['state'], 'success', output)
+
+    def test_reused_custom_output_with_new_failure_does_not_publish_old_named_metrics(self):
+        output_dir = self.root / 'fixed-output'
+        config = self.config('same_output.env', model='same-model', output=output_dir)
+        code, output = self.run_pair(config)
+        self.assertEqual(code, 0, output)
+        _, first = self.latest_batch()
+        initial, = first['tasks']
+        old_csv = Path(initial['source_csv'])
+        old_bytes = old_csv.read_bytes()
+        named_csv = Path(initial['result_csv'])
+        self.assertTrue(named_csv.is_file())
+        code, output = self.run_pair(config, env={'AISBENCH_TEST_DURATION': '0.05',
+                                                 'AISBENCH_TEST_ABNORMAL': '1'})
+        self.assertNotEqual(code, 0, output)
+        _, second = self.latest_batch()
+        failed, = second['tasks']
+        self.assertEqual(failed['state'], 'failed', output)
+        self.assertEqual(failed['result_csv'], '')
+        self.assertEqual(failed['results_state'], 'missing')
+        self.assertFalse(named_csv.exists(), 'previous run metrics were presented beside the new failure log')
+        self.assertFalse((output_dir / (failed['output_label'] + '__execution.log')).exists())
+        self.assertTrue((output_dir / (failed['output_label'] + '__launcher.log')).is_file())
+        self.assertEqual(old_csv.read_bytes(), old_bytes, 'historical source metrics were removed or rewritten')
+        with (self.latest_batch()[0].parent / 'merged_metrics.csv').open(encoding='utf-8-sig', newline='') as handle:
+            self.assertEqual(list(csv.DictReader(handle)), [])
+
+    def test_running_batch_refreshes_identity_and_result_paths_for_four_tasks(self):
+        configs = [self.config(f'live{index}.env', model=f'model-{index}') for index in range(4)]
+        process = self.start(*configs, env={'AISBENCH_TEST_DURATION': '5'})
+        self.wait_starts(4)
+        deadline = time.monotonic() + 4
+        payload = {}
+        while time.monotonic() < deadline:
+            _, payload = self.latest_batch()
+            tasks = payload.get('tasks', [])
+            if len(tasks) == 4 and all(task.get('container_id') and task.get('result_dir') for task in tasks):
+                break
+            time.sleep(0.05)
+        self.assertIsNone(process.poll(), 'status was populated only after all workers exited')
+        self.assertEqual(len(payload.get('tasks', [])), 4)
+        for task in payload['tasks']:
+            self.assertEqual(task['state'], 'running')
+            self.assertRegex(task['container_id'], r'^[a-f0-9]{64}$')
+            self.assertTrue(Path(task['result_dir']).is_dir())
+            self.assertTrue(task['started_at'])
+            self.assertEqual(task['planned_tests'], 1)
+            self.assertEqual(task['test_index'], 1)
+            self.assertEqual(task['current_scenario'], 'small_c1')
+        code, output = self.finish(process)
+        self.assertEqual(code, 0, output)
+
+    def test_four_task_batch_names_and_merged_metrics_preserve_original_strings(self):
+        models = ['DeepSeek-V4-Flash', 'Qwen3-32B', 'model-c', 'model-d']
+        configs = [self.config(f'task{index}.env', model=model) for index, model in enumerate(models)]
+        code, output = self.run_pair(*configs, env={'AISBENCH_TEST_DURATION': '1.5'})
+        self.assertEqual(code, 0, output)
+        path, payload = self.latest_batch()
+        with (path.parent / 'merged_metrics.csv').open(encoding='utf-8-sig', newline='') as handle:
+            reader = csv.DictReader(handle)
+            merged_header = reader.fieldnames
+            merged = list(reader)
+        self.assertEqual(len(merged), 4)
+        self.assertEqual(merged_header[:6], ['task', 'model', 'endpoint', 'service_id', 'run_id', 'source_csv'])
+        self.assertEqual(len(merged_header), 29)
+        self.assertEqual({row['model'] for row in merged}, set(models))
+        for task in payload['tasks']:
+            label = task['task'] + '__' + task['model']
+            self.assertEqual(task['output_label'], label)
+            self.assertEqual(Path(task['host_output_dir']), path.parent / 'tasks' / label)
+            self.assertEqual(Path(task['result_csv']).name, label + '__all_results.csv')
+            self.assertEqual(Path(task['source_csv']), Path(task['result_dir']) / 'all_results.csv')
+            self.assertTrue((path.parent / 'tasks' / label / 'result_index.json').is_file())
+            self.assertEqual(Path(task['source_csv']).read_bytes(), Path(task['result_csv']).read_bytes())
+            self.assertEqual(task['results_state'], 'ready')
+            self.assertEqual(task['planned_tests'], 1)
+            self.assertEqual((task['completed_tests'], task['passed_tests'], task['failed_tests']), (1, 1, 0))
+            self.assertRegex(task['started_at'], r'[+-]\d{2}:\d{2}$')
+            self.assertRegex(task['finished_at'], r'[+-]\d{2}:\d{2}$')
+            with Path(task['source_csv']).open(encoding='utf-8-sig', newline='') as handle:
+                source_reader = csv.DictReader(handle)
+                source_rows = list(source_reader)
+                source_header = source_reader.fieldnames
+            rows = [row for row in merged if row['task'] == task['task']]
+            self.assertEqual(len(rows), len(source_rows))
+            self.assertEqual([{key: row[key] for key in source_header} for row in rows], source_rows)
+            self.assertEqual(rows[0]['input_len'], '16.0000')
+            self.assertEqual(rows[0]['prefill_token_throughput'], '')
+            self.assertEqual(rows[0]['repeat_rate'], '0.90')
+
+    def test_special_model_names_have_safe_distinct_bounded_output_labels(self):
+        models = ['Org/DeepSeek V4', 'Org DeepSeek/V4', '模型/测试:001', 'very-long-model-' * 16]
+        configs = [self.config(f'encoded{index}.env', model=model) for index, model in enumerate(models)]
+        code, output = self.run_pair(*configs, env={'AISBENCH_TEST_DURATION': '1.5'})
+        self.assertEqual(code, 0, output)
+        _, payload = self.latest_batch()
+        tasks = payload['tasks']
+        self.assertEqual({task['model'] for task in tasks}, set(models))
+        self.assertEqual(len({task['output_label'] for task in tasks}), 4)
+        for task in tasks:
+            self.assertRegex(task['output_label'], r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+            self.assertLessEqual(len(task['output_label']), 114)
+            self.assertEqual(os.path.normcase(Path(task['host_output_dir']).name),
+                             os.path.normcase(task['output_label']))
+            self.assertEqual(Path(task['result_csv']).name, task['output_label'] + '__all_results.csv')
+            self.assertTrue(Path(task['result_csv']).is_file())
 
     def test_same_second_repeated_launches_have_distinct_ids_and_directories(self):
         launcher = self.root / 'frozen_clock_launcher.py'
@@ -477,6 +791,8 @@ class ParallelProcessContracts(unittest.TestCase):
         starts = self.events('start')
         self.assertEqual(len(starts), 4)
         self.assertEqual(len({row['tag'] for row in starts}), 4)
+        self.assertEqual(len({row['name'] for row in starts}), 4,
+                         'same tasks reused a default container name across batches')
         self.assertTrue(all(row['tag'].startswith('20261019_120000_') for row in starts))
         directories = [Path(row['output']) / 'scenario_results' / row['tag'] for row in starts]
         self.assertEqual(len(set(directories)), 4)
@@ -485,19 +801,27 @@ class ParallelProcessContracts(unittest.TestCase):
 
     @unittest.skipIf(os.name == 'nt', 'POSIX signal delivery requires Linux CI')
     def test_sigint_and_sigterm_stop_only_recorded_fixed_container_ids(self):
+        foreign_id = 'f' * 64
+        foreign_path = self.root / 'containers' / (foreign_id + '.json')
+        foreign_path.parent.mkdir(exist_ok=True)
+        foreign_path.write_text(json.dumps({'Id': foreign_id, 'Name': '/protected-model-service',
+                                            'Config': {'Image': 'model-service', 'Labels': {}},
+                                            'State': {'Running': True}}))
         for signum in (signal.SIGINT, signal.SIGTERM):
             with self.subTest(signal=signum):
                 before = len(self.events('start'))
-                a = self.config('signal_a.env')
-                b = self.config('signal_b.env')
-                process = self.start(a, b, env={'AISBENCH_TEST_DURATION': '60'})
-                self.wait_starts(before + 2)
+                configs = [self.config(f'signal_{index}.env', model=f'model-{index}') for index in range(4)]
+                process = self.start(*configs, env={'AISBENCH_TEST_DURATION': '60'})
+                self.wait_starts(before + 4)
                 starts = self.events('start')[before:]
                 process.send_signal(signum)
                 code, output = self.finish(process, timeout=20)
                 self.assertNotEqual(code, 0, output)
                 stopped = {row['args'][-1] for row in self.events('docker') if row['args'][0] == 'stop'}
                 self.assertTrue({row['identity'] for row in starts}.issubset(stopped), output)
+                self.assertTrue(all(len(identity) == 64 for identity in stopped), output)
+                self.assertNotIn(foreign_id, stopped)
+                self.assertTrue(json.loads(foreign_path.read_text())['State']['Running'])
                 for row in starts:
                     state = json.loads((self.root / 'containers' / (row['identity'] + '.json')).read_text())
                     self.assertFalse(state['State']['Running'])
@@ -518,13 +842,18 @@ class ParallelProcessContracts(unittest.TestCase):
                'MODEL_NAME': 'real-preflight-model', 'MODEL_HOST_PATH': (self.root / 'model').as_posix(),
                'TOOLS_HOST_DIR': (self.root / 'tools').as_posix(), 'HOST_OUTPUT_DIR': (self.root / 'unused-out').as_posix(),
                'HOST_IP': '192.168.1.123', 'HOST_PORT': '8000', 'NPU_NUM': '1', 'PEAK_HARD_CAP': '1',
-               'DATA_NUM_MULTIPLIER': '4', 'MAX_CONTEXT_LEN': '4096'}
+               'DATA_NUM_MULTIPLIER': '4', 'MAX_CONTEXT_LEN': '4096',
+               'API_URL': 'https://api.invalid:8443/v1/chat/completions', 'SERVICE_ID': 'preflight-service'}
         process = subprocess.run([self.bash, wrapper.as_posix()], env=env, text=True, capture_output=True, timeout=30)
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         self.assertNotIn('FORBIDDEN_DOCKER_CALL', process.stdout + process.stderr)
         payload = json.loads(report.read_text(encoding='utf-8'))
         self.assertEqual(payload['model_name'], 'real-preflight-model')
         self.assertEqual(str(payload['host_ip']), '192.168.1.123')
+        self.assertEqual(payload['api_url'], 'https://api.invalid:8443/v1/chat/completions')
+        self.assertEqual(payload['service_id'], 'preflight-service')
+        self.assertEqual(payload['planned_tests'], 1)
+        self.assertEqual(payload['effective_config']['DATA_NUM_MULTIPLIER'], '4')
         self.assertFalse((self.root / 'unused-out').exists(), 'preflight created runtime results')
         # Exercise real parser rejection, rather than only the fake worker path.
         write_lf(config, "SCENARIOS_JSON=$(cat <<'JSON'\n[{\"name\":\"invalid\",\"input_len\":16,\"output_len\":4,\"concurrency\":[0]}]\nJSON\n)\n")

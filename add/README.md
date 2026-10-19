@@ -19,21 +19,27 @@
 首次获取仓库：
 
 ```bash
-git clone --branch feat/parallel-tests-20261019 https://github.com/ZhengDeL/aisbench_auto_tools_prefix.git
+git clone --branch feat/n-config-runs-20261019 https://github.com/ZhengDeL/aisbench_auto_tools_prefix.git
 cd aisbench_auto_tools_prefix/add
 ```
 
-已有仓库时，进入其 `add/` 目录。**日常使用直接修改 `env.env`，无需复制文件。** 按顺序执行以下三行命令：
+已有仓库时，进入其 `add/` 目录。日常使用直接修改 `env.env`，然后将完整配置文件传给脚本，**无需先 `source`**：
 
 ```bash
 vi env.env
+bash run_perf_scenarios.sh ./env.env
+```
+
+`env.env` 上半部分填写模型名、权重路径、服务地址、NPU 数和指标端点；下半部分的 `SCENARIOS_JSON` 填写测试场景。仓库中提供的是公开示例，使用前改为实际配置。显式传入文件时，脚本自动加载该文件的全局参数，并直接读取同一文件的场景 JSON；场景无需 `export`。
+
+原来不传配置文件的用法仍兼容：
+
+```bash
 source ./env.env
 bash run_perf_scenarios.sh
 ```
 
-`env.env` 上半部分填写模型名、权重路径、服务地址、NPU 数和指标端点；下半部分的 `SCENARIOS_JSON` 填写测试场景。仓库中提供的是公开示例，使用前改为实际配置。
-
-`source ./env.env` 加载服务地址、路径等全局参数；`bash run_perf_scenarios.sh` 启动测试，并直接读取同一文件中的场景 JSON。场景无需 `export`。每次修改配置后，重新执行这两行命令。
+零参数模式沿用当前 shell 的全局参数，直接读取 `add/env.env` 的场景；它不会自动加载全局参数。每次修改配置后，建议使用上面的显式文件方式运行，避免沿用上次加载的值。
 
 | 项目 | 当前 `env.env` 的值 |
 |---|---|
@@ -47,9 +53,9 @@ bash run_perf_scenarios.sh
 
 `NPU_NUM` 是吞吐归一化的分母：`single_output_throughput = output_throughput / NPU_NUM`，`single_E2E_throughput = E2E_throughput / NPU_NUM`；全局吞吐保持整轮统计值。用户必须按报告单位填写参与测试的设备总数：按物理卡报告就填物理卡数，按 NPU 芯片报告就填芯片数，并在报告中注明口径。A3 一张物理卡包含 2 颗 NPU 芯片，两种口径对应的归一化吞吐相差 2 倍。默认 `1` 是示例值，脚本不会自动探测硬件。`POD_INFO` 的端点数量也不会自动设置 `dp`；当前场景没有显式设置 `dp`，底层默认是 `1`。
 
-### 双配置并行：一次启动两组测试
+### 一次启动 1 到 N 份配置
 
-需要同时运行两组测试时，在 `add/` 目录分别编辑两份配置，再用一条命令启动。**双配置模式自动分别加载全局参数和场景，无需先 `source`。**
+可以传入任意数量的完整配置文件。每份自动加载自己的全局参数和场景，一份配置对应一个任务和一个压测容器；同一任务内的固定并发及摸高仍顺序执行：
 
 ```bash
 vi test_a.env
@@ -57,25 +63,43 @@ vi test_b.env
 bash run_perf_scenarios.sh ./test_a.env ./test_b.env
 ```
 
-每份文件都包含完整的模型、路径、服务地址等全局参数，以及一个 `SCENARIOS_JSON` 场景块。两份公开示例都是 1K 输入、512 输出、4 并发，无摸高和前缀预热；固定请求倍率为 `4`，每组发出 `16` 条主测试请求。填写实际模型别名、权重路径、服务地址和 NPU 数后再运行。
+需要三组、四组或更多组时，继续添加配置文件参数即可，例如：
 
-| 项目 | 测试 A | 测试 B |
-|---|---|---|
-| 配置文件 | `test_a.env` | `test_b.env` |
-| 默认压测容器 | `ais_bench-test_a` | `ais_bench-test_b` |
-| 默认结果根目录 | `outputs/test_a/` | `outputs/test_b/` |
+```bash
+bash run_perf_scenarios.sh ./a.env ./b.env ./c.env ./d.env
+```
 
-容器名和结果根目录默认根据配置文件名生成；需要指定时，在各自文件中设置独立的 `CONTAINER_NAME`、`HOST_OUTPUT_DIR`。两组分别使用自己的配置、镜像、压测容器、日志、CSV、摸高报告和 `latest`；每组内部仍按顺序执行固定测试和摸高。两份文件即使都含有同名场景，也不会共用结果目录。
+`a`、`b`、`c`、`d` 只是示例，任务名从实际配置文件名派生，不是写死的组别。每份文件必须包含完整全局参数和一个 `SCENARIOS_JSON` 块。`test_a.env`、`test_b.env` 两份公开示例都是 1K 输入、512 输出、4 并发，无摸高和前缀预热；固定请求倍率为 `4`，每组发出 `16` 条主测试请求。填写实际模型别名、权重路径、服务地址和 NPU 数后再运行。
 
-启动前统一校验两份配置和资源锁。容器重名、输出目录重叠、配置非法，或容器/结果目录正在被另一轮使用时，整批报错，不启动压测。一组运行失败时，另一组继续；两组全部成功才返回 `0`，任一失败则整批返回非零。
+默认压测容器名为 `aisbench-<task>-<batch_id>`，如 `aisbench-test_a-<batch_id>`；同一批任务共享批次标记，重跑会创建新容器，保留此前批次容器。结果目录和命名文件仍同时包含任务名与模型名，如 `test_a__your-model-a`、`test_b__your-model-b`。配置文件名须以字母或数字开头，只含字母、数字、点、下划线和短横线；任务名从文件名去掉 `.env` 或 `.local.env` 后缀得到。任务名和模型名按脚本规则生成安全名称，任务与模型输出身份冲突会被拒绝。每组拥有自己的配置、容器、日志、CSV、摸高报告和 `latest`，不同任务即使含同名场景也分别保存。需要固定容器名或结果根目录时，可在各自文件中设置独立的 `CONTAINER_NAME`、`HOST_OUTPUT_DIR`；批次结果表会记录实际路径。
 
-批次状态保存在项目下 `outputs/parallel/<批次标记>/batch_results.json` 和 `batch_results.csv`，记录各组退出码、结果目录和启动日志路径。各组的启动日志保存在自己的结果根目录下 `.launcher/<运行标记>/launcher.log`，结束时还会复制到对应的 `scenario_results/<运行标记>/launcher.log`；指标汇总仍位于 `scenario_results/latest/all_results.csv`。
+启动前统一校验全部配置、服务身份和资源锁。配置非法、容器重名、结果目录重叠、指向同一服务，或服务/容器/目录正在被另一批任务占用时，整批报错，不启动压测。一组运行失败时，其余组继续；所有组成功才返回 `0`，任一失败则整批返回非零。
 
-双配置模式在启动时固定两份配置的文件内容，运行中修改配置会在下次启动时生效。路径按启动目录解析，建议填写绝对路径；配置文件不要依赖 `BASH_SOURCE` 定位相邻文件。
+### 同一服务不能同时测试
 
-按 `Ctrl+C` 会停止本批两组的压测进程和专用压测容器，避免继续发送请求，保留容器及已有产物；不停止模型服务容器。两组若指向同一个模型服务，负载会叠加；若共享缓存指标端点，采集值也可能混合，应据此解释性能和缓存结果。
+服务身份优先依据实际 `API_URL`，未设置时依据 `HOST_IP/HOST_PORT`。相同 host 和端口即判为同一端点，更换模型别名、URL 路径或鉴权信息不会把它变成另一服务。一个服务同时承受多组压测会影响结果，因此脚本拒绝这种配置。
 
-原来的零参数或单配置参数用法保持不变，仍按单测流程先 `source`。本节的自动加载仅用于双配置模式。
+不同代理地址如果仍指向同一后端，在对应配置里填写相同的可选 `SERVICE_ID`，例如：
+
+```bash
+export SERVICE_ID=shared-backend-01
+```
+
+`SERVICE_ID` 用于补充后端身份；不能用不同的 `SERVICE_ID` 绕过同端点检查。相同 IP 的不同端口只有确实对应独立模型实例时才适合并行；脚本无法自动识别代理后的部署拓扑。不同服务共享缓存指标端点时，指标仍可能混合，应按实际拓扑解释。
+
+锁在当前压测主机上跨批次生效，防止本机另一轮占用相同服务、容器或输出目录；它不是跨主机中央锁。多台压测主机仍需自行协调，避免同时请求同一后端。
+
+取消或异常退出后，如果无法确认原压测进程及容器停止，任务标记为 `cleanup_failed`，本机对应服务、容器和输出目录会保持资源隔离，后续冲突任务被拒绝。再次启动时，只在相同 Docker daemon 中按原完整容器 ID 只读确认该工具容器已停止或不存在后，才自动解除隔离；无法查询、daemon 不同或身份不明时继续阻断。请按批次记录检查原固定 ID 的工具容器，不要删除锁文件、隔离记录，或通过换名绕过。隔离记录无法写入时，管理进程会保留资源锁并重试，需先恢复锁目录可写。
+
+### 批次状态与结果
+
+显式传入 1 到 N 份文件时，批次目录位于 `outputs/parallel/<批次标记>/`，包含 `batch_results.json`、`batch_results.csv` 和跨任务的 `merged_metrics.csv`。状态表记录每个任务、模型、退出码、实际输出位置及日志路径；时间同时标明时区。配置保存脱敏快照，用于核对本批使用的设置，鉴权值等敏感信息不写入快照。
+
+默认每组位于批次的 `tasks/<task__model>/` 下，直接提供带任务和模型名的 `<task__model>__all_results.csv`、`<task__model>__launcher.log`；原来的 `scenario_results/<运行标记>/all_results.csv` 和详细归档仍保留。设置 `HOST_OUTPUT_DIR` 后以状态表指向的实际目录为准。详细结构及合并规则见第 7 节。
+
+启动时固定本批各配置文件内容；运行中编辑文件在下次启动时生效。配置路径按启动目录解析，建议使用绝对路径；不要依赖配置文件里的 `BASH_SOURCE` 定位相邻文件。
+
+按 `Ctrl+C` 会停止本批任务的压测进程和专用压测容器，避免继续发送请求，保留容器及已有产物；不停止模型服务容器。
 
 ## 3. 先用小场景验证流程
 
@@ -97,13 +121,13 @@ JSON
 )
 ```
 
-保存后按第 2 节加载并运行；使用其他配置文件的可选用法见第 4 节。上例是 1K 输入、512 输出、4 并发，共 4 条主测试请求，没有 `"max"`，不会摸高，也没有前缀预热。出现结果文件和 `passed` 只能确认该轮流程检查通过，回答内容仍需另外核验。
+保存后按第 2 节将所用配置文件传给脚本运行；无需手动加载。上例是 1K 输入、512 输出、4 并发，共 4 条主测试请求，没有 `"max"`，不会摸高，也没有前缀预热。出现结果文件和 `passed` 只能确认该轮流程检查通过，回答内容仍需另外核验。
 
 旧版 `SCENARIOS_JSON_OVERRIDE` 已不再支持；如果当前环境仍设置了它，脚本会报错停止。先 `unset SCENARIOS_JSON_OVERRIDE`，再把场景移到所用配置文件。
 
 ## 4. 全局环境变量与文件配置优先级
 
-下表是**未设置对应环境变量时，脚本自身使用的回退值**。模型、路径和地址均为公开示例。单测按第 2 节加载配置后，以环境值为准；双配置模式由脚本分别加载每份完整配置。并行模式未显式指定容器名、结果目录时，使用第 2 节所述的文件名派生值。
+下表是**未设置对应环境变量时，脚本自身使用的回退值**。模型、路径和地址均为公开示例。显式传入 1 到 N 份配置时，脚本分别加载每份完整文件；未指定容器名时按第 2 节以任务名和批次派生，结果目录以任务名、模型名和批次派生。零参数兼容模式仍以当前环境值为准。
 
 | 环境变量 | 脚本回退值 | 用途 |
 |---|---|---|
@@ -114,7 +138,8 @@ JSON
 | `NPU_NUM` | `1` | `single_*` 吞吐的分母；按报告单位填写物理卡数或 NPU 芯片数 |
 | `POD_INFO` | 空 | 逗号分隔的 metrics 地址；生成配置时转为列表 |
 | `API_KEY` | 空 | 鉴权 Key |
-| `API_URL` | 空 | 自定义服务 URL，映射到容器内 `config.py` 的 `URL` |
+| `API_URL` | 空 | 自定义服务 URL，映射到容器内 `config.py` 的 `URL`，并优先用于服务身份检查 |
+| `SERVICE_ID` | 未设置 | 不同代理共用同一后端时填写相同值，补充本机互斥检查 |
 | `FAILED_REQ_LIMIT` | `0` | 解析到的失败请求数超过此值时判失败 |
 | `MAX_CONTEXT_LEN` | `512000` | 场景的输入加输出长度上限；加载当前 env 后为 `133120` |
 | `CONTAINER_NAME` | `ais_bench-example` | 压测容器名 |
@@ -134,39 +159,36 @@ JSON
 
 配置按下面的规则生效：
 
-1. 单测模式下，加载配置文件后，全局环境变量覆盖 shell 的回退值；后续的 `export` 或 `VAR=value bash ...` 可以再次覆盖这些全局参数。场景数组从脚本唯一参数指定的文件读取，未指定时读取 `add/env.env`，不从环境变量取值。双配置模式分别自动加载两份文件，各组的全局参数和场景使用自己的文件；请将组内参数直接写在对应文件中。
+1. 显式传入文件时，每份完整配置自动加载，全局参数与场景使用同一文件；请直接在对应文件里填写组内参数。零参数兼容模式使用当前 shell 已加载的全局参数，场景始终读取 `add/env.env`。场景 JSON 不从环境变量取值。
 2. 场景显式填写的 `ttft_limit`、`tpot_limit`、`peak_min_cc`、`peak_max_cc`、`peak_data_multiplier`、`peak_wait` 优先于相应的 `PEAK_*` 环境默认。
 3. shell 把最终场景值作为命令行参数传给摸高引擎，覆盖 `aisbench_perf_matrix_config.py` 中对应的默认值。场景填写 `npu_num` 时，也会优先于全局 `NPU_NUM`。
 
 例如，当前场景已写入 TTFT=15 秒、TPOT=60 毫秒，仅设置 `PEAK_TTFT_LIMIT=5`、`PEAK_TPOT_LIMIT=50` 不会改变它们。请直接修改所用配置文件中的场景字段。
 
-### 单测可选：使用其他配置文件
+### 使用其他配置文件
 
-只有需要保留多套配置时，才使用其他文件。普通使用继续编辑 `env.env` 即可。
-
-如果已另外准备完整的 `env.local.env`，在 `add/` 目录执行：
+普通使用继续编辑 `env.env` 即可；需要保存多套配置时，可以使用任意合法文件名。被 Git 忽略的 `env.local.env` 可保存本地真实配置，在 `add/` 目录直接执行：
 
 ```bash
-source ./env.local.env
 bash run_perf_scenarios.sh ./env.local.env
 ```
 
-单配置模式的两行使用同一个文件：第一行加载全局参数，第二行指定场景 JSON 的读取位置。其他配置文件也必须同时包含全局参数和一个 `SCENARIOS_JSON=$(cat <<'JSON' ... JSON )` 场景块。单配置模式只解析其中的场景，不自动加载全局参数；双配置模式则按第 2 节自动分别加载。`env.local.env` 已被 Git 忽略，可保存本地真实配置。
+该文件也必须同时包含完整全局参数和一个 `SCENARIOS_JSON=$(cat <<'JSON' ... JSON )` 场景块。脚本自动加载全局参数，并直接读取其中的字面 JSON 场景；不需要单独 `source`。
 
-### 单测可选：临时覆盖全局参数
+### 零参数兼容模式：临时覆盖全局参数
 
-加载配置后可以继续覆盖变量，例如：
+需要继续使用旧的零参数方式时，加载配置后可以临时覆盖变量，例如：
 
 ```bash
 source ./env.env
 DATA_NUM_MULTIPLIER=7 CONTAINER_NAME=ais_bench_check bash run_perf_scenarios.sh
 ```
 
-`source env.env` 会覆盖该文件中定义的同名变量，因此临时覆盖应放在加载之后。
+`source env.env` 会覆盖该文件中定义的同名变量，因此临时覆盖应放在加载之后。显式文件模式会自动加载对应文件，请直接修改文件中的组内参数。
 
 ### API 与缓存指标
 
-`API_URL` 为空时，由 AISBench 根据 `HOST_IP/HOST_PORT` 构造接口地址。它的接线是 `API_URL` → 容器 `config.URL` → 模型配置 `url`。指定镜像的 chat 客户端使用 `urljoin(base_url, "v1/chat/completions")`：例如 `API_URL=http://192.168.1.10:8000/` 最终请求 `/v1/chat/completions`，带网关前缀时也应按此规则保留末尾斜杠并核验最终路径。需要鉴权时，在加载 env 后设置 `API_KEY`。
+`API_URL` 为空时，由 AISBench 根据 `HOST_IP/HOST_PORT` 构造接口地址。它的接线是 `API_URL` → 容器 `config.URL` → 模型配置 `url`。指定镜像的 chat 客户端使用 `urljoin(base_url, "v1/chat/completions")`：例如 `API_URL=http://192.168.1.10:8000/` 最终请求 `/v1/chat/completions`，带网关前缀时也应按此规则保留末尾斜杠并核验最终路径。需要鉴权时，在对应配置中填写 `API_KEY`。
 
 终端摘要在指定 `API_URL` 时显示它的scheme、host、port和path，省略userinfo、query和fragment；未指定时显示 `HOST_IP:HOST_PORT`。摘要不改变请求接线。
 
@@ -222,7 +244,28 @@ PEAK_HARD_CAP=1 bash run_perf_scenarios.sh
 
 ## 7. 结果目录、指标和状态
 
-默认结果根目录为项目下的 `outputs/default`，可用 `HOST_OUTPUT_DIR` 覆盖：
+显式配置模式默认按批次和任务保存，便于直接识别每份配置对应的模型：
+
+```text
+outputs/parallel/<批次标记>/
+├─ batch_results.csv / batch_results.json
+├─ merged_metrics.csv
+└─ tasks/
+   ├─ test_a__your-model-a/
+   │  ├─ test_a__your-model-a__all_results.csv
+   │  ├─ test_a__your-model-a__launcher.log
+   │  ├─ scenario_results/<运行标记>/all_results.csv
+   │  └─ ...各轮详细归档
+   └─ test_b__your-model-b/
+      ├─ test_b__your-model-b__all_results.csv
+      ├─ test_b__your-model-b__launcher.log
+      ├─ scenario_results/<运行标记>/all_results.csv
+      └─ ...各轮详细归档
+```
+
+`merged_metrics.csv` 在每组原始 23 列之外增加任务、模型、配置和结果来源等身份字段，逐行保留原始指标；不对不同服务的吞吐做相加或平均。摸高的 `peak_round` 仍是探测过程，最终 `peak` 才是该次搜索选出的 best；不能把每条 `peak_round` 当成一个新的场景计数。任务失败和没有生成有效结果的情况以 `batch_results.*` 为准，不能只看合并文件里已有的指标行。
+
+零参数兼容模式默认结果根目录仍为项目下的 `outputs/default`。各模式均允许用每份配置的 `HOST_OUTPUT_DIR` 覆盖实际结果根目录，显式配置模式由批次状态表记录它。每组内部仍保留以下结构：
 
 ```text
 <HOST_OUTPUT_DIR>/
@@ -293,7 +336,7 @@ scenario,current_time,input_len,output_len,total_req,max_cc,cc,rr,TTFT avg,TTFT 
 
 ## 8. 检查结果
 
-单测在 `add/` 目录查看本轮汇总：
+零参数兼容模式在 `add/` 目录查看本轮汇总：
 
 ```bash
 OUTPUT_ROOT="${HOST_OUTPUT_DIR:-$(cd .. && pwd)/outputs/default}"
@@ -301,7 +344,7 @@ cat "$OUTPUT_ROOT/scenario_results/latest/all_results.csv"
 tail -n 30 "$OUTPUT_ROOT/scenario_results/latest/execution.log"
 ```
 
-双配置模式先查看终端打印的批次目录中的 `batch_results.json` 或 `batch_results.csv`，再按其中的组内结果位置查看各组 `all_results.csv` 和日志。默认结果根目录分别是 `outputs/test_a` 和 `outputs/test_b`；下面的产物校验命令也应分别对两组执行。
+显式配置模式先查看终端打印的批次目录中的 `batch_results.json` 或 `batch_results.csv`，核对所有任务状态和退出码，再按记录的实际路径查看带 `<task__model>` 的汇总、日志及 `merged_metrics.csv`。默认结果位于批次的 `tasks/` 下；使用 `HOST_OUTPUT_DIR` 时按状态表记录的实际根目录检查。下面的产物校验命令应分别对每个任务执行，将 `OUTPUT_ROOT` 改为该任务的实际输出根目录。
 
 离线检查插件本身，不调用 Docker、不请求模型：
 
@@ -331,9 +374,11 @@ python3 validate_result_integrity.py \
 
 | 现象 | 检查方法 |
 |---|---|
-| 使用了错误模型、地址或 NPU 数 | 单测确认已编辑并 `source ./env.env`；双配置模式分别检查两份文件，参数直接写入对应文件 |
+| 使用了错误模型、地址或 NPU 数 | 检查传入的完整配置文件与脱敏快照；显式文件模式自动加载，零参数模式才需要先 source |
 | 只改 `PEAK_*`，摸高阈值没有变化 | 当前场景显式字段优先，直接修改所用配置文件中的场景 |
-| 自定义 env 的场景未生效 | 确认加载全局参数后，使用 `bash run_perf_scenarios.sh ./env.local.env` 指定同一个完整配置文件 |
+| 自定义 env 的场景未生效 | 使用 `bash run_perf_scenarios.sh ./env.local.env` 直接指定完整文件，并核对批次记录的配置来源 |
+| 多份配置被判为同一服务 | 核对实际 `API_URL` 或 `HOST_IP/HOST_PORT`；更换模型别名或路径不隔离服务，不同代理共用后端需设置相同 `SERVICE_ID` |
+| 服务正被另一批任务占用 | 在同一压测主机查看占用任务；本机锁不是跨主机中央锁，不要通过改名或换输出目录绕过服务互斥 |
 | 改固定倍率后，摸高请求数没变化 | `DATA_NUM_MULTIPLIER` 只控制固定测试；摸高使用独立的 `peak_data_multiplier` |
 | 场景超过 MAX_CONTEXT_LEN | 检查输入加输出长度；脚本回退值 512000，当前 env 为 133120；该设置不会扩大模型服务的上下文能力 |
 | 容器内模型路径不存在 | 检查宿主机 `MODEL_HOST_PATH` 及容器 `/workspace/model` 的实际挂载；复用容器时不能仅凭路径存在就认定挂载的是正确权重 |
@@ -346,9 +391,9 @@ python3 validate_result_integrity.py \
 
 | 文件 | 作用 |
 |---|---|
-| [env.env](env.env) | 单测全局参数与场景配置；全局参数先加载，场景由脚本直接读取 |
-| [test_a.env](test_a.env) / [test_b.env](test_b.env) | 双配置并行的完整公开示例，由脚本分别自动加载 |
-| [run_perf_scenarios.sh](run_perf_scenarios.sh) | 主入口；零/一个配置参数运行单测，两个配置参数并行运行两组 |
+| [env.env](env.env) | 完整全局参数与场景配置；显式传入时自动加载 |
+| [test_a.env](test_a.env) / [test_b.env](test_b.env) | 两份完整公开示例，可单独运行或与更多配置一起运行 |
+| [run_perf_scenarios.sh](run_perf_scenarios.sh) | 主入口；显式传入 1 到 N 份完整配置自动加载运行，零参数保留旧用法 |
 | [aisbench_perf_matrix.py](aisbench_perf_matrix.py) | 并发搜索、逐档执行及证据保存 |
 | [aisbench_perf_matrix_config.py](aisbench_perf_matrix_config.py) | 搜索引擎默认配置、指标列名和扩容限制 |
 | [aisbench_result_adapter.py](aisbench_result_adapter.py) | 按列名读取源 CSV、检查关键指标并投影汇总字段 |

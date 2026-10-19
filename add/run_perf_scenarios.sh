@@ -46,6 +46,8 @@ API_KEY="${API_KEY:-}"
 
 # 自定义请求 URL（为空则使用 http://{HOST_IP}:{HOST_PORT}/v1/chat/completions）# 示例: API_URL="http://192.168.1.10:8000"
 API_URL="${API_URL:-}"
+# Different gateways for the same backend must declare the same SERVICE_ID.
+SERVICE_ID="${SERVICE_ID:-}"
 
 # Failed Requests 阈值：本轮失败请求数 > 此值即判为不满足（failed）。默认 0（出现任何失败请求即不满足）
 FAILED_REQ_LIMIT="${FAILED_REQ_LIMIT:-0}"
@@ -83,11 +85,14 @@ fail() { log "ERROR: $*"; exit 1; }
 write_runtime_report() {
     [ -n "${AISBENCH_RUNTIME_REPORT:-}" ] || return 0
     python3 - "$AISBENCH_RUNTIME_REPORT" "${CURRENT_ID:-}" "$CONTAINER_NAME" \
-        "$EXPECTED_IMAGE" "${RUN_TIMESTAMP:-}" "${RESULTS_HOST_DIR:-}" "$1" "${2:-}" <<'PY'
+        "$EXPECTED_IMAGE" "${RUN_TIMESTAMP:-}" "${RESULTS_HOST_DIR:-}" "$1" "${2:-}" \
+        "${RUNTIME_PHASE:-initializing}" "${ARCHIVE_NAME:-}" "${TOTAL_TESTS:-0}" "${TEST_INDEX:-0}" <<'PY'
 import json, os, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 data = dict(zip(('container_id', 'container_name', 'image', 'run_id', 'result_dir'), sys.argv[2:7]))
 data['complete'] = sys.argv[7] == 'true'
+data.update(phase=sys.argv[9], current_scenario=sys.argv[10],
+            planned_tests=int(sys.argv[11]), test_index=int(sys.argv[12]))
 if sys.argv[8]:
     data['worker_exit'] = int(sys.argv[8])
 temporary = path.with_name(path.name + '.tmp')
@@ -400,11 +405,23 @@ if [ -n "${AISBENCH_PREFLIGHT_REPORT:-}" ]; then
     [ -d "$MODEL_HOST_PATH" ] || fail "宿主机模型目录不存在: $MODEL_HOST_PATH"
     [ -f "$TOOLS_HOST_DIR/aisbench_test.py" ] || fail "工具目录缺少 aisbench_test.py: $TOOLS_HOST_DIR"
     python3 - "$AISBENCH_PREFLIGHT_REPORT" "$CONTAINER_NAME" "$HOST_OUTPUT_DIR" \
-        "$MODEL_HOST_PATH" "$TOOLS_HOST_DIR" "$EXPECTED_IMAGE" "$HOST_IP" "$HOST_PORT" "$MODEL_NAME" <<'PY'
+        "$MODEL_HOST_PATH" "$TOOLS_HOST_DIR" "$EXPECTED_IMAGE" "$HOST_IP" "$HOST_PORT" "$MODEL_NAME" \
+        "$API_URL" "$SERVICE_ID" "$TOTAL_TESTS" "$FIXED_COUNT" "$PEAK_COUNT" \
+        "$SCENARIOS_JSON" "$COMBOS" "$PEAK_COMBOS" "$DATA_NUM_MULTIPLIER" "$NPU_NUM" \
+        "$PEAK_HARD_CAP" "$FAILED_REQ_LIMIT" "$MAX_CONTEXT_LEN" "$PEAK_MIN_CONCURRENCY" \
+        "$PEAK_MAX_MULTIPLIER" "$PEAK_DATA_MULTIPLIER" "$PEAK_WAIT_SECONDS" "$PEAK_TTFT_LIMIT" "$PEAK_TPOT_LIMIT" <<'PY'
 import json, pathlib, sys
 keys = ('container_name', 'host_output_dir', 'model_host_path', 'tools_host_dir',
-        'expected_image', 'host_ip', 'host_port', 'model_name')
-pathlib.Path(sys.argv[1]).write_text(json.dumps(dict(zip(keys, sys.argv[2:])), ensure_ascii=False), encoding='utf-8')
+        'expected_image', 'host_ip', 'host_port', 'model_name', 'api_url', 'service_id')
+report = dict(zip(keys, sys.argv[2:12]))
+report.update(planned_tests=int(sys.argv[12]), fixed_count=int(sys.argv[13]), peak_count=int(sys.argv[14]))
+effective = dict(zip(('DATA_NUM_MULTIPLIER', 'NPU_NUM', 'PEAK_HARD_CAP', 'FAILED_REQ_LIMIT',
+                     'MAX_CONTEXT_LEN', 'PEAK_MIN_CONCURRENCY', 'PEAK_MAX_MULTIPLIER',
+                     'PEAK_DATA_MULTIPLIER', 'PEAK_WAIT_SECONDS', 'PEAK_TTFT_LIMIT', 'PEAK_TPOT_LIMIT'), sys.argv[18:]))
+effective.update(scenarios=json.loads(sys.argv[15]), expanded_fixed=sys.argv[16].splitlines(),
+                 expanded_peak=sys.argv[17].splitlines())
+report['effective_config'] = effective
+pathlib.Path(sys.argv[1]).write_text(json.dumps(report, ensure_ascii=False), encoding='utf-8')
 PY
     exit $?
 fi
@@ -568,6 +585,10 @@ log "start fixed concurrency tests ($FIXED_COUNT groups)"
 while IFS='|' read -r ARCHIVE_NAME CMD_PARAMS; do
     [ -z "$ARCHIVE_NAME" ] && continue
     TEST_INDEX=$((TEST_INDEX + 1))
+    RUNTIME_PHASE=fixed
+    if [ -n "${AISBENCH_RUNTIME_REPORT:-}" ]; then
+        write_runtime_report false || fail "无法更新测试进度"
+    fi
     log "[$TEST_INDEX/$TOTAL_TESTS] 开始测试: $ARCHIVE_NAME (container_id=$CURRENT_ID)"
     if [ -n "${AISBENCH_RUNTIME_REPORT:-}" ]; then
         assert_container_ready || fail "原压测容器失效，停止本组测试"
@@ -690,6 +711,10 @@ while IFS='|' read -r ARCHIVE_NAME PEAK_INPUT_LEN PEAK_OUTPUT_LEN PEAK_MIN_CC PE
     : "${PEAK_REPEAT_RATE:=0}"
     PEAK_CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
     TEST_INDEX=$((TEST_INDEX + 1))
+    RUNTIME_PHASE=peak
+    if [ -n "${AISBENCH_RUNTIME_REPORT:-}" ]; then
+        write_runtime_report false || fail "无法更新摸高进度"
+    fi
     log "[$TEST_INDEX/$TOTAL_TESTS] 摸高搜索: $ARCHIVE_NAME (并发 $PEAK_MIN_CC~$PEAK_MAX_CC, TTFT<$PEAK_TTFT s, TPOT<$PEAK_TPOT ms, container_id=$CURRENT_ID)"
     if [ -n "${AISBENCH_RUNTIME_REPORT:-}" ]; then
         assert_container_ready || fail "原压测容器失效，停止本组摸高"
@@ -937,6 +962,7 @@ log "全部测试完成"
 WORKER_EXIT=0
 [ "$FAILED_COUNT" -eq 0 ] || WORKER_EXIT=1
 if [ -n "${AISBENCH_RUNTIME_REPORT:-}" ]; then
+    RUNTIME_PHASE=completed
     write_runtime_report true "$WORKER_EXIT" || fail "无法记录本组完成状态"
 fi
 exit "$WORKER_EXIT"

@@ -532,7 +532,7 @@ Path('aisbench.log').write_text('round=' + str(index), encoding='utf-8')
 print('Failed Requests: 0')
 print('Success Requests: ' + str(a.data_num))
 """
-        (tools / "aisbench_test.py").write_text("BASE_ROW = " + repr(row) + "\n" + stub, encoding="utf-8", newline="\n")
+        (tools / "aisbench_test.py").write_bytes(("BASE_ROW = " + repr(row) + "\n" + stub).encode("utf-8"))
         peak_stub = """import argparse, json, os
 from pathlib import Path
 p = argparse.ArgumentParser()
@@ -545,7 +545,7 @@ row = BASE_ROW.copy()
 row.update(concurrency=2, passed='yes')
 (root / 'peak_search_report.json').write_text(json.dumps({'best': [row]}), encoding='utf-8')
 """
-        (add / "aisbench_perf_matrix.py").write_text("BASE_ROW = " + repr(row) + "\n" + peak_stub, encoding="utf-8", newline="\n")
+        (add / "aisbench_perf_matrix.py").write_bytes(("BASE_ROW = " + repr(row) + "\n" + peak_stub).encode("utf-8"))
         interpreter = shlex.quote(sys.executable.replace("\\", "/"))
         prefix = ("python3() { " + interpreter + ' "$@"; }\nexport -f python3\n'
                   'log() { printf "%s\\n" "$*"; }\nfail() { log "ERROR: $*"; exit 1; }\n'

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Supervise isolated AISBench runs without changing their benchmark contract.
 
-The shell entry point delegates here before reading any configuration.  One
-configuration retains the historical inherited-environment contract; two files
-are sourced separately into clean tool environments and run concurrently.
+The shell entry point delegates here before reading any configuration.  Every
+explicit configuration is sourced once into an isolated environment.  With no
+arguments only, the historical inherited-environment contract remains intact.
 """
 
 from __future__ import annotations
 
-import csv
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -22,10 +22,14 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
+from urllib.parse import urlsplit
+
+from aisbench_batch_results import prepare_task_outputs, publish_batch, save_effective_config
 
 
 TOOL_PARAMETERS = frozenset({
@@ -37,6 +41,7 @@ TOOL_PARAMETERS = frozenset({
     "PEAK_MAX_MULTIPLIER", "PEAK_DATA_MULTIPLIER", "PEAK_WAIT_SECONDS",
     "PEAK_TTFT_LIMIT", "PEAK_TPOT_LIMIT", "PEAK_HARD_CAP", "SCENARIOS_JSON",
     "SCENARIOS_JSON_OVERRIDE", "SCENARIO_CONFIG_FILE", "ADD_DIR", "PROJECT_ROOT",
+    "SERVICE_ID",
 })
 MANAGED_LABEL = "io.aisbench-auto-tools-prefix.managed"
 INTERNAL_PARAMETERS = frozenset({
@@ -114,6 +119,72 @@ def task_alias(config: Path) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
         raise RunError("配置文件名须以字母或数字开头，仅使用字母、数字、点、下划线和短横线")
     return name
+
+
+def safe_slug(value: str, limit: int) -> str:
+    """Keep labels readable while distinguishing escaped and shortened values."""
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-_") or "model"
+    # Reserve the double underscore for the task/model boundary. Otherwise
+    # (task=a__b, model=c) and (task=a, model=b__c) share a label.
+    slug = re.sub(r"__+", "_", slug)
+    if slug != value or len(slug) > limit:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+        slug = slug[:limit - len(digest) - 1].rstrip(".-_") + "-" + digest
+    return slug
+
+
+def task_output_label(alias: str, model: str) -> str:
+    return safe_slug(alias, 48) + "__" + safe_slug(model, 64)
+
+
+def service_authority(api_url: str, host: str, port: str) -> tuple[str, str]:
+    """Return a credential-free target and a host:port resource key.
+
+    Paths, model names, and HTTP versus HTTPS on the same explicit port do not
+    create independent services. DNS aliases and proxy backends need SERVICE_ID;
+    resolving them here cannot prove backend independence.
+    """
+    address = api_url.strip()
+    if not address:
+        clean_host = host.strip().removeprefix("[").removesuffix("]")
+        address = "http://" + ("[" + clean_host + "]" if ":" in clean_host else clean_host) + ":" + port
+    try:
+        if any(character.isspace() or ord(character) < 32 for character in address):
+            raise ValueError("URL contains unescaped whitespace")
+        parsed = urlsplit(address)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
+            raise ValueError("an absolute HTTP(S) URL is required")
+        hostname = parsed.hostname.rstrip(".").lower()
+        if ":" in hostname and "%25" in hostname:
+            # RFC 6874 encodes the zone separator in an IPv6 URL, while a
+            # HOST_IP value commonly contains the literal percent character.
+            hostname = hostname.replace("%25", "%", 1)
+        if not hostname or any(character.isspace() for character in hostname):
+            raise ValueError("invalid host")
+        try:
+            address_object = ipaddress.ip_address(hostname)
+            if isinstance(address_object, ipaddress.IPv6Address) and address_object.ipv4_mapped:
+                address_object = address_object.ipv4_mapped
+            hostname = address_object.compressed
+        except ValueError:
+            if re.fullmatch(r"[0-9.]+", hostname) or ":" in hostname:
+                raise ValueError("invalid IP address") from None
+            hostname = hostname.encode("idna").decode("ascii")
+            if not re.fullmatch(r"[a-z0-9_][a-z0-9_.-]*", hostname):
+                raise ValueError("invalid hostname")
+        effective_port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
+        if not 1 <= effective_port <= 65535:
+            raise ValueError("invalid port")
+    except (ValueError, UnicodeError) as error:
+        # Do not repeat a URL: it can contain an API key in its query string.
+        raise RunError("模型服务地址无效，请使用有效的 HTTP(S) 地址和端口") from error
+    authority = ("[" + hostname + "]" if ":" in hostname else hostname) + ":" + str(effective_port)
+    return scheme + "://" + authority, authority
+
+
+def timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
 def _signal_request(signum: int, _frame: Any) -> None:
@@ -223,7 +294,7 @@ class Job:
     environment: dict[str, str]
     worker_config: Path | None = None
     config_sha256: str = ""
-    metadata: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
     daemon_id: str = ""
     run_id: str = ""
     runtime_path: Path | None = None
@@ -234,21 +305,42 @@ class Job:
     state: str = "pending"
     exit_code: int | None = None
     cleanup: str = "not_needed"
+    output_label: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    started_monotonic: float | None = None
+    finished_monotonic: float | None = None
 
     def status(self) -> dict[str, Any]:
         runtime = read_json(self.runtime_path) if self.runtime_path else {}
         matching = runtime.get("run_id") == self.run_id
+        elapsed = 0.0
+        if self.started_monotonic is not None:
+            end = self.finished_monotonic if self.finished_monotonic is not None else time.monotonic()
+            elapsed = round(max(0.0, end - self.started_monotonic), 3)
         return {
             "task": self.alias,
             "config": str(self.config) if self.config else "",
             "config_sha256": self.config_sha256,
+            "model": self.metadata.get("model_name", ""),
+            "endpoint": self.metadata.get("service_endpoint", ""),
+            "service_id": self.metadata.get("service_id", ""),
+            "output_label": self.output_label,
+            "host_output_dir": self.metadata.get("host_output_dir", ""),
             "container_name": self.metadata.get("container_name", ""),
             "container_id": runtime.get("container_id", "") if matching else "",
             "image": self.metadata.get("expected_image", ""),
             "run_id": self.run_id,
             "state": self.state,
+            "phase": runtime.get("phase", self.state) if matching else self.state,
+            "current_scenario": runtime.get("current_scenario", "") if matching else "",
+            "planned_tests": self.metadata.get("planned_tests", ""),
+            "test_index": runtime.get("test_index", 0) if matching else 0,
             "exit_code": self.exit_code,
             "cleanup": self.cleanup,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "elapsed_seconds": elapsed,
             "result_dir": runtime.get("result_dir", "") if matching else "",
             "launcher_log": str(self.launcher_path) if self.launcher_path else "",
         }
@@ -269,15 +361,20 @@ class ResourceLocks:
         base = Path("/tmp") if os.name == "posix" else Path(tempfile.gettempdir())
         self.directory = base / "aisbench-auto-tools-locks"
         self.handles: list[IO[bytes]] = []
+        self.jobs: list[Job] = []
 
     @property
     def descriptors(self) -> tuple[int, ...]:
         return tuple(handle.fileno() for handle in self.handles)
 
     def acquire(self, jobs: list[Job]) -> None:
+        self.jobs = jobs
         requested: dict[str, bool] = {}
         for job in jobs:
             requested["container\0" + job.daemon_id + "\0" + job.metadata["container_name"]] = True
+            requested["service\0" + job.metadata["service_key"]] = True
+            if job.metadata.get("service_id"):
+                requested["service-id\0" + job.metadata["service_id"]] = True
             target = Path(job.metadata["host_output_dir"])
             for ancestor in target.parents:
                 requested.setdefault("output\0" + str(ancestor), False)
@@ -307,9 +404,127 @@ class ResourceLocks:
                     handle.close()
                     raise
                 self.handles.append(handle)
+            self._check_quarantines(jobs)
         except OSError as error:
             self.close()
-            raise RunError("容器名或输出目录已被其他压测占用；本批次未启动") from error
+            raise RunError("服务、容器名或输出目录已被其他压测占用；本批次未启动") from error
+        except RunError:
+            self.close()
+            raise
+
+    @staticmethod
+    def _exclusive_resources(job: Job) -> list[str]:
+        resources = ["container\0" + job.daemon_id + "\0" + job.metadata["container_name"],
+                     "service\0" + job.metadata["service_key"],
+                     "output\0" + job.metadata["host_output_dir"]]
+        if job.metadata.get("service_id"):
+            resources.append("service-id\0" + job.metadata["service_id"])
+        return resources
+
+    def _check_quarantines(self, jobs: list[Job]) -> None:
+        """Only a verified stopped fixed ID can release a failed cleanup marker.
+
+        Scan output paths as well as exact resource keys: a blocked child output
+        must also block a later run using its parent directory. The kernel locks
+        already acquired above serialize every overlapping claimant.
+        """
+        for path in self.directory.glob("*.blocked.json"):
+            if path.is_symlink():
+                raise RunError("发现无法确认的资源隔离记录，本批次未启动")
+            record = read_json(path)
+            resources = record.get("resources")
+            output = record.get("host_output_dir")
+            if (record.get("schema_version") != 1 or not isinstance(resources, list)
+                    or not resources or any(not isinstance(item, str) for item in resources)
+                    or not isinstance(output, str) or not output):
+                raise RunError("资源隔离记录无效，保留隔离；本批次未启动")
+            blocked_resources = set(resources)
+            matching = [job for job in jobs
+                        if blocked_resources.intersection(self._exclusive_resources(job))
+                        or paths_overlap(output, job.metadata["host_output_dir"])]
+            if not matching:
+                continue
+            identifier = record.get("container_id", "")
+            daemon = record.get("daemon_id", "")
+            container_name, image = record.get("container_name", ""), record.get("image", "")
+            inspector = next((job for job in matching if job.daemon_id == daemon), None)
+            message = "此前任务清理未确认，资源保持隔离；请检查原固定ID工具容器后重试"
+            if (not isinstance(identifier, str) or not re.fullmatch(r"[a-fA-F0-9]{64}", identifier)
+                    or not isinstance(daemon, str) or not daemon or inspector is None
+                    or not isinstance(container_name, str) or not container_name
+                    or not isinstance(image, str) or not image):
+                raise RunError(message)
+            try:
+                inspected = inspect_container(inspector, identifier)
+            except (OSError, subprocess.SubprocessError, RunError) as error:
+                raise RunError(message) from error
+            if inspected is not None:
+                config, state = inspected.get("Config"), inspected.get("State")
+                if (inspected.get("Id") != identifier
+                        or inspected.get("Name", "").lstrip("/") != container_name
+                        or not isinstance(config, dict) or config.get("Image") != image
+                        or not isinstance(config.get("Labels"), dict)
+                        or config["Labels"].get(MANAGED_LABEL) != "true"
+                        or not isinstance(state, dict) or state.get("Running") is not False):
+                    raise RunError(message)
+            # Never remove a lock inode. The independent marker can disappear
+            # only after this read-only fixed-ID proof under the claimant's lock.
+            path.unlink(missing_ok=True)
+            emit("manager", "已确认此前固定ID工具容器停止或不存在，解除对应资源隔离")
+
+    def _write_quarantine(self, job: Job) -> None:
+        runtime = read_json(job.runtime_path) if job.runtime_path else {}
+        identifier = runtime.get("container_id", "")
+        if (runtime.get("run_id") != job.run_id
+                or runtime.get("container_name") != job.metadata["container_name"]
+                or runtime.get("image") != job.metadata["expected_image"]
+                or not isinstance(identifier, str) or not re.fullmatch(r"[a-fA-F0-9]{64}", identifier)):
+            identifier = ""  # Unknown identity must remain blocked, never guessed by name.
+        record = {"schema_version": 1, "created_at": timestamp(), "run_id": job.run_id,
+                  "daemon_id": job.daemon_id, "container_id": identifier,
+                  "container_name": job.metadata["container_name"],
+                  "image": job.metadata["expected_image"],
+                  "host_output_dir": job.metadata["host_output_dir"],
+                  "resources": self._exclusive_resources(job), "reason": "cleanup_unconfirmed"}
+        identity = json.dumps([job.daemon_id, job.run_id, job.alias], ensure_ascii=True).encode("utf-8")
+        name = hashlib.sha256(identity).hexdigest() + ".blocked.json"
+        target = self.directory / name
+        temporary = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(record, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            if os.name == "posix":
+                directory_descriptor = os.open(self.directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _quarantine_failed_jobs(self) -> None:
+        for job in self.jobs:
+            if job.state != "cleanup_failed":
+                continue
+            last_warning = float("-inf")
+            while True:
+                try:
+                    self._write_quarantine(job)
+                    emit(job.alias, "清理未确认，已隔离本机对应服务、容器和输出资源")
+                    break
+                except OSError:
+                    # Releasing an ordinary flock here would permit overlapping
+                    # requests. Keep it until the persistent block is durable.
+                    now = time.monotonic()
+                    if now - last_warning >= 10:
+                        emit(job.alias, "资源隔离记录写入失败，保持资源锁并等待重试；请恢复锁目录可写")
+                        last_warning = now
+                    time.sleep(1)
 
     def close(self) -> None:
         for handle in reversed(self.handles):
@@ -320,6 +535,7 @@ class ResourceLocks:
         return self
 
     def __exit__(self, *_args: Any) -> None:
+        self._quarantine_failed_jobs()
         self.close()
 
 
@@ -342,19 +558,41 @@ def _windows_lock(descriptor: int, exclusive: bool) -> None:
         raise OSError(ctypes.get_last_error(), "resource already locked")
 
 
-def validate_metadata(raw: dict[str, Any], alias: str) -> dict[str, str]:
+def validate_metadata(raw: dict[str, Any], alias: str,
+                      environment: dict[str, str] | None = None) -> dict[str, Any]:
     required = {"container_name", "host_output_dir", "model_host_path", "tools_host_dir",
                 "expected_image", "host_ip", "host_port", "model_name"}
     if not required.issubset(raw) or any(not isinstance(raw[key], str) or not raw[key]
                                        for key in required):
         raise RunError(f"{alias}: 预检未返回完整资源信息")
     metadata = {key: raw[key] for key in required}
+    for key in ("planned_tests", "fixed_count", "peak_count"):
+        if key in raw:
+            if not isinstance(raw[key], int) or isinstance(raw[key], bool) or raw[key] < 0:
+                raise RunError(f"{alias}: 预检任务数量无效")
+            metadata[key] = raw[key]
+    if "effective_config" in raw:
+        if not isinstance(raw["effective_config"], dict):
+            raise RunError(f"{alias}: 预检有效配置无效")
+        metadata["effective_config"] = raw["effective_config"]
+    environment = environment or {}
+    for field_name, variable in (("api_url", "API_URL"), ("service_id", "SERVICE_ID")):
+        value = raw.get(field_name, environment.get(variable, ""))
+        if not isinstance(value, str):
+            raise RunError(f"{alias}: {variable} 须为字符串")
+        metadata[field_name] = value.strip()
+    if (len(metadata["service_id"]) > 256
+            or any(ord(character) < 32 or ord(character) == 127 for character in metadata["service_id"])):
+        raise RunError(f"{alias}: SERVICE_ID 过长或包含控制字符")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", metadata["container_name"]):
         raise RunError(f"{alias}: CONTAINER_NAME 格式非法")
     if not re.fullmatch(r"[0-9]+", metadata["host_port"]) or not 1 <= int(metadata["host_port"]) <= 65535:
         raise RunError(f"{alias}: HOST_PORT 须为 1 至 65535 的整数")
     if any(character.isspace() for character in metadata["expected_image"]):
         raise RunError(f"{alias}: EXPECTED_IMAGE 不能包含空白字符")
+    metadata["service_endpoint"], metadata["service_key"] = service_authority(
+        metadata["api_url"], metadata["host_ip"], metadata["host_port"])
+    metadata["endpoint"] = metadata["service_endpoint"]
     for key in ("host_output_dir", "model_host_path", "tools_host_dir"):
         metadata[key] = canonical_path(metadata[key])
     for key in ("model_host_path", "tools_host_dir"):
@@ -459,55 +697,133 @@ def stream_output(job: Job) -> None:
         job.process.stdout.close()
 
 
-def write_batch(path: Path | None, batch_id: str, jobs: list[Job]) -> None:
+def write_batch(path: Path | None, batch_id: str, jobs: list[Job],
+                final: bool = False) -> list[str]:
     if path is None:
-        return
+        return []
     statuses = [job.status() for job in jobs]
-    atomic_json(path / "batch_results.json", {"batch_id": batch_id, "tasks": statuses})
-    temporary = path / "batch_results.csv.tmp"
-    with temporary.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(statuses[0]))
-        writer.writeheader()
-        writer.writerows(statuses)
-    os.replace(temporary, path / "batch_results.csv")
+    return publish_batch(path, batch_id, statuses, final=final)
+
+
+def finish_job(job: Job, state: str, exit_code: int | None) -> None:
+    job.state = state
+    job.exit_code = exit_code
+    job.finished_at = timestamp()
+    job.finished_monotonic = time.monotonic()
+
+
+def abort_job(job: Job, cancelled: bool) -> None:
+    """End one owned workload; re-read its identity after its shell is gone."""
+    assert job.process is not None
+    runtime = read_json(job.runtime_path) if job.runtime_path else {}
+    complete = (not cancelled and runtime.get("run_id") == job.run_id
+                and runtime.get("complete") is True)
+    if not complete:
+        stop_owned_container(job)
+    host_stopped = True
+    try:
+        terminate_process(job.process)
+    except (OSError, subprocess.SubprocessError):
+        host_stopped = False
+        emit(job.alias, "宿主机压测进程停止未确认，需要人工检查")
+    # Runtime can first appear between the first read and SIGTERM delivery.
+    cleaned = True if complete else stop_owned_container(job)
+    if not host_stopped or not cleaned:
+        state = "cleanup_failed"
+    else:
+        state = "cancelled" if cancelled else "failed"
+    finish_job(job, state, job.process.returncode)
+
+
+def abort_jobs(jobs: list[Job], cancelled: bool, path: Path | None, batch_id: str,
+               all_jobs: list[Job]) -> None:
+    """Bound stop latency by parallelizing independent fixed-ID cleanup."""
+    if not jobs:
+        return
+    for job in jobs:
+        job.state = "cancelling" if cancelled else "cleaning_up"
+    report_failed = False
+
+    def report_cleanup() -> None:
+        nonlocal report_failed
+        try:
+            write_batch(path, batch_id, all_jobs)
+        except Exception:
+            # An output failure must never prevent stopping owned workloads.
+            if not report_failed:
+                emit("manager", "停止期间无法更新批次文件，继续停止本批次压测")
+                report_failed = True
+
+    report_cleanup()
+    with ThreadPoolExecutor(max_workers=min(32, len(jobs)), thread_name_prefix="aisbench-stop") as executor:
+        pending = {executor.submit(abort_job, job, cancelled) for job in jobs}
+        last_refresh = time.monotonic()
+        while pending:
+            done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+            for result in done:
+                result.result()
+            if done or time.monotonic() - last_refresh >= 0.5:
+                report_cleanup()
+                last_refresh = time.monotonic()
+
+
+def validate_job_conflicts(jobs: list[Job]) -> None:
+    """Locks protect batches from each other; check every pair within a batch."""
+    for index, job in enumerate(jobs):
+        for previous in jobs[:index]:
+            pair = f"{previous.alias} / {job.alias}"
+            if job.metadata["container_name"] == previous.metadata["container_name"]:
+                raise RunError(f"{pair}: CONTAINER_NAME 相同，请使用不同容器名")
+            if paths_overlap(job.metadata["host_output_dir"], previous.metadata["host_output_dir"]):
+                raise RunError(f"{pair}: HOST_OUTPUT_DIR 相同或互为父子目录，请使用互不重叠目录")
+            if job.metadata["service_key"] == previous.metadata["service_key"]:
+                raise RunError(f"{pair}: 指向同一个模型服务，禁止同时压测（模型别名不区分服务）")
+            if (job.metadata["service_id"]
+                    and job.metadata["service_id"] == previous.metadata["service_id"]):
+                raise RunError(f"{pair}: SERVICE_ID 相同，禁止同时压测同一后端")
 
 
 def supervise(script: Path, arguments: list[str]) -> int:
-    if len(arguments) > 2:
-        raise RunError("用法: bash run_perf_scenarios.sh [配置文件 [第二份配置文件]]")
     project_root = script.parent.parent
-    dual = len(arguments) == 2
+    explicit = bool(arguments)
     config_arguments = arguments or [str(script.parent / "env.env")]
     configs = [Path(value).resolve(strict=True) for value in config_arguments]
     if any(not config.is_file() for config in configs):
         raise RunError("配置路径必须指向可读文件")
-    if dual and os.path.samefile(configs[0], configs[1]):
-        raise RunError("两组测试不能使用同一份配置文件")
-    aliases = [task_alias(config) for config in configs] if dual else ["single"]
+    for index, config in enumerate(configs):
+        if any(os.path.samefile(config, previous) for previous in configs[:index]):
+            raise RunError("同批任务不能重复使用同一份配置文件")
+    aliases = [task_alias(config) for config in configs] if explicit else ["single"]
     if len(set(aliases)) != len(aliases):
-        raise RunError("两份配置的任务名冲突，请使用不同配置文件名")
+        raise RunError("配置的任务名冲突，请使用不同配置文件名")
     batch_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:12]
     jobs: list[Job] = []
-    batch_path: Path | None = None
+    batch_path = project_root / "outputs" / "parallel" / batch_id if explicit else None
+    publication_errors: list[str] = []
     with tempfile.TemporaryDirectory(prefix="aisbench-manager-") as temporary:
         private = Path(temporary)
         for index, alias in enumerate(aliases):
             config = configs[index]
-            snapshot = private / (alias + "-config.env")
+            snapshot = private / (str(index) + "-config.env")
             config_bytes = config.read_bytes()
             snapshot.write_bytes(config_bytes)
-            if dual:
+            if explicit:
                 environment = isolated_environment(snapshot, private)
+                default_container = not environment.get("CONTAINER_NAME")
+                default_output = not environment.get("HOST_OUTPUT_DIR")
+                # The shell owns effective defaults such as MODEL_NAME.  Use
+                # provisional resources during its read-only preflight, then
+                # derive final resources from the returned effective model.
                 environment["CONTAINER_NAME"] = environment.get("CONTAINER_NAME") or "ais_bench-" + alias
                 environment["HOST_OUTPUT_DIR"] = (environment.get("HOST_OUTPUT_DIR")
-                                                  or str(project_root / "outputs" / alias))
+                                                  or str(batch_path / "tasks" / alias))
             else:
                 environment = {key: value for key, value in os.environ.items()
                                if key not in INTERNAL_PARAMETERS and key != "SCENARIOS_JSON"}
             job = Job(alias, config, environment)
             job.worker_config = snapshot
             job.config_sha256 = hashlib.sha256(config_bytes).hexdigest()
-            report = private / (alias + "-preflight.json")
+            report = private / (str(index) + "-preflight.json")
             preflight_environment = {**environment, "AISBENCH_MANAGED_WORKER": "1",
                                      "AISBENCH_PREFLIGHT_REPORT": str(report)}
             result = command([bash_executable(), str(script), str(snapshot)],
@@ -517,20 +833,33 @@ def supervise(script: Path, arguments: list[str]) -> int:
                 # dumps the environment/API key; no sourced-file output leaks.
                 for line in (result.stdout + result.stderr).splitlines():
                     emit(alias, line)
-                raise RunError(f"{alias}: 配置预检失败，两组压测均未启动")
-            job.metadata = validate_metadata(read_json(report), alias)
+                raise RunError(f"{alias}: 配置预检失败，本批次所有压测均未启动")
+            raw_metadata = read_json(report)
+            model = raw_metadata.get("model_name", "")
+            job.output_label = task_output_label(alias, model if isinstance(model, str) else "")
+            if explicit:
+                if default_container:
+                    raw_metadata["container_name"] = "aisbench-" + safe_slug(alias, 48) + "-" + batch_id
+                    environment["CONTAINER_NAME"] = raw_metadata["container_name"]
+                if default_output:
+                    raw_metadata["host_output_dir"] = str(batch_path / "tasks" / job.output_label)
+            job.metadata = validate_metadata(raw_metadata, alias, environment)
             # Freeze normalized host paths so the worker cannot use a different
             # path than the path protected by the supervisor's resource lock.
             for field_name, variable in (("host_output_dir", "HOST_OUTPUT_DIR"),
                                          ("model_host_path", "MODEL_HOST_PATH"),
                                          ("tools_host_dir", "TOOLS_HOST_DIR")):
                 job.environment[variable] = job.metadata[field_name]
+            effective = job.metadata.get("effective_config")
+            if isinstance(effective, dict):
+                effective.update(CONTAINER_NAME=job.metadata["container_name"],
+                                 HOST_OUTPUT_DIR=job.metadata["host_output_dir"],
+                                 MODEL_HOST_PATH=job.metadata["model_host_path"],
+                                 TOOLS_HOST_DIR=job.metadata["tools_host_dir"])
             jobs.append(job)
-        if dual:
-            if jobs[0].metadata["container_name"] == jobs[1].metadata["container_name"]:
-                raise RunError("两组 CONTAINER_NAME 相同，请分别配置不同容器名")
-            if paths_overlap(jobs[0].metadata["host_output_dir"], jobs[1].metadata["host_output_dir"]):
-                raise RunError("两组 HOST_OUTPUT_DIR 相同或互为父子目录，请使用互不重叠目录")
+        if len({job.output_label for job in jobs}) != len(jobs):
+            raise RunError("任务与模型生成的输出标记重复，请调整任务文件名")
+        validate_job_conflicts(jobs)
         for job in jobs:
             result = command([docker_executable(job.environment), "info", "--format", "{{.ID}}"], job.environment, 30)
             job.daemon_id = result.stdout.strip()
@@ -542,16 +871,22 @@ def supervise(script: Path, arguments: list[str]) -> int:
             locks.acquire(jobs)
             if _STOP_REQUESTED:
                 return 128 + _STOP_REQUESTED
-            if dual:
-                batch_path = project_root / "outputs" / "parallel" / batch_id
+            if batch_path:
                 batch_path.mkdir(parents=True, exist_ok=False)
-                emit("parallel", "两组共享宿主机资源；若指向同一服务，负载和缓存指标会相互影响")
+            for job in jobs:
+                prepare_task_outputs(Path(job.metadata["host_output_dir"]), job.output_label)
+            if batch_path:
+                for job in jobs:
+                    task_path = batch_path / "tasks" / job.output_label
+                    task_path.mkdir(parents=True, exist_ok=True)
+                    save_effective_config(task_path, job.metadata, job.environment, job.config_sha256)
+                emit("parallel", f"共 {len(jobs)} 组独立服务并行压测，共享宿主机客户端资源")
             try:
                 for job in jobs:
                     if _STOP_REQUESTED:
                         raise RunError("启动已取消")
                     job.run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:12]
-                    job.runtime_path = private / (job.alias + "-runtime.json")
+                    job.runtime_path = private / (job.output_label + "-runtime.json")
                     log_directory = Path(job.metadata["host_output_dir"]) / ".launcher" / job.run_id
                     log_directory.mkdir(parents=True, exist_ok=False)
                     job.launcher_path = log_directory / "launcher.log"
@@ -562,6 +897,8 @@ def supervise(script: Path, arguments: list[str]) -> int:
                     options = _process_options()
                     if os.name == "posix":
                         options["pass_fds"] = locks.descriptors
+                    job.started_at = timestamp()
+                    job.started_monotonic = time.monotonic()
                     job.process = subprocess.Popen(
                         [bash_executable(), str(script), str(job.worker_config)],
                         env=worker_environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -571,22 +908,12 @@ def supervise(script: Path, arguments: list[str]) -> int:
                     job.reader.start()
                     emit(job.alias, f"已启动，启动日志: {job.launcher_path}")
                 write_batch(batch_path, batch_id, jobs)
+                last_refresh = time.monotonic()
                 remaining = list(jobs)
                 while remaining:
                     if _STOP_REQUESTED:
                         emit("manager", "收到停止信号，正在停止本批次任务")
-                        # Stop container work before ending docker-exec clients.
-                        for job in remaining:
-                            cleaned = stop_owned_container(job)
-                            job.state = "cancelled" if cleaned else "cleanup_failed"
-                        for job in remaining:
-                            terminate_process(job.process)
-                            # The worker may have recorded its container between
-                            # the first read and delivery of SIGTERM.  Re-read
-                            # after the host group is gone before releasing locks.
-                            cleaned = stop_owned_container(job)
-                            job.state = "cancelled" if cleaned else "cleanup_failed"
-                            job.exit_code = job.process.returncode
+                        abort_jobs(remaining, True, batch_path, batch_id, jobs)
                         remaining.clear()
                         break
                     for job in list(remaining):
@@ -605,23 +932,25 @@ def supervise(script: Path, arguments: list[str]) -> int:
                         if not complete:
                             cleaned = stop_owned_container(job)
                             job.state = "failed" if cleaned else "cleanup_failed"
+                        finish_job(job, job.state, returncode)
                         remaining.remove(job)
                         write_batch(batch_path, batch_id, jobs)
+                        last_refresh = time.monotonic()
                     if remaining:
+                        if time.monotonic() - last_refresh >= 0.5:
+                            write_batch(batch_path, batch_id, jobs)
+                            last_refresh = time.monotonic()
                         time.sleep(0.1)
             except BaseException:
+                unfinished = []
                 for job in jobs:
                     if job.process is not None:
-                        runtime = read_json(job.runtime_path)
-                        complete = runtime.get("run_id") == job.run_id and runtime.get("complete") is True
-                        if not complete:
-                            stop_owned_container(job)
-                        terminate_process(job.process)
-                        cleaned = True if complete else stop_owned_container(job)
-                        job.exit_code = job.process.returncode
-                        job.state = "failed" if cleaned else "cleanup_failed"
+                        if job.finished_monotonic is not None:
+                            continue
+                        unfinished.append(job)
                     else:
-                        job.state = "not_started"
+                        finish_job(job, "not_started", None)
+                abort_jobs(unfinished, bool(_STOP_REQUESTED), batch_path, batch_id, jobs)
                 raise
             finally:
                 for job in jobs:
@@ -630,12 +959,14 @@ def supervise(script: Path, arguments: list[str]) -> int:
                     if job.log_handle is not None:
                         job.log_handle.close()
                     copy_launcher(job)
-                write_batch(batch_path, batch_id, jobs)
+                publication_errors = write_batch(batch_path, batch_id, jobs, final=True)
             if batch_path:
                 emit("parallel", f"批次结果: {batch_path / 'batch_results.json'}")
             if _STOP_REQUESTED:
                 return 128 + _STOP_REQUESTED
-            return 0 if all(job.state == "success" for job in jobs) else 1
+            for error in publication_errors:
+                emit("parallel", error)
+            return 0 if all(job.state == "success" for job in jobs) and not publication_errors else 1
 
 
 def main(argv: list[str] | None = None) -> int:
