@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+*.local.env
+*.local.json
+VALIDATION_REPORT.md

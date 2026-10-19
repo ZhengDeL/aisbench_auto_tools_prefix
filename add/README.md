@@ -2,7 +2,9 @@
 
 `run_perf_scenarios.sh` 负责管理 AISBench 压测容器、生成运行配置、执行固定并发和摸高搜索，并汇总、归档结果。实际请求仍由项目根目录的 `aisbench_test.py` 发出。
 
-当前版本的基础文件使用[原仓提交 ef2b6d8](https://github.com/rayn-zzz/aisbench_auto_tools_prefix/commit/ef2b6d8653d57487b622b0dc9db458f8a1e8dec6)，功能适配放在 `add/`。根目录只将 IP 示例改为 `192.168.1.x`，其余基础逻辑沿用原仓。底层参数与数据集生成方式见[上层 README](../README.md)。
+**所有增补功能和公开配置仅放在 `add/`，`add/` 之外原样复用上游。** 当前基线为 [rayn-zzz/aisbench_auto_tools_prefix 提交 ef2b6d8](https://github.com/rayn-zzz/aisbench_auto_tools_prefix/commit/ef2b6d8653d57487b622b0dc9db458f8a1e8dec6)，完整提交号为 `ef2b6d8653d57487b622b0dc9db458f8a1e8dec6`。外层文件清单、内容字节和 Git 文件模式与该提交一致；根目录的 `config.py`、`default_api.py`、README 及上游示例均保持原样，不新增外层 `.gitignore` 或 `.github` 工作流。底层参数与数据集生成方式见[上层 README](../README.md)。
+
+本版开发分支为 `feat/n-config-runs-20261019`，版本标签为 `v2026.10.19-n-config-upstream-clean`。更新基础仓时，先确认新的上游提交，再原样同步全部 `add/` 之外的文件、更新 `add/upstream_manifest.json` 基线及 `validate_publication.py` 中固定的提交号和清单校验值，并执行发布检查；兼容适配继续放在 `add/`。运行配置只写入各任务压测容器里的源码副本，不回写本地上游文件。
 
 ## 1. 运行条件
 
@@ -398,6 +400,8 @@ python3 validate_result_integrity.py \
 | [aisbench_perf_matrix_config.py](aisbench_perf_matrix_config.py) | 搜索引擎默认配置、指标列名和扩容限制 |
 | [aisbench_result_adapter.py](aisbench_result_adapter.py) | 按列名读取源 CSV、检查关键指标并投影汇总字段 |
 | [aisbench_artifact_archive.py](aisbench_artifact_archive.py) | 保存固定测试原始产物和本轮输出快照 |
+| [upstream_manifest.json](upstream_manifest.json) | 固定上游提交、外层文件清单、SHA256 和 Git 文件模式基线 |
+| [validate_publication.py](validate_publication.py) | 外层基线一致性、公开地址、凭据和产物发布检查 |
 | [validate_addon.py](validate_addon.py) | 离线插件检查 |
 | [validate_e2e_outputs.py](validate_e2e_outputs.py) | 运行后产物检查 |
 | [validate_result_integrity.py](validate_result_integrity.py) | 运行后汇总与源结果字段追溯 |
@@ -408,11 +412,19 @@ python3 validate_result_integrity.py \
 
 ## 公开发布检查
 
-公开配置、注释和文档统一使用 `192.168.1.x` 示例地址。`127.0.0.1` 等回环地址和 `0.0.0.0` 监听地址保留其程序语义。真实地址、鉴权信息、运行日志及本地分析材料放在被忽略的本地配置或输出目录。提交前在仓库根目录执行以下检查；如果当前位于 `add/` 目录，先执行 `cd ..`：
+本工具自己的 `add/` 配置、注释和文档统一使用 `192.168.1.x` 示例地址。`127.0.0.1` 等回环地址和 `0.0.0.0` 监听地址保留其程序语义。外层上游文件中原本公开的示例地址保持上游原样；它们与用户部署地址分开处理，不能为替换示例而修改外层文件。
+
+`add/upstream_manifest.json` 记录可信上游提交的完整外层文件清单、SHA256 和 Git 模式。发布检查先确认外层完整匹配，只有通过该检查的上游原文件才豁免本工具的示例地址规则；任何外层新增、删除、改动或换行变化均会被拒绝。`add/` 中的新增内容仍严格检查示例网段、凭据及产物，不能通过改写清单或扩大地址白名单绕过审查。更新基线前必须先核对实际上游提交。
+
+真实部署地址、鉴权信息、日志和压测产物留在本地配置或输出目录。`add/` 下本地配置由其忽略规则保护，仓库根目录生成物可在本机 `.git/info/exclude` 中忽略；该文件是本机 Git 元数据，不加入发布内容，也不改变外层上游文件。提交时只添加本轮需要的 `add/` 文件，并检查暂存清单。
+
+提交前在仓库根目录执行以下检查；如果当前位于 `add/` 目录，先执行 `cd ..`：
 
 ```bash
-python3 add/validate_publication.py
-python3 add/validate_addon.py
+python3 -B add/validate_publication.py
+python3 -B add/validate_addon.py
+python3 -B -m unittest discover -s add -p 'test_*.py'
+git diff --cached --name-status
 ```
 
-发布扫描会检查 Git 实际跟踪的文件；无 `.git` 的交付包按公开源码目录检查。提交本地配置、日志、压测产物或真实网络地址会被拒绝。GitHub 工作流也执行同样的检查。
+发布扫描检查 Git 实际跟踪的文件；无 `.git` 的交付包按公开源码目录和基线检查。提交本地配置、日志、压测产物或用户真实网络地址会被拒绝。为了保持上游外层原样，本分支不在仓库根目录新增 GitHub Actions 工作流；可用 `bash add/check_all.sh` 一次执行上述检查。本版需实际执行本地检查，不能以旧分支的 CI 状态代替。

@@ -1,0 +1,46 @@
+{
+  "repository": "https://github.com/rayn-zzz/aisbench_auto_tools_prefix",
+  "commit": "ef2b6d8653d57487b622b0dc9db458f8a1e8dec6",
+  "files": {
+    "GSM8K.jsonl": {
+      "sha256": "fb581f0270b25988e071316835842a1c8449f4e27af6fc0f539ef270b987f9ff",
+      "mode": "100644"
+    },
+    "LICENSE": {
+      "sha256": "4ec08cd8c3921e08d8bb2b79cf38a2795942e5c35bec8399a1a2c6c1735ca259",
+      "mode": "100644"
+    },
+    "README.md": {
+      "sha256": "61f91015b7630aace9381dde1c42f1543252daa8b325168ccb4fc8be5d7962f5",
+      "mode": "100755"
+    },
+    "aisbench_test.py": {
+      "sha256": "cdee0b15a5baa471740bcd69dd243b1cad3876b1bfaa1b5d3eac4aa9b97fa37a",
+      "mode": "100644"
+    },
+    "cal_prefix_hit_rate.py": {
+      "sha256": "07e0ac9c4084f7d5bc58e1c39cabe1c7753db9749c7e1f6cc4b17ce7839c138d",
+      "mode": "100644"
+    },
+    "config.py": {
+      "sha256": "32a8d4188bbb3319502905d7f98663c8cb3b8c65ea606077ba1fb1453f7e89eb",
+      "mode": "100755"
+    },
+    "data_picker.py": {
+      "sha256": "6a3c3960b338c84e767cc92d790bbb0f26ca585d9f9a2ce23b3c44e679554f4d",
+      "mode": "100644"
+    },
+    "default_api.py": {
+      "sha256": "10bf4220fa786299c3b0f6296fce1e9ad830dc2c8f4aabe1865ef9812774c778",
+      "mode": "100644"
+    },
+    "generate_dataset.py": {
+      "sha256": "8e4d0d04e17ab8a6a8d45b7e4d1c2fc6d0cbd608f534440718c77519545b6f5a",
+      "mode": "100644"
+    },
+    "save_file.py": {
+      "sha256": "f664683e69c35a7af39c9a4e897b5ec60ccdbcc70e583f31fe3c9b24f63fe756",
+      "mode": "100755"
+    }
+  }
+}
