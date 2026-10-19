@@ -361,9 +361,9 @@ class WorkerPeakPublicationContracts(unittest.TestCase):
         self.scene = self.plan['peak'][0]
         self.session = self.worker.output / ('peak_fixture_' + self.worker.run_id + '_1')
 
-    def write_trial(self, ordinal):
+    def write_trial(self, ordinal, input_len='16', output_len='4'):
         raw = dict.fromkeys(CANONICAL_COLUMNS, '1')
-        raw.update(current_time='2026-10-20 01:00:00', input_len='16', output_len='4', total_req='8',
+        raw.update(current_time='2026-10-20 01:00:00', input_len=input_len, output_len=output_len, total_req='8',
                    max_cc='2', cc='1.9', rr='0', repeat_rate='0')
         folder = self.session / 'live_peak' / ('trial_' + str(ordinal))
         folder.mkdir(parents=True)
@@ -454,6 +454,11 @@ class WorkerPeakPublicationContracts(unittest.TestCase):
         _, row, reason = selected_measurement(loaded, self.worker.output)
         self.assertEqual(reason, '')
         self.assertTrue(all(row[name] == '' for name in CANONICAL_COLUMNS[1:]))
+        self.worker.append_row(self.scene, row, 'passed', scope=selected,
+                               evaluation_file=str(second_file), test_accuracy=True)
+        self.assertEqual((self.worker.rows[-1]['input_len'], self.worker.rows[-1]['output_len']), ('', ''))
+        self.assertEqual((self.worker.scopes[-1]['configured_input_len'], self.worker.scopes[-1]['configured_output_len']),
+                         (self.scene['input_len'], self.scene['output_len']))
 
     def test_partial_timeout_round_has_no_selected_measurement_or_numeric_fallback(self):
         for state in ('ERROR', 'REQUEST_ERROR'):
@@ -476,6 +481,7 @@ class WorkerPeakPublicationContracts(unittest.TestCase):
                                   timed_out=state == 'ERROR', main_scopes=[scope], scopes=[scope])
                     file.write_text(json.dumps(report), encoding='utf-8')
                     trial = dict(trial_id='trial_1', measurement_state=state, concurrency=2,
+                                 input_len=self.scene['input_len'], output_len=self.scene['output_len'],
                                  evaluation_file=self.worker.container_path(file))
                     best = dict(case_name=self.scene['name'], passed='no',
                                 status='peak_budget' if state == 'ERROR' else 'peak_request_error',
@@ -494,9 +500,10 @@ class WorkerPeakPublicationContracts(unittest.TestCase):
                 self.assertEqual(json.loads(evaluation.read_text())['scopes'][0]['state'], state)
                 checks = validate_results(self.worker.result, self.worker.output, True)
                 self.assertFalse([detail for name, ok, detail in checks if not ok and name != 'final states successful'])
-                with self.assertRaisesRegex(ValueError, 'unmeasured scope'):
-                    check_indexed_row(dict(self.worker.rows[0], total_req='4'), self.worker.scopes[0],
-                                      self.worker.result, self.worker.output, set())
+                for field in ('total_req', 'input_len', 'output_len'):
+                    with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'unmeasured scope'):
+                        check_indexed_row(dict(self.worker.rows[0], **{field: '4'}), self.worker.scopes[0],
+                                          self.worker.result, self.worker.output, set())
 
     def test_worker_rejects_request_error_missing_id_and_missing_original_csv(self):
         for ordinal, mode in enumerate(('REQUEST_ERROR', 'missing_id', 'missing_csv', 'duplicate_id'), 1):
@@ -532,6 +539,8 @@ class WorkerPeakPublicationContracts(unittest.TestCase):
         self.assertEqual(self.worker.rows[0]['status'], 'failed')
         self.assertEqual(self.worker.scopes[0]['measurement_state'], 'ERROR')
         self.assertTrue(all(not self.worker.rows[0][name] for name in CANONICAL_COLUMNS))
+        self.assertEqual(self.worker.scopes[0]['configured_input_len'], scene['input_len'])
+        self.assertEqual(self.worker.scopes[0]['configured_output_len'], scene['output_len'])
         verify_archive_manifest(self.worker.result / 'fixed_1' / 'archive_manifest.json')
         self.worker.index = 2
         def request_error(arguments, timeout):
@@ -558,23 +567,59 @@ class WorkerPeakPublicationContracts(unittest.TestCase):
         checks = validate_results(self.worker.result, self.worker.output, True)
         self.assertFalse([detail for name, ok, detail in checks if not ok
                           and name not in {'final states successful', 'csv no failed/no_result'}])
-        with self.assertRaisesRegex(ValueError, 'unmeasured scope'):
-            check_indexed_row(dict(self.worker.rows[-1], total_req='4'), self.worker.scopes[-1],
-                              self.worker.result, self.worker.output, set())
+        for field in ('total_req', 'input_len', 'output_len'):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'unmeasured scope'):
+                check_indexed_row(dict(self.worker.rows[-1], **{field: '4'}), self.worker.scopes[-1],
+                                  self.worker.result, self.worker.output, set())
 
     def test_absent_selected_evaluation_never_reads_current_directory(self):
-        def run_container(arguments, timeout, on_progress=None):
-            best = dict(case_name=self.scene['name'], status='peak_budget', passed='no',
-                        termination='budget_limit', evaluation_file='', selected_scope_id='', selected_trial_id='')
-            self.write_report(dict(best=[best], all=[], complete=True), seal=True)
-            return 1
-        with patch.object(self.worker, 'run_container', side_effect=run_container), \
-                patch.object(self.worker, 'evaluation', side_effect=AssertionError('must not resolve empty evidence')) as reader:
-            self.assertFalse(self.worker.peak(self.scene))
-            reader.assert_not_called()
+        for status in ('peak_budget', 'peak_no_pass', 'peak_error', 'peak_request_error',
+                       'peak_cancelled', 'peak_unstable'):
+            with self.subTest(status=status):
+                self.worker.rows.clear(); self.worker.scopes.clear()
+                self.worker.run_id += '_' + status
+                self.session = self.worker.output / ('peak_fixture_' + self.worker.run_id + '_1')
+                def run_container(arguments, timeout, on_progress=None):
+                    # Reproduce the source10 budget report: plan lengths masqueraded as measurements.
+                    best = dict(case_name=self.scene['name'], status=status, passed='no',
+                                input_len=self.scene['input_len'], output_len=self.scene['output_len'],
+                                termination='budget_limit', evaluation_file='', selected_scope_id='', selected_trial_id='')
+                    self.write_report(dict(best=[best], all=[], complete=True), seal=True)
+                    return 1
+                with patch.object(self.worker, 'run_container', side_effect=run_container), \
+                        patch.object(self.worker, 'evaluation', side_effect=AssertionError('must not resolve empty evidence')) as reader:
+                    self.assertFalse(self.worker.peak(self.scene))
+                    reader.assert_not_called()
+                self.assertEqual(self.worker.rows[0]['status'], status)
+                self.assertTrue(all(not self.worker.rows[0][name] for name in CANONICAL_COLUMNS))
+                self.assertEqual(self.worker.scopes[0]['configured_input_len'], self.scene['input_len'])
+                self.assertEqual(self.worker.scopes[0]['configured_output_len'], self.scene['output_len'])
+                checks = validate_results(self.worker.result, self.worker.output, True)
+                self.assertFalse([detail for name, ok, detail in checks if not ok and name != 'final states successful'])
+                for field in ('input_len', 'output_len'):
+                    with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'unmeasured scope'):
+                        check_indexed_row(dict(self.worker.rows[0], **{field: '4'}), self.worker.scopes[0],
+                                          self.worker.result, self.worker.output, set())
         with self.assertRaises(ValueError):
             self.worker.evaluation(Path('evaluation.json'))
-        self.assertEqual(self.worker.rows[0]['status'], 'peak_budget')
+
+    def test_budget_with_confirmed_scope_preserves_actual_lengths_not_scene_plan(self):
+        def run_container(arguments, timeout, on_progress=None):
+            trial = self.write_trial(1, input_len='15.5', output_len='3.5')
+            best = dict(trial, status='peak_budget', termination='budget_limit', passed='yes',
+                        selected_trial_id=trial['trial_id'])
+            self.write_report(dict(best=[best], all=[trial], complete=True), seal=True)
+            return 1
+        with patch.object(self.worker, 'run_container', side_effect=run_container):
+            self.assertFalse(self.worker.peak(self.scene))
+        self.assertEqual([row['status'] for row in self.worker.rows], ['peak_round', 'peak_budget'])
+        for row, entry in zip(self.worker.rows, self.worker.scopes):
+            self.assertEqual((row['input_len'], row['output_len']), ('15.5', '3.5'))
+            self.assertEqual((entry['configured_input_len'], entry['configured_output_len']),
+                             (self.scene['input_len'], self.scene['output_len']))
+            self.assertEqual(entry['selected_scope_id'], 'scope_001')
+        checks = validate_results(self.worker.result, self.worker.output, True)
+        self.assertFalse([detail for name, ok, detail in checks if not ok and name != 'final states successful'])
 
     def test_incomplete_or_unsealed_final_report_cannot_publish_a_success(self):
         for incomplete, sealed in ((True, True), (False, False)):

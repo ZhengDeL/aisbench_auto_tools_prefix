@@ -80,6 +80,29 @@ class VerifiedPeakTests(unittest.TestCase):
         self.assertIsNotNone(engine.summary()["highest_observed"])
         self.assertIsNone(engine.summary()["highest_confirmed"])
 
+    def test_unmeasured_peak_reports_never_replace_lengths_with_configured_values(self):
+        best, engine, history = self.search(lambda *_: "PASS", cap=0, max_trials=3)
+        self.assertIsNone(best)
+        summary = matrix.write_case_summary(engine.case, engine.config, self.root, best, history)
+        self.assertEqual((summary['input_len'], summary['output_len']), ('', ''))
+        self.assertEqual((summary['configured_input_len'], summary['configured_output_len']), (1024, 512))
+        self.assertEqual(json.loads((self.root / 'case_summary.json').read_text())['case']['input_len'], 1024)
+        # A failed/partial round has no raw metrics. The standalone live CSV must remain unmeasured too.
+        result = history[-1]
+        result.metrics = {}; result.csv_row = {}; result.selected_scope_id = ''
+        row = matrix.trace_row(engine.case, result, engine.config)
+        self.assertEqual((row['input_len'], row['output_len']), ('', ''))
+        self.assertEqual((row['configured_input_len'], row['configured_output_len']), (1024, 512))
+        file = self.root / 'live.csv'
+        matrix.append_live_peak_round(str(file), engine.case, result, '0')
+        with file.open(newline='', encoding='utf-8') as stream:
+            live = next(csv.DictReader(stream))
+        self.assertTrue(all(not live[name] for name in CANONICAL_COLUMNS))
+        # Valid measured means are preserved even when they differ from both configured token limits.
+        result.metrics = result.csv_row = dict(input_len='1001.25', output_len='477.5')
+        row = matrix.trace_row(engine.case, result, engine.config)
+        self.assertEqual((row['input_len'], row['output_len']), ('1001.25', '477.5'))
+
     def test_invalid_retry_counts_and_request_error_never_shrinks_boundary(self):
         best, engine, _ = self.search(lambda cc, profile, n: "INVALID" if n == 1 else "PASS", cap=2)
         self.assertEqual(engine.termination, "capped")

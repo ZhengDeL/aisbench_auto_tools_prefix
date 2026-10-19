@@ -304,14 +304,18 @@ class Worker:
             output_root=str(self.output), csv_sha256=hashlib.sha256(content).hexdigest()))
 
     def append_row(self, scene, raw, status, *, evaluation_file='', scope=None, **metadata):
-        values = {name: str(raw.get(name, '')) for name in CANONICAL_COLUMNS}
+        # Canonical values describe the selected measurement, never the scene plan.
+        measured = raw if scope else {}
+        values = {name: str(measured.get(name, '')) for name in CANONICAL_COLUMNS}
         repeat = raw.get('repeat_rate', scene.get('repeat_rate', '0'))
         if str(repeat).endswith('%'):
             repeat = str(float(str(repeat)[:-1]) / 100)
         row = dict(scenario=scene['name'], **values, repeat_rate=str(repeat), status=status)
         self.scopes.append(dict(row_index=len(self.rows), scenario=row['scenario'], current_time=row['current_time'],
             status=status, evaluation_file=evaluation_file, scope=scope or {},
-            selected_scope_id=(scope or {}).get('scope_id', ''), **metadata))
+            selected_scope_id=(scope or {}).get('scope_id', ''),
+            configured_input_len=scene.get('input_len', ''), configured_output_len=scene.get('output_len', ''),
+            **metadata))
         self.rows.append(row)
         self.save_rows()
 

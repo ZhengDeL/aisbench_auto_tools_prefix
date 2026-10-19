@@ -295,7 +295,8 @@ def check_indexed_row(row: dict, entry: dict, result_dir: Path, host_output_dir:
         if row['status'] in SUCCESS_STATES:
             raise ValueError("invalid measurement cannot be successful")
         validate_summary_row(row)
-        if any(str(row.get(name, '')).strip() for name in (*PERFORMANCE_COLUMNS, 'total_req', 'max_cc')):
+        if any(str(row.get(name, '')).strip() for name in
+               (*PERFORMANCE_COLUMNS, 'input_len', 'output_len', 'total_req', 'max_cc')):
             raise ValueError('unmeasured scope cannot contain measured performance or request counts')
         return
     selected, scopes = indexed_scope(entry, result_dir, host_output_dir, verified_manifests)

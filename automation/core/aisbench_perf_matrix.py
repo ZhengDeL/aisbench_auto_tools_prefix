@@ -768,8 +768,10 @@ def trace_row(case: SearchCase, result: EvaluationResult, config: RunnerConfig) 
     row.update(
         {
             "case_name": case.name,
-            "input_len": row.get("input_len", case.input_len),
-            "output_len": row.get("output_len", case.output_len),
+            "input_len": row.get("input_len", ""),
+            "output_len": row.get("output_len", ""),
+            "configured_input_len": case.input_len,
+            "configured_output_len": case.output_len,
             "sequence_id": result.sequence_id,
             "concurrency": result.concurrency,
             "num_prompts": result.num_prompts,
@@ -1049,8 +1051,10 @@ def write_case_summary(
     trace_rows = [trace_row(case, item, config) for item in history]
     best_row = trace_row(case, best_result, config) if best_result is not None else {
         "case_name": case.name,
-        "input_len": case.input_len,
-        "output_len": case.output_len,
+        "input_len": "",
+        "output_len": "",
+        "configured_input_len": case.input_len,
+        "configured_output_len": case.output_len,
         "passed": "no",
         "reason": "未找到满足阈值的并发",
         "request_rate": case.request_rate,
@@ -1088,8 +1092,8 @@ def append_live_peak_round(csv_path: str, case: SearchCase, result: EvaluationRe
     metrics = dict(result.csv_row or result.metrics or {})
     values = [
         case.name,
-        metrics.get("current_time", ""), metrics.get("input_len", case.input_len),
-        metrics.get("output_len", case.output_len), metrics.get("total_req", ""),
+        metrics.get("current_time", ""), metrics.get("input_len", ""),
+        metrics.get("output_len", ""), metrics.get("total_req", ""),
         metrics.get("max_cc", ""), metrics.get("cc", ""), metrics.get("rr", ""),
         metrics.get("TTFT avg", ""), metrics.get("TTFT P90", ""), metrics.get("TPOT avg", ""),
         metrics.get("TPOT SLO_P90", ""), metrics.get("E2E_time", ""), metrics.get("output_throughput", ""),
