@@ -1052,6 +1052,8 @@ def simulate_shell_batch_failures() -> None:
         for index, (name, output, process_exit, limit, statuses, expected_exit, expected_passes) in enumerate(cases):
             job_root = root / str(index)
             job_root.mkdir()
+            results = job_root / "scenario_results" / "offline"
+            results.mkdir(parents=True)
             scenario = 'case, "quoted"'
             peak = name in ("missing peak result", "quoted peak success")
             report = job_root / "peak.json"
@@ -1063,7 +1065,7 @@ def simulate_shell_batch_failures() -> None:
                 **os.environ, "FIXED_COUNT": "0" if peak else str(len(statuses)), "PEAK_COUNT": "1" if peak else "0",
                 "TOTAL_TESTS": str(len(statuses)), "COMBOS": "" if peak else combos,
                 "PEAK_COMBOS": scenario + '_peak|16|4|1|2|1|0|30|50|0|', "RUN_TIMESTAMP": "offline",
-                "HOST_OUTPUT_DIR": str(job_root), "RESULTS_HOST_DIR": str(job_root),
+                "HOST_OUTPUT_DIR": str(job_root), "RESULTS_HOST_DIR": str(results),
                 "RESULTS_CSV": str(job_root / "summary.csv"), "RESULTS_LOG": str(job_root / "execution.log"),
                 "WORK_PATH_DETECTED": "/unused", "TOOL_ROOT": "/unused", "CONTAINER_NAME": "offline", "CURRENT_ID": "offline",
                 "CONTAINER_OUTPUT_DIR": "/unused", "HOST_IP": "localhost", "HOST_PORT": "8000",
@@ -1288,6 +1290,9 @@ def main() -> int:
     failed = sum(1 for item in checks if item.status == "FAIL")
     warned = sum(1 for item in checks if item.status == "WARN")
     print(f"PASS={sum(1 for item in checks if item.status == 'PASS')} WARN={warned} FAIL={failed}")
+    for item in checks:
+        if item.status == "FAIL":
+            print(f"FAIL: {item.name}: {item.detail}")
     return 1 if failed else 0
 
 
