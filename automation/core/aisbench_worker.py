@@ -15,7 +15,7 @@ import time
 import uuid
 from aisbench_configuration import PEAK_NEW_DEFAULTS, build_plan, effective_environment, read_scenarios
 from aisbench_logging import REDACTOR, timestamp, validate_output_path, private_binary
-from aisbench_result_adapter import CANONICAL_COLUMNS, SUMMARY_COLUMNS, normalize_result
+from aisbench_result_adapter import CANONICAL_COLUMNS, SUMMARY_COLUMNS, selected_measurement
 from aisbench_artifact_archive import write_archive_manifest, path_is_relative_to
 
 AUTOMATION_ROOT = Path(__file__).resolve().parent
@@ -321,9 +321,17 @@ class Worker:
         if not file.is_file():
             return {}, {}
         report = self.convert_paths(json.loads(file.read_text(encoding='utf-8')))
+        scope, row, reason = selected_measurement(report, self.output)
+        if scope:
+            report['raw_row'] = row
+        else:
+            if report.get('selected_scope_id'):
+                report['reported_selected_scope_id'] = report['selected_scope_id']
+            report.update(selected_scope_id='', raw_row={}, selection_reason=reason)
+            if report.get('state') in {'PASS', 'SLO_FAIL', 'UNSTABLE'}:
+                report.update(state='INVALID', reason='selected measurement unavailable: ' + reason)
         atomic_json(file, report)
-        main = report.get('main_scopes') or [s for s in report.get('scopes', []) if s.get('phase') == 'main']
-        return report, main[-1] if main else {}
+        return report, scope
 
     def fixed(self, scene):
         self.current, self.phase = scene['name'], 'fixed'
@@ -341,11 +349,7 @@ class Worker:
         file = evidence / 'evaluation.json'
         report, scope = self.evaluation(file)
         passed = rc == 0 and report.get('state') == 'PASS' and bool(scope)
-        try:
-            raw = normalize_result(scope.get('raw_row') or {}, test_type=scene['test_type'], test_accuracy=scene['accuracy']) if passed else {}
-        except ValueError as error:
-            self.log('invalid_result', str(error), level='ERROR', evidence=str(file))
-            raw, passed = {}, False
+        raw = dict(report.get('raw_row') or {}) if passed else {}
         self.append_row(scene, raw, 'passed' if passed else 'failed', evaluation_file=str(file), scope=scope,
                         test_type=scene['test_type'], test_accuracy=scene['accuracy'],
                         measurement_state=report.get('state', 'ERROR'))

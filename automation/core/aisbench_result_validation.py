@@ -290,7 +290,7 @@ def check_indexed_row(row: dict, entry: dict, result_dir: Path, host_output_dir:
         if row['status'] in SUCCESS_STATES and best[0].get('passed') not in {'yes', True}:
             raise ValueError('final successful peak is not a passing measurement')
     unmeasured = not entry.get("selected_scope_id") and not entry.get("scope")
-    if unmeasured and (entry.get("measurement_state") in {"ERROR", "INVALID", "CANCELLED"}
+    if unmeasured and (entry.get("measurement_state") in {"ERROR", "INVALID", "REQUEST_ERROR", "CANCELLED"}
                        or row['status'] in PEAK_FINAL_STATES - SUCCESS_STATES):
         if row['status'] in SUCCESS_STATES:
             raise ValueError("invalid measurement cannot be successful")

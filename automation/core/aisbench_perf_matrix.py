@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from aisbench_artifact_archive import write_archive_manifest
-from aisbench_result_adapter import invalid_result_reason, read_last_result
+from aisbench_result_adapter import invalid_result_reason, read_last_result, normalize_scope_row, selected_measurement
 from aisbench_execution import execute_native, atomic_json, request_count_file
 sys.dont_write_bytecode = True
 
@@ -136,6 +136,9 @@ class EvaluationResult:
     selected_scope_id: str = ""
     scopes: List[Dict[str, Any]] = field(default_factory=list)
     evaluation_file: str = ""
+    timed_out: bool = False
+    execution_timeout: Optional[float] = None
+    timeout_source: str = "trial"
 
 
 def parse_args() -> Tuple[argparse.Namespace, List[str]]:
@@ -672,6 +675,7 @@ def build_run_command(config: RunnerConfig, case: SearchCase, concurrency: int, 
 def run_single_evaluation(
     case: SearchCase, config: RunnerConfig, case_dir: Path, sequence_id: int,
     concurrency: int, logger: logging.Logger, profile: str = "explore", timeout=None,
+    timeout_source: str = "trial",
 ) -> EvaluationResult:
     num_prompts = calculate_num_prompts(concurrency, case.request_multiplier)
     if profile == "confirm":
@@ -679,8 +683,9 @@ def run_single_evaluation(
     run_dir = case_dir / f"run_{sequence_id:03d}_cc_{concurrency}_{profile}"
     command = build_run_command(config, case, concurrency, num_prompts)
     logger.info("开始执行 case=%s cc=%s requests/scope=%s profile=%s", case.name, concurrency, num_prompts, profile)
+    execution_timeout = case.trial_timeout if timeout is None else timeout
     report = execute_native(BASE_DIR, run_dir, command[2:],
-                            timeout=timeout or case.trial_timeout,
+                            timeout=execution_timeout,
                             failed_req_limit=config.failed_req_limit,
                             python_bin=config.python_bin, native_script=AISBENCH_TEST_SCRIPT)
     state, reason = report["state"], report["reason"]
@@ -688,8 +693,11 @@ def run_single_evaluation(
     if state == "PASS":
         outcomes = []
         for scope in main_scopes:
-            raw = scope.get("raw_row", {})
-            invalid = invalid_result_reason(raw, (config.ttft_column, config.tpot_column))
+            try:
+                raw = normalize_scope_row(scope, run_dir)
+                invalid = invalid_result_reason(raw, (config.ttft_column, config.tpot_column))
+            except (OSError, ValueError, TypeError, KeyError, csv.Error) as error:
+                raw, invalid = {}, 'original scope CSV unavailable: ' + str(error)
             if profile == "confirm" and case.confirm_min_requests > 0:
                 counts = scope.get("counts", {})
                 success = parse_metric_float(counts.get("success", scope.get("success_requests", "")))
@@ -721,27 +729,35 @@ def run_single_evaluation(
             state, reason = "SLO_FAIL", "all main scopes exceed configured SLO"
         else:
             state, reason = "UNSTABLE", "repeat scopes disagree under the same trial"
-    row = dict(report.get("raw_row", {}))
-    if state in {"ERROR", "INVALID"}:
-        row = {}
-    last_scope = main_scopes[-1] if main_scopes else {}
+    selection_report = dict(report, state=state)
+    selected, row, selection_reason = selected_measurement(selection_report, run_dir)
+    if not selected and state in {"PASS", "SLO_FAIL", "UNSTABLE"}:
+        state, reason = "INVALID", "selected measurement unavailable: " + selection_reason
+    selected_scope_id = selected.get("scope_id", "")
+    if report.get("selected_scope_id") and not selected:
+        report["reported_selected_scope_id"] = report["selected_scope_id"]
     result = EvaluationResult(
         sequence_id=sequence_id, concurrency=concurrency, num_prompts=num_prompts,
         passed=state == "PASS", reason=reason, return_code=report.get("return_code") or 0,
         metrics=row, csv_row=row, command=command, run_dir=str(run_dir),
-        process_log=report["stdout_log"], aisbench_log=last_scope.get("stdout_log", ""),
-        aisbench_all_log=report["stderr_log"], result_csv=last_scope.get("result_csv", ""),
-        captured_outputs_dir=last_scope.get("artifact_dir", ""), state=state, profile=profile,
-        trial_id=report["trial_id"], selected_scope_id=report.get("selected_scope_id", ""),
+        process_log=report["stdout_log"], aisbench_log=selected.get("stdout_log", ""),
+        aisbench_all_log=report["stderr_log"], result_csv=selected.get("source_csv") or selected.get("result_csv", ""),
+        captured_outputs_dir=selected.get("artifact_dir", ""), state=state, profile=profile,
+        trial_id=report["trial_id"], selected_scope_id=selected_scope_id,
         scopes=report["scopes"], evaluation_file=str(run_dir / "evaluation.json"),
+        timed_out=report.get("timed_out") is True,
+        execution_timeout=execution_timeout, timeout_source=timeout_source,
     )
     # Keep execution details and searchable peak policy together in one document.
-    report.update(peak_evaluation=asdict(result), state=state, reason=reason, profile=profile)
+    report.update(peak_evaluation=asdict(result), state=state, reason=reason, profile=profile,
+                  selected_scope_id=selected_scope_id, raw_row=row, selection_reason=selection_reason)
     atomic_json(run_dir / "evaluation.json", report)
     atomic_json(run_dir / "request_meta.json", dict(case=asdict(case), sequence_id=sequence_id,
                                                    concurrency=concurrency, num_prompts=num_prompts,
                                                    profile=profile, ttft_column=config.ttft_column,
-                                                   tpot_column=config.tpot_column))
+                                                   tpot_column=config.tpot_column,
+                                                   execution_timeout=execution_timeout,
+                                                   timeout_source=timeout_source))
     (run_dir / "command.txt").write_text(format_command(command) + "\n", encoding="utf-8")
     logger.info("单轮完成 case=%s cc=%s state=%s reason=%s", case.name, concurrency, state, reason)
     return result
@@ -819,11 +835,20 @@ class PeakSearcher:
             return self.cache[key][-1]
         for attempt in range(self.case.invalid_retries + 1):
             self._check_budget()
+            remaining = self.remaining
+            if remaining <= 0:
+                raise SearchStop("budget_limit", "total elapsed time budget exhausted before trial")
+            budget_limited = remaining < self.case.trial_timeout
             result = run_single_evaluation(
                 case=self.case, config=self.config, case_dir=self.case_dir,
                 sequence_id=len(self.history) + 1, concurrency=concurrency, logger=self.logger,
-                profile=self.profile, timeout=min(self.case.trial_timeout, self.remaining),
+                profile=self.profile, timeout=min(self.case.trial_timeout, remaining),
+                timeout_source="total_budget" if budget_limited else "trial",
             )
+            # Capture this before publication/waiting can consume the remaining
+            # budget. A real process or I/O error must retain its own cause.
+            total_budget_timeout = (result.state == "ERROR" and result.timed_out is True
+                                    and budget_limited and self.remaining <= 0)
             if not result.state:  # Compatibility for independent injected evaluators.
                 result.state = "PASS" if result.passed else "SLO_FAIL"
             result.profile = self.profile
@@ -843,6 +868,8 @@ class PeakSearcher:
             if result.state == "REQUEST_ERROR":
                 raise SearchStop("request_error", result.reason)
             if result.state == "ERROR":
+                if total_budget_timeout:
+                    raise SearchStop("budget_limit", "total elapsed time budget exhausted during trial")
                 raise SearchStop("error", result.reason)
             if result.state == "UNSTABLE":
                 raise SearchStop("unstable", result.reason)

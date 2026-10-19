@@ -305,6 +305,58 @@ def read_accuracy_scope(scope: Mapping[str, Any], base_dir: Path | None = None) 
             'artifacts': artifacts, 'independently_scored': bool(scored), 'recomputed': scored}
 
 
+def selected_measurement(report: Mapping[str, Any], base_dir: Path) -> tuple[dict, dict, str]:
+    """Resolve an explicit completed main scope without selecting diagnostics."""
+    if report.get('state') not in {'PASS', 'SLO_FAIL', 'UNSTABLE'}:
+        return {}, {}, 'execution or measurement is not complete and usable'
+    if type(report.get('return_code')) is not int or report['return_code'] != 0:
+        return {}, {}, 'execution has no successful process completion'
+    identity = report.get('selected_scope_id')
+    if not isinstance(identity, str) or not identity:
+        return {}, {}, 'selected_scope_id is missing'
+    scopes = report.get('scopes', report.get('main_scopes', []))
+    if not isinstance(scopes, list) or any(not isinstance(item, dict) for item in scopes):
+        return {}, {}, 'invalid original scope list'
+    matches = [item for item in scopes if item.get('scope_id') == identity]
+    if len(matches) != 1 or matches[0].get('phase') != 'main':
+        return {}, {}, 'selected scope is missing, duplicated or not main'
+    scope = matches[0]
+    if 'main_scopes' in report:
+        main = report['main_scopes']
+        matches = [item for item in main if isinstance(item, dict) and item.get('scope_id') == identity] if isinstance(main, list) else []
+        if len(matches) != 1 or matches[0] != scope:
+            return {}, {}, 'selected main differs from original scope'
+    if (scope.get('state') not in {'PASS', 'SLO_FAIL'}
+            or type(scope.get('return_code')) is not int or scope['return_code'] != 0):
+        return {}, {}, 'selected scope did not complete a usable measurement'
+    try:
+        source = scope.get('source_csv') or scope.get('result_csv')
+        if not source:
+            raise ValueError('selected scope has no original CSV')
+        path = Path(str(source))
+        if not path.is_absolute():
+            path = base_dir / path
+        if not path_is_relative_to(path.resolve(), base_dir.resolve()):
+            raise ValueError('selected original CSV is outside this execution output')
+        row = normalize_scope_row(scope, base_dir)
+        if scope.get('test_accuracy', scope.get('accuracy', False)):
+            accuracy = read_accuracy_scope(scope, base_dir)
+            if accuracy['denominator'] is None or accuracy['denominator'] <= 0:
+                raise ValueError('selected accuracy scope has no original denominator')
+        else:
+            counts = scope_counts(scope)
+            if (counts['success'] is None or counts['success'] <= 0 or counts['failed'] is None
+                    or counts['total'] is None
+                    or counts['total'] != counts['success'] + counts['failed'] + (counts['cancelled'] or 0)
+                    or float(row['total_req']) != counts['total']):
+                raise ValueError('selected scope has no reconciled completed request counters')
+            if scope.get('planned_verified', (scope.get('counts') or {}).get('planned_verified', False)) and counts['planned'] != counts['total']:
+                raise ValueError('selected scope did not complete its actual dataset')
+    except (OSError, ValueError, TypeError, KeyError, csv.Error) as error:
+        return {}, {}, str(error)
+    return scope, row, ''
+
+
 def load_scope_index(result_dir: Path) -> dict[int, dict[str, Any]] | None:
     path = result_dir / "result_scopes.json"
     if not path.exists():

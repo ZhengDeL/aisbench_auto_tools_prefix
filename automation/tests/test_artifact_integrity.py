@@ -21,8 +21,8 @@ for folder in (CORE_ROOT, TOOLS_ROOT):
 
 import aisbench_artifact_archive as archive
 from aisbench_result_adapter import (CANONICAL_COLUMNS, SUMMARY_COLUMNS, normalize_result,
-                                    read_accuracy_scope)
-from aisbench_result_validation import validate_results, verify_archive_manifest
+                                    read_accuracy_scope, selected_measurement)
+from aisbench_result_validation import check_indexed_row, validate_results, verify_archive_manifest
 
 
 class ArtifactIntegrityContracts(unittest.TestCase):
@@ -370,11 +370,11 @@ class WorkerPeakPublicationContracts(unittest.TestCase):
         source = folder / 'aisbench_result.csv'
         with source.open('w', encoding='utf-8', newline='') as handle:
             writer = csv.DictWriter(handle, fieldnames=list(raw)); writer.writeheader(); writer.writerow(raw)
-        scope = dict(scope_id='scope_001', phase='main', state='PASS', test_type='stream',
+        scope = dict(scope_id='scope_001', phase='main', state='PASS', return_code=0, test_type='stream',
             source_csv=self.worker.container_path(source), raw_row=raw,
             counts=dict(planned=8, total=8, success=8, failed=0, planned_verified=True))
         evaluation = folder / 'evaluation.json'
-        evaluation.write_text(json.dumps(dict(state='PASS', main_scopes=[scope], scopes=[scope],
+        evaluation.write_text(json.dumps(dict(state='PASS', return_code=0, main_scopes=[scope], scopes=[scope],
             selected_scope_id=scope['scope_id'], raw_row=raw)), encoding='utf-8')
         return dict(raw, case_name=self.scene['name'], trial_id='trial_' + str(ordinal),
             measurement_state='PASS', concurrency=2, evaluation_file=self.worker.container_path(evaluation),
@@ -422,6 +422,105 @@ class WorkerPeakPublicationContracts(unittest.TestCase):
         checks = validate_results(self.worker.result, self.worker.output, True)
         self.assertFalse([detail for name, ok, detail in checks if not ok and name != 'final states successful'])
 
+    def test_worker_resolves_explicit_main_and_valid_accuracy_without_last_fallback(self):
+        first = self.write_trial(1)
+        second = self.write_trial(2)
+        first_file = self.worker.host_path(first['evaluation_file'])
+        second_file = self.worker.host_path(second['evaluation_file'])
+        earlier = json.loads(first_file.read_text())['scopes'][0]
+        report = json.loads(second_file.read_text())
+        later = report['scopes'][0]
+        later['scope_id'] = 'scope_002'
+        report.update(state='SLO_FAIL', selected_scope_id=earlier['scope_id'],
+                      scopes=[earlier, later], main_scopes=[earlier, later])
+        second_file.write_text(json.dumps(report), encoding='utf-8')
+        loaded, selected = self.worker.evaluation(second_file)
+        self.assertEqual(loaded['state'], 'SLO_FAIL')
+        self.assertEqual(selected['scope_id'], 'scope_001')
+        self.assertEqual(Path(selected['source_csv']), self.worker.host_path(earlier['source_csv']))
+        self.assertEqual(selected['state'], 'PASS')
+
+        score = second_file.parent / 'results/gsm8k.json'
+        score.parent.mkdir()
+        score.write_text(json.dumps({'accuracy': 0, 'details': {str(i): dict(
+            origin_prediction='Answer is 2', predictions=['2'], references=['3'], correct=[False])
+            for i in range(8)}}), encoding='utf-8')
+        earlier = loaded['scopes'][0]
+        earlier.update(accuracy=True, test_accuracy=True, accuracy_results=[str(score)])
+        loaded.update(state='PASS', scopes=[earlier], main_scopes=[earlier], selected_scope_id=earlier['scope_id'])
+        second_file.write_text(json.dumps(loaded), encoding='utf-8')
+        loaded, selected = self.worker.evaluation(second_file)
+        self.assertTrue(selected)
+        _, row, reason = selected_measurement(loaded, self.worker.output)
+        self.assertEqual(reason, '')
+        self.assertTrue(all(row[name] == '' for name in CANONICAL_COLUMNS[1:]))
+
+    def test_partial_timeout_round_has_no_selected_measurement_or_numeric_fallback(self):
+        for state in ('ERROR', 'REQUEST_ERROR'):
+            with self.subTest(state=state):
+                self.worker.rows.clear(); self.worker.scopes.clear()
+                self.worker.run_id += '_' + state
+                self.session = self.worker.output / ('peak_fixture_' + self.worker.run_id + '_1')
+                def run_container(arguments, timeout, on_progress=None):
+                    trial = self.write_trial(1)
+                    file = self.worker.host_path(trial['evaluation_file'])
+                    report = json.loads(file.read_text())
+                    scope = report['scopes'][0]
+                    if state == 'ERROR':
+                        self.worker.host_path(scope['source_csv']).unlink()
+                        scope.update(state=state, return_code=None, raw_row={})
+                    else:
+                        scope.update(state=state, counts=dict(planned=8, total=8, success=7, failed=1,
+                                                              planned_verified=True))
+                    report.update(state=state, return_code=124 if state == 'ERROR' else 0,
+                                  timed_out=state == 'ERROR', main_scopes=[scope], scopes=[scope])
+                    file.write_text(json.dumps(report), encoding='utf-8')
+                    trial = dict(trial_id='trial_1', measurement_state=state, concurrency=2,
+                                 evaluation_file=self.worker.container_path(file))
+                    best = dict(case_name=self.scene['name'], passed='no',
+                                status='peak_budget' if state == 'ERROR' else 'peak_request_error',
+                                termination='budget_limit' if state == 'ERROR' else 'request_error',
+                                evaluation_file='', selected_scope_id='', selected_trial_id='')
+                    self.write_report(dict(best=[], all=[trial], complete=False))
+                    on_progress()
+                    self.write_report(dict(best=[best], all=[trial], complete=True), seal=True)
+                    return 1
+                with patch.object(self.worker, 'run_container', side_effect=run_container):
+                    self.assertFalse(self.worker.peak(self.scene))
+                self.assertEqual(self.worker.scopes[0]['selected_scope_id'], '')
+                self.assertEqual(self.worker.scopes[0]['scope'], {})
+                self.assertTrue(all(not self.worker.rows[0][name] for name in CANONICAL_COLUMNS))
+                evaluation = self.worker.host_path(self.worker.scopes[0]['evaluation_file'])
+                self.assertEqual(json.loads(evaluation.read_text())['scopes'][0]['state'], state)
+                checks = validate_results(self.worker.result, self.worker.output, True)
+                self.assertFalse([detail for name, ok, detail in checks if not ok and name != 'final states successful'])
+                with self.assertRaisesRegex(ValueError, 'unmeasured scope'):
+                    check_indexed_row(dict(self.worker.rows[0], total_req='4'), self.worker.scopes[0],
+                                      self.worker.result, self.worker.output, set())
+
+    def test_worker_rejects_request_error_missing_id_and_missing_original_csv(self):
+        for ordinal, mode in enumerate(('REQUEST_ERROR', 'missing_id', 'missing_csv', 'duplicate_id'), 1):
+            with self.subTest(mode=mode):
+                trial = self.write_trial(ordinal)
+                file = self.worker.host_path(trial['evaluation_file'])
+                report = json.loads(file.read_text())
+                if mode == 'REQUEST_ERROR':
+                    report['state'] = report['scopes'][0]['state'] = 'REQUEST_ERROR'
+                    report['main_scopes'] = report['scopes']
+                elif mode == 'missing_id':
+                    report['selected_scope_id'] = ''
+                elif mode == 'missing_csv':
+                    self.worker.host_path(report['scopes'][0]['source_csv']).unlink()
+                else:
+                    report['scopes'].append(dict(report['scopes'][0]))
+                    report['main_scopes'] = report['scopes']
+                file.write_text(json.dumps(report), encoding='utf-8')
+                loaded, selected = self.worker.evaluation(file)
+                self.assertEqual(selected, {})
+                self.assertEqual(loaded['selected_scope_id'], '')
+                self.assertEqual(loaded['raw_row'], {})
+                self.assertTrue(loaded['scopes'], 'all original diagnostic scopes stay archived')
+
     def test_fixed_failure_without_evaluation_keeps_unknown_measurements_and_error_state(self):
         from aisbench_configuration import build_plan
         config = self.root / 'fixed.env'
@@ -434,6 +533,34 @@ class WorkerPeakPublicationContracts(unittest.TestCase):
         self.assertEqual(self.worker.scopes[0]['measurement_state'], 'ERROR')
         self.assertTrue(all(not self.worker.rows[0][name] for name in CANONICAL_COLUMNS))
         verify_archive_manifest(self.worker.result / 'fixed_1' / 'archive_manifest.json')
+        self.worker.index = 2
+        def request_error(arguments, timeout):
+            folder = self.worker.host_path(arguments[arguments.index('--evidence-dir') + 1])
+            folder.mkdir(parents=True)
+            source = folder / 'aisbench_result.csv'
+            raw = dict.fromkeys(CANONICAL_COLUMNS, '1')
+            raw.update(total_req='4', current_time='2026-10-20 01:00:00')
+            with source.open('w', encoding='utf-8', newline='') as stream:
+                writer = csv.DictWriter(stream, fieldnames=CANONICAL_COLUMNS)
+                writer.writeheader(); writer.writerow(raw)
+            scope = dict(scope_id='scope_001', phase='main', state='REQUEST_ERROR', return_code=0,
+                         source_csv=self.worker.container_path(source), raw_row=raw,
+                         counts=dict(planned=4, total=4, success=3, failed=1, planned_verified=True))
+            (folder / 'evaluation.json').write_text(json.dumps(dict(state='REQUEST_ERROR', return_code=0,
+                scopes=[scope], main_scopes=[scope], selected_scope_id=scope['scope_id'], raw_row=raw)), encoding='utf-8')
+            return 1
+        with patch.object(self.worker, 'run_container', side_effect=request_error):
+            self.assertFalse(self.worker.fixed(scene))
+        self.assertEqual(self.worker.scopes[-1]['measurement_state'], 'REQUEST_ERROR')
+        self.assertEqual(self.worker.scopes[-1]['selected_scope_id'], '')
+        self.assertEqual(self.worker.scopes[-1]['scope'], {})
+        self.assertTrue(all(not self.worker.rows[-1][name] for name in CANONICAL_COLUMNS))
+        checks = validate_results(self.worker.result, self.worker.output, True)
+        self.assertFalse([detail for name, ok, detail in checks if not ok
+                          and name not in {'final states successful', 'csv no failed/no_result'}])
+        with self.assertRaisesRegex(ValueError, 'unmeasured scope'):
+            check_indexed_row(dict(self.worker.rows[-1], total_req='4'), self.worker.scopes[-1],
+                              self.worker.result, self.worker.output, set())
 
     def test_absent_selected_evaluation_never_reads_current_directory(self):
         def run_container(arguments, timeout, on_progress=None):
