@@ -260,6 +260,68 @@ class ArtifactIntegrityContracts(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 read_accuracy_scope(entry['scope'], self.output)
 
+    def test_exact_image_single_replica_lists_keep_wrong_answers_valid(self):
+        row, entry = self.fixture(accuracy=True)
+        directory = self.output / 'trial' / 'results'
+        directory.mkdir()
+        score = directory / 'gsm8k.json'
+        payload = {'accuracy': 6.25, 'type': 'GEN', 'details': {
+            str(index): {'origin_prediction': 'Answer is 2', 'predictions': ['2'],
+                         'references': ['2' if index == 4 else '18'], 'correct': [index == 4]}
+            for index in range(16)}}
+        score.write_text(json.dumps(payload), encoding='utf-8')
+        predictions = self.output / 'trial' / 'predictions'
+        predictions.mkdir()
+        records = predictions / 'gsm8k.jsonl'
+        records.write_text(''.join(json.dumps({'id': index, 'prediction': 'Answer is 2'}) + '\n'
+                                   for index in range(16)), encoding='utf-8')
+        entry['scope']['accuracy_results'] = [str(score), str(records)]
+        self.write([row], [entry])
+        evidence = read_accuracy_scope(entry['scope'], self.output)
+        self.assertEqual((evidence['numerator'], evidence['denominator'], evidence['prediction_count']), (1, 16, 16))
+        self.assertEqual(evidence['metrics']['accuracy'], 6.25)
+        self.assertTrue(evidence['independently_scored'])
+        self.assertEqual(self.failures(), [], 'low model accuracy is valid scoring evidence')
+        self.assertEqual(row['qps'], '', 'accuracy cannot invent performance measurements')
+
+    def test_accuracy_replica_shape_and_per_sample_evidence_remain_strict(self):
+        _, entry = self.fixture(accuracy=True)
+        directory = self.output / 'trial' / 'results'
+        directory.mkdir()
+        score = directory / 'gsm8k.json'
+        original = {'accuracy': 100.0, 'details': {'0': {
+            'origin_prediction': 'Answer is 2', 'predictions': ['2'],
+            'references': ['2'], 'correct': [True]}}}
+        entry['scope']['accuracy_results'] = [str(score)]
+        for change in ('empty', 'multiple', 'mixed', 'nonbool', 'missing', 'nested',
+                       'score', 'verdict', 'extraction', 'malformed_sample'):
+            payload = json.loads(json.dumps(original))
+            sample = payload['details']['0']
+            if change == 'empty':
+                sample['correct'] = []
+            elif change == 'multiple':
+                for name in ('predictions', 'references', 'correct'):
+                    sample[name] *= 2
+            elif change == 'mixed':
+                sample['correct'] = True
+            elif change == 'nonbool':
+                sample['correct'] = [1]
+            elif change == 'missing':
+                del sample['references']
+            elif change == 'nested':
+                sample['correct'] = [[True]]
+            elif change == 'score':
+                payload['accuracy'] = 0
+            elif change == 'verdict':
+                sample['correct'] = [False]
+            elif change == 'extraction':
+                sample['predictions'] = ['3']
+            else:
+                payload['details']['1'] = 'not a scored sample'
+            score.write_text(json.dumps(payload), encoding='utf-8')
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                read_accuracy_scope(entry['scope'], self.output)
+
     def test_scope_handoff_uses_explicit_origin_root_without_rewriting_evidence(self):
         _, _ = self.fixture()
         index = self.result / 'result_scopes.json'

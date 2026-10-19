@@ -86,6 +86,16 @@ bash run_perf_scenarios.sh automation/examples/test_a.env automation/examples/te
 
 固定轮次未指定 `data_num` 时，使用 `配置并发 × DATA_NUM_MULTIPLIER`，该全局倍数默认 `4`。重复并发合法，如 `[1, 10, 10, 20, "max"]`；重复的固定轮次使用独立名称和归档，不覆盖前一轮。`"max"` 表示增加一次摸高，不是一个固定并发数。
 
+上述请求数公式适用于生成数据。显式设置 `dataset` 时，文件必须在容器内可读；原生使用文件的全部记录，`data_num` 不会截取或补齐该文件。请先确认实际记录数，再安排负载和预算。
+
+`test_accuracy=true` 使用 GSM8K 精度流程，只支持固定并发，不能与 `"max"` 组合。未指定 `dataset` 时，工具从锁定原生仓的 `GSM8K.jsonl` 选择 `data_num` 条真实问题和金标，保留来源行号及校验值；不会按 `input_len` 把问题合成为长输入，配置层的上下文门禁仍会执行。显式数据集使用全部记录，须包含非空 `question` 和带 `#### ` 金标的 `answer`，格式错误在发请求前报错。
+
+精度结果保留实际预测、金标及逐题判定，见该轮 `accuracy_dataset.json`、`evaluation.json` 的精度作用域和 `scope_*/artifacts/experiment/`。模型答错或准确率低不表示工具失败；工具检查评分提取、逐题判定和分母是否一致，不设置模型准确率合格线。精度测试的性能字段留空，不能把准确率、缺失项或原生性能占位值填入性能 CSV。
+
+固定轮次的全局 `PEAK_TRIAL_TIMEOUT` 同样控制一次完整调用的超时，包含前缀准备和该次原生 `repeat`；只有摸高可以用场景字段 `peak_trial_timeout` 覆盖它。`FAILED_REQ_LIMIT` 按每个性能测量作用域检查，也包含前缀准备；精度测试使用独立评分证据。
+
+`enable_think=true` 按原生方式发送 `enable_thinking=true`；`false` 省略该请求字段，不保证模型关闭思考，需按实际模型响应核验。
+
 `API_URL` 是**服务基址**，非空时优先于 `HOST_IP/HOST_PORT`。当前默认镜像先为基址路径补齐尾斜杠，再用 `urljoin` 追加 `v1/chat/completions`：
 
 | 配置中的 `API_URL` | 实际聊天请求地址 |
@@ -142,7 +152,7 @@ TTFT 阈值用**秒**，TPOT 阈值用**毫秒**，从 CSV 的毫秒值换算后
 | 全局参数 | 场景字段 | 默认值及含义 |
 |---|---|---|
 | `PEAK_PRECISION` | `peak_precision` | `1`，边界并发差精度 |
-| `PEAK_CONFIRM_RUNS` | `peak_confirm_runs` | `3`，确认阶段的新执行次数 |
+| `PEAK_CONFIRM_RUNS` | `peak_confirm_runs` | `3`，每个确认并发点的新执行次数；通过/失败两端各执行 3 次 |
 | `PEAK_CONFIRM_MIN_REQUESTS` | `peak_confirm_min_requests` | `100`，确认轮次最少主测试请求数 |
 | `PEAK_MAX_TRIALS` | `peak_max_trials` | `40`，单场景总尝试数预算，含复测和无效重试 |
 | `PEAK_TRIAL_TIMEOUT` | `peak_trial_timeout` | `1800` 秒，单次执行超时 |
@@ -150,7 +160,7 @@ TTFT 阈值用**秒**，TPOT 阈值用**毫秒**，从 CSV 的毫秒值换算后
 | `PEAK_INVALID_RETRIES` | `peak_invalid_retries` | `1`，无效测量的重试次数 |
 | `PEAK_FLOOR_CONCURRENCY` | `peak_floor_cc` | `1`，允许下探的最低并发 |
 
-普通探索轮次的主测试请求数由并发和 `peak_data_multiplier` 决定；确认阶段至少取 `max(并发 × 倍数, 最少请求数)`。这与原生 `repeat` 不同，后者保留其正常/前缀分支语义。无效或不完整数据只按限制重试；请求失败、容器故障和日志/证据错误不当作“延迟已越界”用于收缩区间。最少样本量和复测次数也不是统计置信度保证。
+使用生成数据时，普通探索轮次的主测试请求数由并发和 `peak_data_multiplier` 决定；确认阶段至少取 `max(并发 × 倍数, 最少请求数)`。显式 `dataset` 保留全量记录，确认门禁检查每个主测作用域实际完成的请求数；低于配置下限时测量无效，不会补造记录。这与原生 `repeat` 不同。无效或不完整数据只按限制重试；请求失败、容器故障和日志/证据错误不当作“延迟已越界”用于收缩区间。最少样本量和复测次数也不是统计置信度保证。
 
 | 最终 CSV 状态 | 含义 |
 |---|---|
@@ -237,7 +247,9 @@ scenario,current_time,input_len,output_len,total_req,max_cc,cc,rr,TTFT avg,TTFT 
 
 当前默认镜像的 total 统计时长从最早请求开始到最晚请求结束；吞吐和 `cc` 使用其未显示舍入的时长，界面/CSV 的时长值已按原生规则舍入。P90 是逐请求指标分布的线性分位数，不能用各轮 P90 求平均来代替。若采用其他原生统计窗口，应按该作用域原始定义核验，不能套用 total 的分母。token 数来源是实际原始记录中的服务 usage/原生 tokenizer 计数；聚合核对不能独立证明服务 usage 或 tokenizer 绝对正确。
 
-原生 `repeat` 的每次 main 作用域分别保留；固定汇总选择该次执行最后一个 main，摸高选中行还绑定确认试验及其具体 main。汇总的 `total_req`、时长与吞吐来自该选中作用域，不是所有 repeat 的总计。缓存准备/prefix 作用域也独立保留，不计入主测汇总；`repeat_rate` 不是从 `/metrics` 测得的缓存命中率。
+原生 normal 分支按 `repeat` 重复执行，每次 main 作用域分别保留；固定汇总选择该次执行最后一个 main，摸高选中行还绑定确认试验及其具体 main。当前原生 prefix_cache 分支忽略 `repeat`：`prefix_test=true` 只执行一次前缀准备和一次主测，`false` 只执行一次主测。例如 `repeat=2`、主测 16 条、`dp=1`、`prefix_num=2` 且启用前缀准备时，实际是准备 2 条加主测 16 条，不是两轮主测。
+
+汇总的 `total_req`、时长与吞吐来自选中的单个 main 作用域，不是所有 repeat 的总计。前缀准备作用域独立保留，不计入主测汇总。`repeat_rate` 是配置的重复比例，不是实测缓存命中率。启用前缀准备时，原生额外从 `POD_INFO` 读取缓存计数；计算要求测试前后 normal/external 的 queries/hits 字典齐全且引擎集合一致，否则跳过并记录警告。计数增量为 `0/0` 时原生显示 `0.00%`，实际比率未定义；不能将该显示当作测得的零命中率，也不能用一次 `/metrics` HTTP 200 证明计数及比率正确。
 
 固定轮次 `passed` 表示执行和适用的数据/请求完整性检查通过，不表示已经按摸高 SLO 筛选。`failed`、`no_result` 表示执行或结果失败。中间摸高行及最终摸高状态见上一节。控制台为可读性格式化，数值核验以保存的原始作用域和 CSV 为准。
 

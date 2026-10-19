@@ -234,14 +234,23 @@ def read_accuracy_scope(scope: Mapping[str, Any], base_dir: Path | None = None) 
                 details = value.get('details')
                 if 'gsm8k' in path.stem.casefold() and 'accuracy' in value and isinstance(details, (dict, list)):
                     records = list(details.values()) if isinstance(details, dict) else details
-                    records = [item for item in records if isinstance(item, dict)]
-                    if not records:
-                        raise ValueError('accuracy details contain no samples')
+                    if not records or any(not isinstance(item, dict) for item in records):
+                        raise ValueError('accuracy details contain no samples or malformed samples')
                     correct = 0
                     for record in records:
                         prediction = record.get('predictions', record.get('pred'))
                         reference = record.get('references', record.get('answer'))
-                        if prediction is None or reference is None or not isinstance(record.get('correct'), bool):
+                        verdict = record.get('correct')
+                        # BaseEvaluator groups every replica, including n=1,
+                        # into aligned lists before OpenICLEval formats details.
+                        # A multi-replica aggregate needs its own denominator
+                        # contract; never flatten it or silently take item zero.
+                        values = (prediction, reference, verdict)
+                        if any(isinstance(item, list) for item in values):
+                            if not all(isinstance(item, list) and len(item) == 1 for item in values):
+                                raise ValueError('accuracy details require aligned single-replica fields')
+                            prediction, reference, verdict = (item[0] for item in values)
+                        if prediction is None or reference is None or not isinstance(verdict, bool):
                             raise ValueError('accuracy detail lacks prediction/reference/verdict')
                         origin = record.get('origin_prediction')
                         if isinstance(origin, str):
@@ -255,7 +264,7 @@ def read_accuracy_scope(scope: Mapping[str, Any], base_dir: Path | None = None) 
                                 equal = abs(float(prediction) - int(reference)) < 1e-6
                             except (ValueError, TypeError, OverflowError):
                                 equal = False
-                        if equal != record['correct']:
+                        if equal != verdict:
                             raise ValueError('accuracy verdict differs from original GSM8K definition')
                         correct += int(equal)
                     score = 100 * correct / len(records)
