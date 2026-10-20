@@ -477,9 +477,9 @@ class Worker:
 def main():
     worker = None
     try:
-        config = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else RELEASE_ROOT / 'env.env'
+        config = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else RELEASE_ROOT / 'config.env'
         if 'SCENARIOS_JSON_OVERRIDE' in os.environ:
-            raise ValueError('SCENARIOS_JSON_OVERRIDE已停用，请把场景写入所用env.env配置文件并unset旧变量')
+            raise ValueError('SCENARIOS_JSON_OVERRIDE已停用，请把场景写入所用配置文件（如 config.env）的 SCENARIOS_JSON 块，并 unset 旧变量')
         os.environ.pop('SCENARIOS_JSON', None)
         values = effective_environment(dict(os.environ), RELEASE_ROOT)
         NATIVE_ROOTS.append(Path(values['TOOLS_HOST_DIR']))

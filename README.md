@@ -1,74 +1,85 @@
-# AISBench automation · v2026.10.19
+# AISBench 自动化压测工具
 
-在原生 AISBench 工具外增加配置加载、多个独立服务并行测试、固定并发测试、并发摸高、结果核验和日志归档。**本版本为 v2026.10.19 正式发布版，版本以同名注释标签为准。**
+版本：v2026.10.20
 
-原生仓完整放在 `aisbench_auto_tools_prefix/`，内容和 Git 文件模式与选定上游提交一致。自动化代码位于 `automation/`，运行输出位于根目录 `outputs/`；运行时不向原生目录写入配置、缓存或结果。
+基于 AISBench，对已部署的模型服务执行固定并发测试和并发摸高，支持前缀缓存、GSM8K 精度测试，以及多个独立服务并行测试。每份配置独立执行，分别保存结果、日志和原始数据。
 
-```text
-aisbench_auto_tools_prefix/          # 本仓库根目录
-├── run_perf_scenarios.sh            # 日常启动入口
-├── env.env                          # 默认完整配置，末尾有参数参考
-├── README.md
-├── aisbench_auto_tools_prefix/      # 原生仓，只通过上游同步更新
-├── automation/
-│   ├── README.md                    # 配置、算法、结果、维护与验证说明
-│   ├── core/                       # 按职责拆分的运行模块
-│   ├── tools/                      # 校验工具和离线门禁
-│   ├── tests/                      # 自动化测试
-│   ├── examples/                   # 两份小规模公开示例
-│   └── metadata/                   # 锁定上游的文件清单
-└── outputs/default/<批次号>/        # 单份、多份配置采用同一批次结构
-```
+原生仓保留在 `aisbench_auto_tools_prefix/`，自动化代码位于 `automation/`。运行时使用原生代码副本，配置、缓存和结果均写在原生目录之外，便于后续同步上游。
 
-需要 Linux、Bash、Python 3.7+、Docker、可读取的模型 tokenizer 目录和已启动的模型服务。默认镜像为：
+## 运行条件
+
+- Linux、Bash、Python 3.7 或更高版本、Docker。
+- 已启动且可从压测主机访问的模型服务。
+- 本机可读取的模型 tokenizer 目录，以及与宿主机架构匹配的 AISBench 镜像。
+
+默认镜像：
 
 ```text
 ghcr.io/aisbench/aisbench_benchmark:v3.1-20261013-master-openeuler24.03-py311
 ```
 
-镜像架构应与宿主机匹配。脚本启动的是 AISBench 请求客户端容器，不负责部署模型服务。
+脚本启动的是 AISBench 压测客户端容器，模型服务需提前部署。
 
-## 启动
+## 配置与启动
 
-在仓库根目录编辑配置，再运行。**不需要先 `source`，也不要求先复制配置文件。**
+日常使用只需编辑配置文件，不需要先执行 `source`。主要配置项如下，完整参数参考位于配置文件末尾。
 
-```bash
-vi env.env
-bash run_perf_scenarios.sh ./env.env
-```
+| 配置项 | 填写内容 |
+|---|---|
+| `MODEL_NAME` | 服务提供的模型名称或别名 |
+| `MODEL_HOST_PATH` | 压测主机上的模型 tokenizer 目录 |
+| `HOST_IP`、`HOST_PORT` | 模型服务地址和端口 |
+| `NPU_NUM` | 吞吐归一化使用的卡数或 NPU 芯片数，报告时注明口径 |
+| `SCENARIOS_JSON` | 输入长度、输出长度、并发、摸高阈值等测试场景 |
 
-`env.env` 中的服务地址、模型名和路径是公开占位示例，必须填写实际值。当前默认场景为 **64K 输入、256/1024 输出，包含固定并发和摸高**；首次验证流程时可先使用 1K 输入、512 输出、并发 4 的示例：
-
-```bash
-vi automation/examples/test_a.env
-bash run_perf_scenarios.sh automation/examples/test_a.env
-```
-
-该小示例默认主测试请求数为 `4 × DATA_NUM_MULTIPLIER(4) = 16`，不包含摸高。模型需要的 tokenizer、聊天模板和服务行为仍需实际验证。
-
-通常填写 `HOST_IP` 和 `HOST_PORT` 即可。使用 `API_URL` 时填写**服务基址**，例如 `http://192.168.1.10:8000/`；网关有路径前缀时可填 `http://192.168.1.10:8000/gateway/`。当前默认镜像会补齐路径尾斜杠，再追加 `v1/chat/completions`，因此不要把完整的 `/v1/chat/completions` 接口或 `/v1/` 写入基址。详见 [地址规则](automation/README.md#配置加载与优先级)。
-
-一次启动多个独立服务的测试：
+仓库中的地址、模型名和路径均为示例，使用前应填写实际值。默认 `config.env` 包含两组 64K 输入场景、固定并发和摸高。首次检查流程时，建议先编辑小规模示例：
 
 ```bash
 vi automation/examples/test_a.env
-vi automation/examples/test_b.env
-bash run_perf_scenarios.sh automation/examples/test_a.env automation/examples/test_b.env
+bash run_benchmark.sh automation/examples/test_a.env
 ```
 
-配置文件名可以自定，不限于 `test_a`、`test_b`。一份配置对应一个任务、一个 AISBench 容器；三份配置启动三个，四份启动四个。同一任务中的各轮顺序执行，各任务并行执行。**多份配置必须指向不同的服务；同一有效主机和端口会被拒绝。** 通过不同 DNS 名称或代理访问同一个后端时，应使用相同 `SERVICE_ID` 标识，避免把同一个服务误当成两组独立服务。
+该示例配置输入 1024、输出 512、固定并发 4，不进行摸高。默认主测试请求数为 `4 × DATA_NUM_MULTIPLIER(4) = 16`；配置长度与实际 token 数可能因 tokenizer 和聊天模板而不同。
 
-也可省略配置参数：
+使用默认配置时，在仓库根目录运行：
 
 ```bash
-bash run_perf_scenarios.sh
+vi config.env
+bash run_benchmark.sh
 ```
 
-零参数会自动读取根目录 `env.env`，同时保留当前进程已导出的受支持全局参数覆盖值。显式传入 `./env.env` 时，各配置与当前 shell 的这些参数隔离，通常更容易复现。场景始终从对应文件的 `SCENARIOS_JSON` 块读取。完整优先级和空值规则见 [配置说明](automation/README.md#配置加载与优先级)。
+不带参数时自动读取入口脚本同目录的 `config.env`；当前 shell 已导出的受支持全局参数可以覆盖文件中的值。需要隔离这些值时，显式指定配置：
 
-## 查看结果
+```bash
+bash run_benchmark.sh ./config.env
+```
 
-启动和结束时会打印批次目录。例如：
+通常填写 `HOST_IP` 和 `HOST_PORT` 即可。使用 `API_URL` 时，应填写服务基址，例如 `http://192.168.1.10:8000/` 或 `http://192.168.1.10:8000/gateway/`。默认镜像会追加 `v1/chat/completions`，不要在基址中重复填写 `/v1/` 或完整聊天接口。地址与配置优先级见 [配置说明](automation/README.md#配置加载与优先级)。
+
+## 多个服务并行测试
+
+配置文件名可以自定，例如 `dsv4.env`、`qwen.env`。每份文件都包含完整的全局参数和场景，运行时自动加载：
+
+```bash
+bash run_benchmark.sh ./dsv4.env ./qwen.env
+```
+
+一份配置对应一个任务、一个专用 AISBench 容器；传入三份配置就启动三个，四份就启动四个。默认容器名为 `aisbench-<配置名>-<批次号>`。各任务并行执行，每个任务内部的测试轮次顺序执行。
+
+并行配置必须指向不同的独立服务。同一有效主机和端口不能同时测试，换模型别名或 URL 路径也不能绕过检查。不同域名或代理实际共用同一后端时，应填写相同的 `SERVICE_ID`。互斥检查仅协调本压测主机上的本工具，其他主机的流量仍需自行协调。
+
+## 目录与结果
+
+```text
+仓库根目录/
+├── run_benchmark.sh             # 启动入口
+├── config.env                   # 默认配置，末尾附参数参考
+├── aisbench_auto_tools_prefix/  # 原生仓
+├── automation/                  # 自动化模块、使用说明和配置示例
+└── outputs/default/<批次号>/    # 本批次结果与日志
+```
+
+启动和结束时会打印批次目录。单份与多份配置使用相同结构：
 
 ```text
 outputs/default/<批次号>/
@@ -77,35 +88,24 @@ outputs/default/<批次号>/
 ├── batch_results.csv
 ├── merged_metrics.csv
 ├── logs/batch.log
-├── logs/events.jsonl
-├── logs/archive_index.json
 └── tasks/
-    ├── test_a__your-model-a/
-    │   ├── test_a__your-model-a__all_results.csv
-    │   ├── test_a__your-model-a__execution.log
+    ├── dsv4__<模型名>/
+    │   ├── dsv4__<模型名>__all_results.csv
+    │   ├── dsv4__<模型名>__execution.log
     │   └── result_index.json
-    └── test_b__your-model-b/
-        ├── test_b__your-model-b__all_results.csv
-        ├── test_b__your-model-b__execution.log
-        └── result_index.json
+    └── qwen__<模型名>/...
 ```
 
-每组有自己的 CSV 和日志；批次文件提供索引及合并视图，不会把不同服务的吞吐相加或把延迟平均。自定义 `HOST_OUTPUT_DIR` 时，以任务索引中的实际路径为准。
+每组有自己的 CSV 和日志；批次汇总保留任务、模型、服务和原始文件位置，不将不同服务的吞吐相加或延迟平均。自定义输出目录时，以 `batch_results.json` 和任务 `result_index.json` 中的路径为准。
 
-先看 `batch_state.json`、`batch_results.json` 和 `logs/batch.log`，再按任务查看 `execution.log`、摸高报告和原始证据。结束时管理日志按 16 MiB 字节段额外封存为 gzip，`logs/archive_index.json` 保存来源及校验值，原始文件保留；封存失败会使批次失败。`passed` 表示固定测试通过执行及适用的数据完整性检查；摸高需区分 `peak_confirmed`、`peak_capped`、预算耗尽、请求失败和基础设施错误。字段单位、终态及排查顺序见 [自动化说明](automation/README.md#结果与数值口径)。
+固定测试的 `passed` 表示执行及适用的数据完整性检查通过，不代表满足摸高 SLO。摸高需查看最终状态：`peak_confirmed` 表示边界已复测确认，`peak_capped` 表示硬上限已确认通过；预算耗尽、请求失败和执行错误分别记录。23 列指标的单位、空值及选中轮次规则见 [结果说明](automation/README.md#结果与数值口径)。
 
-管理器被 `SIGKILL` 强杀后，Docker 内的压测可能仍在执行。下次启动会检查执行前持久记录的活动资源；未确认原任务结束时继续隔离，不自动补跑旧批次。恢复检查会将旧 `batch_state.json` 标为 `interrupted / MANAGER_LOST`，旧的不可变快照或 `batch_results.json` 可能仍显示中断前的 `running`。此时以批次状态及原完整容器 ID 的证据排查；不要删锁、改容器名或换路径绕过隔离。详见 [恢复规则](automation/README.md#服务隔离容器与取消)。
+## 排查与维护
 
-私有原始日志可能包含服务地址、请求内容或凭据，不能直接上传公开仓库。可以直接编辑默认配置；需要保留公开示例时，也可自行使用被 Git 忽略的 `*.local.env`，这只是可选用法。
+测试失败时，先查看 `batch_state.json` 和 `logs/batch.log`，确定任务、阶段和原因，再查看对应任务的 `__execution.log`、`result_index.json` 以及摸高搜索记录。原始 stdout、stderr、测量结果和日志封存索引均保留在批次或任务目录中，详见 [日志排查与保留](automation/README.md#日志排查与保留)。
 
-## 维护与验证
+管理器被强杀后，容器中的请求可能仍在执行。不要删锁、改容器名或换输出路径绕过隔离，应按 [恢复规则](automation/README.md#服务隔离容器与取消) 核对原任务和完整容器 ID。日志、配置和原始结果可能含真实地址、请求内容或凭据，分享前需单独审查。
 
-日常修改测试内容只需编辑配置。新增执行行为、算法或结果字段时，再修改 `automation/core/` 中对应模块及测试。原生目录只跟随选定上游提交更新，方法见 [原仓更新](automation/README.md#更新原生仓)。
+日常调整服务和测试场景只需修改配置。新增功能时修改 `automation/core/` 中对应模块；原生目录只随上游同步更新，方法见 [更新原生仓](automation/README.md#更新原生仓)。开发回归测试、发布检查工具和 CI 配置保留在维护者本地，不随运行版本发布。
 
-Linux 上执行离线门禁：
-
-```bash
-bash automation/tools/check_all.sh
-```
-
-离线检查通过不等于真实模型验收通过。正式验收还需要在目标镜像和实际服务上验证固定测试、多个独立服务、摸高各终态、故障与取消处理，并将 CSV 与对应原始结果逐项核对。完整命令和证据要求见 [验证与发布](automation/README.md#验证与发布)。
+更换镜像、上游或模型后，应重新检查请求参数、运行流程，并将 CSV 与对应原始结果核对。运行模块保留结果核对入口，使用方法见 [验证与发布](automation/README.md#验证与发布)。

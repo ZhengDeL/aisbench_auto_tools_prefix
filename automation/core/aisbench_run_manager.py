@@ -2,7 +2,7 @@
 """Supervise isolated AISBench runs without changing their benchmark contract.
 
 The shell entry point delegates here before reading any configuration. Every
-file is sourced once into an isolated environment. Zero arguments load env.env
+file is sourced once into an isolated environment. Zero arguments load config.env
 and retain explicitly exported public parameters as compatibility overrides.
 """
 
@@ -1198,7 +1198,7 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
         raise RunError("压测入口不是可读普通文件，本批次未启动")
     project_root = script.parent
     explicit = bool(arguments)
-    config_arguments = arguments or [str(script.parent / "env.env")]
+    config_arguments = arguments or [str(script.parent / "config.env")]
     configs = [Path(value).resolve(strict=True) for value in config_arguments]
     if any(not config.is_file() for config in configs):
         raise RunError("配置路径必须指向可读文件")
@@ -1509,7 +1509,7 @@ def supervise(script: Path, arguments: list[str]) -> int:
              "owner": process_identity(os.getpid()),
              "reason_code": "", "logging_error": "", "log_dir": str(_BATCH_LOG.directory),
              "configuration_count": len(arguments) or 1,
-             "configurations": arguments or [str(script.parent / "env.env")]}
+             "configurations": arguments or [str(script.parent / "config.env")]}
     code = 1
     try:
         atomic_json(batch_path / "batch_state.json", state)
@@ -1599,7 +1599,7 @@ def supervise(script: Path, arguments: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments:
-        emit("manager", "缺少 run_perf_scenarios.sh 路径")
+        emit("manager", "缺少 run_benchmark.sh 路径")
         return 1
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, _signal_request)

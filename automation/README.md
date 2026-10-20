@@ -1,32 +1,31 @@
 # AISBench 自动化使用与维护
 
-本说明对应 **v2026.10.19 正式发布版**。文中的行为和校验命令是使用、实现和验收约定，不代表所有实机场景已经验收。日常启动入口和默认配置均在仓库根目录：`run_perf_scenarios.sh`、`env.env`。
+本说明对应 v2026.10.20，介绍配置、运行、结果判读和维护方法。日常启动入口和默认配置均在仓库根目录：`run_benchmark.sh`、`config.env`。说明中的示例和检查命令不代表对应环境已经完成验收。
 
 ## 目录与修改位置
 
 | 位置 | 职责及修改边界 |
 |---|---|
-| 根目录 `env.env` | 服务、镜像、路径和场景；日常只改这里即可 |
-| 根目录 `run_perf_scenarios.sh` | 定位安装目录、检查 Python、启动管理器 |
+| 根目录 `config.env` | 服务、镜像、路径和场景；日常只改这里即可 |
+| 根目录 `run_benchmark.sh` | 定位安装目录、检查 Python、启动管理器 |
 | `aisbench_auto_tools_prefix/` | 选定上游的原生源码；不加入增补代码，不产生运行文件 |
 | `automation/core/aisbench_run_manager.py` | 加载及冻结配置、全部任务预检、并行调度、互斥、取消、容器身份监督 |
 | `automation/core/aisbench_configuration.py` | 公开参数默认值、参数校验、场景展开和执行计划 |
 | `automation/core/aisbench_worker.py` | 单任务容器准备、原生源码副本配置、固定轮次与摸高调用 |
 | `automation/core/aisbench_execution.py` | 一次实际执行及请求/结果作用域判定 |
 | `automation/core/aisbench_perf_matrix.py` | 摸高搜索、复测、预算及终态 |
-| `automation/core/aisbench_perf_matrix_config.py` | 独立摸高入口的默认配置接口 |
+| `automation/core/aisbench_perf_matrix_config.py` | 正常摸高和独立摸高入口共用的默认配置接口 |
 | `automation/core/aisbench_result_adapter.py` | 按表头读取原生结果、23 列投影、单位及适用性校验 |
 | `automation/core/aisbench_result_validation.py` | 运行时及离线共用的作用域、原始来源、完整性和结果检查，也可单独执行 |
 | `automation/core/aisbench_artifact_archive.py` | 保存原始证据、作用域、清单与校验值 |
 | `automation/core/aisbench_batch_results.py` | 批次/任务索引、合并视图及一致快照发布 |
 | `automation/core/aisbench_logging.py` | 人类日志、结构化事件、脱敏及写盘错误传播 |
-| `automation/tools/` | `validate_publication.py` 发布审计与 `check_all.sh` 唯一离线门禁 |
-| `automation/tests/` | 启动、配置、算法、归档、输出及故障回归测试 |
 | `automation/examples/` | 两份可改名的小规模完整配置 |
-| `automation/metadata/upstream_manifest.json` | 原生仓基线、文件内容和文件模式清单 |
 | `outputs/` | 运行日志、原始结果和验证报告，不作为公开源码提交 |
 
-新增参数时同步修改参数定义、使用它的执行模块、配置末尾参考和相应测试；新增执行行为或算法时修改负责该行为的模块。无需为了修改输入长度、并发、服务地址而改 Python。原生接口发生变化时，兼容逻辑继续放在 `core/`。
+开发回归测试、发布检查工具、原生版本核对记录和 CI 配置由维护者在本地保存，不随运行版本发布。`core/` 中的结果校验、归档和日志模块属于正常运行流程，继续保留。
+
+新增参数时同步修改参数定义、使用它的执行模块、配置末尾参考和本地回归测试；新增执行行为或算法时修改负责该行为的模块。无需为了修改输入长度、并发、服务地址而改 Python。原生接口发生变化时，兼容逻辑继续放在 `core/`。
 
 ## 运行条件与启动
 
@@ -41,15 +40,15 @@ ghcr.io/aisbench/aisbench_benchmark:v3.1-20261013-master-openeuler24.03-py311
 在仓库根目录运行，无需先 `source`：
 
 ```bash
-vi env.env
-bash run_perf_scenarios.sh ./env.env
+vi config.env
+bash run_benchmark.sh ./config.env
 ```
 
 默认配置包括两组 64K 输入场景、固定并发和摸高。只验证流程时先改小规模示例中的模型和地址：
 
 ```bash
 vi automation/examples/test_a.env
-bash run_perf_scenarios.sh automation/examples/test_a.env
+bash run_benchmark.sh automation/examples/test_a.env
 ```
 
 该示例为输入 1024、输出 512、固定并发 4，默认主测试请求数为 16，不摸高。原生数据准备、预热或前缀准备不应与主测试请求数混为一谈。
@@ -57,7 +56,7 @@ bash run_perf_scenarios.sh automation/examples/test_a.env
 N 份完整配置可一次启动，文件名不写死：
 
 ```bash
-bash run_perf_scenarios.sh automation/examples/test_a.env automation/examples/test_b.env
+bash run_benchmark.sh automation/examples/test_a.env automation/examples/test_b.env
 ```
 
 也可使用自己的文件名，例如 `./prefill.env`、`./decode.local.env`；路径含空格时加引号。任务名取文件名，去掉 `.env` 或 `.local.env` 后，须以英文字母或数字开始，只包含英文字母、数字、点、下划线和短横线。
@@ -70,15 +69,15 @@ bash run_perf_scenarios.sh automation/examples/test_a.env automation/examples/te
 
 | 启动方式 | 全局参数来源 | 场景来源 |
 |---|---|---|
-| `bash run_perf_scenarios.sh ./env.env` | 指定文件；受支持全局参数不继承调用者的同名值 | 指定文件的 JSON 块 |
-| `bash run_perf_scenarios.sh ./a.env ./b.env` | 每份文件独立加载，彼此隔离 | 每份文件自己的 JSON 块 |
-| `bash run_perf_scenarios.sh` | 先自动加载根目录 `env.env`，再按“是否已导出”保留父进程的受支持全局覆盖值 | 根目录 `env.env` 的 JSON 块 |
+| `bash run_benchmark.sh ./config.env` | 指定文件；受支持全局参数不继承调用者的同名值 | 指定文件的 JSON 块 |
+| `bash run_benchmark.sh ./a.env ./b.env` | 每份文件独立加载，彼此隔离 | 每份文件自己的 JSON 块 |
+| `bash run_benchmark.sh` | 先自动加载根目录 `config.env`，再按“是否已导出”保留父进程的受支持全局覆盖值 | 根目录 `config.env` 的 JSON 块 |
 
 零参数模式兼容已有 `export` 用法，例如父进程已导出的 `PEAK_HARD_CAP=0` 会覆盖文件中的 `1`。空 `API_KEY` 也按存在性保留；随后各参数的空值校验和默认回退仍按参数类型处理。推荐显式传文件，避免旧 shell 中的值影响复现。
 
 未提供的参数使用代码默认值；场景中的对应字段覆盖该场景的全局默认。每份配置的内容及 SHA 在启动时冻结，运行中编辑文件只影响下一批次。配置相对路径和用户填写的相对宿主机路径按启动时工作目录解析；配置会从冻结副本加载，不应依靠 `BASH_SOURCE` 在临时位置查找相邻文件。
 
-`env.env` 和两个示例的末尾都附有**仅作注释、不会执行**的完整参数参考，覆盖 31 个公开全局参数、场景 JSON 字段及独立摸高 CLI。每项说明默认值、单位、作用域、覆盖、空值和示例。应区分：
+`config.env` 和两个示例的末尾都附有**仅作注释、不会执行**的完整参数参考，覆盖 31 个公开全局参数、场景 JSON 字段及独立摸高 CLI。每项说明默认值、单位、作用域、覆盖、空值和示例。应区分：
 
 - **代码默认值**：未配置时采用，例如 `PEAK_HARD_CAP=0`、`MAX_CONTEXT_LEN=512000`。
 - **本文件有效赋值**：公开默认文件明确设置 `PEAK_HARD_CAP=1`、`MAX_CONTEXT_LEN=133120`，场景设置 TTFT 15 秒、TPOT 60 毫秒。
@@ -293,31 +292,7 @@ docker inspect '<原完整容器ID>' --format 'ID={{.Id}} OOM={{.State.OOMKilled
 
 ## 验证与发布
 
-以下命令从仓库根目录在 Linux 上执行；完整离线门禁不接受跳过必需测试：
-
-```bash
-bash automation/tools/check_all.sh
-```
-
-需要逐项运行时：
-
-```bash
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH="$PWD/automation/core:$PWD/automation/tools${PYTHONPATH:+:$PYTHONPATH}"
-python3 -B automation/tools/validate_publication.py --root "$PWD"
-bash -n run_perf_scenarios.sh
-python3 -B -m unittest discover -s automation/tests -p 'test_*.py'
-```
-
-`validate_publication.py` 检查公开文件、敏感内容、原生清单/模式和禁止的原生新增文件。`check_all.sh` 还在内存编译全部自动化 Python 文件、检查入口 Bash 语法，并且只运行一次完整 unittest。参数、场景、CSV 和写盘合同集中在现有测试内，不另设重复自测工具。测试覆盖正常、边界和注入故障，但本地/模拟通过不能代替真实 Docker 和模型验收。
-
-正式提交完成后，还应检查将要发布的确切 Git 树和工作区，避免只检查工作区却发布另一份内容：
-
-```bash
-python3 -B automation/tools/validate_publication.py --root "$PWD" --ref HEAD --require-clean
-```
-
-对一次实际任务，用 `result_index.json` 中记录的真实目录运行；下面的批次号和运行号需替换：
+任务汇总时会自动检查结果及原始来源。需要单独复核已有结果时，可使用运行模块中的同一入口。从仓库根目录执行，将下列批次号、任务名和运行号替换为 `result_index.json` 中的实际路径：
 
 ```bash
 BATCH_DIR="outputs/default/<批次号>"
@@ -327,18 +302,18 @@ python3 -B automation/core/aisbench_result_validation.py \
   --result-dir "$RESULT_DIR" --host-output-dir "$TASK_OUTPUT" --require-scopes
 ```
 
-这个统一入口检查结果结构、适用字段、作用域、请求计数、原始清单与最终选中证据；可用 `--expected-statuses` 指定完整 CSV 的按行状态列表（包括中间 `peak_round`）。失败终态不是“校验通过的性能结果”，但失败证据仍应完整。验证器和实现共享部分合同，正式数值验收还应从真实原始 JSON/SQLite/NPY 独立复算，逐项对照 CSV，不能只用程序自校验宣称数值全部正确。
+这个入口检查结果结构、适用字段、作用域、请求计数、原始清单与最终选中证据；可用 `--expected-statuses` 指定完整 CSV 的按行状态列表（包括中间 `peak_round`）。失败终态不是“校验通过的性能结果”，但失败证据仍应完整。校验模块与执行模块共享部分规则，正式数值验收还应从真实原始 JSON/SQLite/NPY 独立复算，逐项对照 CSV。
 
-发布验收至少要形成这些证据：
+开发检查和回归测试在维护者本地进行，不要求使用者在运行版本中安装或执行发布工具。本地检查不能代替真实 Docker 和模型验证。维护者发布前应核对实际提交内容，并保留以下验收证据：
 
 - 目标镜像及实际服务的小规模固定测试、重复并发、文本/流式与适用字段、正常/前缀/精度等保留接口。
 - 两个及更多独立服务并行，分别生成任务 CSV/日志；同服务、同容器、重叠目录及跨批次冲突被阻止。
 - 摸高扩展、下探、二分、硬上限开/关、精度、重新确认、不稳定、无效重试、请求失败、超时/预算和取消，轨迹与终态一致。
 - 所有 23 列按实际原始证据核对，重复测试作用域、归一化分母、选中轮次及空值适用性正确，归档损坏能够检出。
 - 配置加载失败、启动异常、容器丢失/替换、日志及磁盘错误、终端断开、取消和停止失败均有明确状态及证据，不碰其他服务。
-- 发布树、原生文件字节和模式、公开隐私扫描、离线门禁及实机证据使用同一发布版本；未覆盖项明确列出。
+- 发布内容、原生文件字节和模式、公开隐私检查、本地回归结果及实机证据对应同一版本；未覆盖项明确列出。
 
-本版完成约定实际验收后，以 `v2026.10.19` 注释标签发布。更换镜像、上游或被测服务后应重新验证；README 中的示例、测试名称或命令不能代替对应环境的验收记录。
+版本以 `v2026.10.20` 注释标签对应的源码为准。更换镜像、上游或被测服务后应重新验证，不能只凭其他环境的检查结果判断当前运行正常。
 
 ## 更新原生仓
 
@@ -357,4 +332,4 @@ git diff --exit-code "$TARGET_UPSTREAM^{tree}" HEAD:aisbench_auto_tools_prefix
 
 使用完整历史，不添加 `--squash`；命令含义见 [Git subtree 官方文档](https://github.com/git/git/blob/master/contrib/subtree/git-subtree.adoc)。合并后原生目录应与选定提交的整棵树一致，包含文件内容和模式。出现冲突时先查明来源；不要把自动化兼容修改留在原生目录。
 
-随后独立核对新上游，更新 `automation/metadata/upstream_manifest.json` 及发布验证器锁定的提交、清单校验值，审查原生配置/CLI/结果接口变化，在 `core/` 适配并补测试。清单更新只是记录信任基线，不能替代字节/模式比对；最后重新执行离线、真实镜像和数值验收，保留对应上游提交号及证据。
+随后在本地维护记录中更新原生提交号、文件内容和模式清单，审查原生配置、CLI 和结果接口变化，在 `core/` 适配并补充本地回归测试。更新记录不能替代原生文件的实际比对；最后重新验证目标镜像、实际服务和数值提取，保留对应上游提交号及证据。

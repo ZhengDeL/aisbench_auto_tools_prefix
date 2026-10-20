@@ -105,7 +105,7 @@ def read_scenarios(config_path: Path) -> list[dict[str, Any]]:
     try:
         result = json.loads(blocks[0])
     except json.JSONDecodeError as error:
-        raise ValueError(f'SCENARIOS_JSON格式错误：第{error.lineno}行第{error.colno}列；请检查所用env.env配置') from error
+        raise ValueError(f'SCENARIOS_JSON格式错误：第{error.lineno}行第{error.colno}列；请检查所用配置文件') from error
     if not isinstance(result, list) or not result:
         raise ValueError('SCENARIOS_JSON 必须为非空场景数组')
     return result
