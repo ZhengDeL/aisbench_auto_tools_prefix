@@ -1046,24 +1046,18 @@ def stream_output(job: Job, channel: str = "stdout") -> None:
     assert job.log_handle is not None
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     pending = ""
-    last_console_progress = float("-inf")
     last_raw_sync = time.monotonic()
 
     def display(line: str) -> None:
-        nonlocal last_console_progress
         safe = REDACTOR.text(line)
         with job.log_lock:
             job.log_handle.write(f"{timestamp()} [{channel}] {safe}\n")
             job.log_handle.flush()
         # Raw output belongs in the task's diagnostics, not repeated as large
         # structured batch events. The console still identifies its task.
-        # Carriage-return progress remains complete in the private raw and
-        # launcher files; keep a busy benchmark from flooding the terminal.
-        if re.search(r"Progress:|\bPOST=|\bRECV=|\d+%\|", safe):
-            now = time.monotonic()
-            if now - last_console_progress < 2:
-                return
-            last_console_progress = now
+        # Every native progress line remains visible; raw bytes are also
+        # retained independently above. Task/channel prefixes disambiguate
+        # concurrent clients without suppressing their AISBench output.
         with _PRINT_LOCK:
             try:
                 print(f"[{job.alias}][{channel}] {safe}", flush=True)

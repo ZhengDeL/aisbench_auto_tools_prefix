@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from aisbench_configuration import PEAK_NEW_DEFAULTS, build_plan, effective_environment, read_scenarios
@@ -57,6 +59,182 @@ def console_message(message, stream=None):
                 os.dup2(sink.fileno(), stream.fileno())
         except (OSError, ValueError, AttributeError):
             pass
+
+
+class FileConsoleMirror:
+    """Observe durable files without putting console backpressure in supervision.
+
+    Docker owns the original files. Each optional daemon observer owns one
+    reader and a console target bound at start, so a blocked stdout cannot stop
+    stderr, the process deadline, or raw capture. Closing waits only briefly;
+    an incomplete console copy is recorded instead of holding the task open.
+    """
+    CLOSE_TIMEOUT = 0.5
+
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.readers = {}
+        self.disabled = set()
+        self._threads, self._targets, self._owned_targets = {}, {}, {}
+        self._wake = {name: threading.Event() for name in ('stdout', 'stderr')}
+        self._closing, self._stop = threading.Event(), threading.Event()
+        self._lock = threading.Lock()
+        self._failures, self._finalized = [], False
+        try:
+            for channel in ('stdout', 'stderr'):
+                self.readers[channel] = (self.directory / (channel + '.raw.log')).open('rb')
+        except BaseException:
+            self.close()
+            raise
+
+    def _save_degradation(self):
+        # Called with _lock held. After close finalizes this snapshot, a late
+        # observer must not change evidence that may already be archived.
+        if self._failures:
+            try:
+                atomic_json(self.directory / 'console_forwarding.json', dict(
+                    schema_version=1, state='degraded', raw_capture_enabled=True,
+                    mirror_complete=False, failures=list(self._failures)))
+            except (OSError, ValueError):
+                # Optional display diagnostics must not override the mandatory
+                # raw-file errors checked by run_container itself.
+                pass
+
+    def _disable(self, channel, error, reason='console output unavailable'):
+        with self._lock:
+            if channel not in self.disabled:
+                self.disabled.add(channel)
+                self._failures.append(dict(stream=channel, reason=reason,
+                    error_type=type(error).__name__, errno=getattr(error, 'errno', None)))
+            if not self._finalized:
+                self._save_degradation()
+
+    def _write(self, channel, chunk):
+        if channel in self.disabled or self._stop.is_set():
+            return
+        target = self._targets.get(channel)
+        if target is None:
+            stream = sys.stdout if channel == 'stdout' else sys.stderr
+            binary = getattr(stream, 'buffer', None)
+            target = (binary, stream)
+        binary, stream = target
+        try:
+            if binary is not None:
+                pending = memoryview(chunk)
+                while pending and not self._stop.is_set():
+                    try:
+                        # A bounded write also bounds the already in-flight
+                        # tail if close has to abandon an unresponsive terminal.
+                        written = binary.write(pending[:4096])
+                    except InterruptedError:
+                        continue
+                    if written is None or written <= 0:
+                        raise OSError('console mirror write made no progress')
+                    pending = pending[written:]
+                if not self._stop.is_set():
+                    binary.flush()
+            else:
+                stream.write(chunk.decode('utf-8', errors='replace'))
+                if not self._stop.is_set():
+                    stream.flush()
+        except (OSError, ValueError, UnicodeError) as error:
+            self._disable(channel, error)
+
+    def _drain_channel(self, channel, final=False):
+        reader = self.readers.get(channel)
+        if reader is None:
+            return False
+        remaining, observed = (None if final else 1024 * 1024), False
+        while not self._stop.is_set() and (remaining is None or remaining > 0):
+            chunk = reader.read(65536 if remaining is None else min(65536, remaining))
+            if not chunk:
+                break
+            observed = True
+            if remaining is not None:
+                remaining -= len(chunk)
+            self._write(channel, chunk)
+        return observed
+
+    def drain(self, final=False):
+        """Synchronous cursor helper; running observers are never joined here."""
+        if self._threads:
+            for wake in self._wake.values():
+                wake.set()
+            return
+        for channel in tuple(self.readers):
+            self._drain_channel(channel, final)
+
+    def _follow(self, channel):
+        try:
+            while not self._stop.is_set():
+                observed = self._drain_channel(channel)
+                if self._closing.is_set() and not observed:
+                    break
+                if not observed:
+                    self._wake[channel].wait(0.05)
+                    self._wake[channel].clear()
+        except (OSError, ValueError) as error:
+            self._disable(channel, error, 'console observer could not read raw log')
+        finally:
+            # The reader and duplicated console descriptor belong exclusively
+            # to this thread. Main-thread close never races a blocked write.
+            reader = self.readers.pop(channel, None)
+            if reader is not None:
+                reader.close()
+            owned = self._owned_targets.pop(channel, None)
+            if owned is not None:
+                owned.close()
+
+    def start(self):
+        if self._threads:
+            return
+        if self._closing.is_set():
+            raise RuntimeError('console mirror is already closed')
+        for channel in tuple(self.readers):
+            stream = sys.stdout if channel == 'stdout' else sys.stderr
+            binary = getattr(stream, 'buffer', None)
+            if binary is not None:
+                try:
+                    # Bind the original pipe, not the mutable global fd number.
+                    # A late observer cannot write into a later fd replacement.
+                    binary = os.fdopen(os.dup(binary.fileno()), 'wb', buffering=0)
+                    self._owned_targets[channel] = binary
+                except (OSError, ValueError, AttributeError):
+                    pass
+            self._targets[channel] = (binary, stream)
+            thread = threading.Thread(target=self._follow, args=(channel,), daemon=True,
+                                      name='aisbench-console-' + channel)
+            self._threads[channel] = thread
+            thread.start()
+
+    def close(self):
+        if self._finalized:
+            return
+        self._closing.set()
+        for wake in self._wake.values():
+            wake.set()
+        deadline = time.monotonic() + self.CLOSE_TIMEOUT
+        for thread in self._threads.values():
+            thread.join(max(0, deadline - time.monotonic()))
+        alive = [name for name, thread in self._threads.items() if thread.is_alive()]
+        if alive:
+            self._stop.set()
+            for channel in alive:
+                self._disable(channel, TimeoutError('console observer drain deadline exceeded'),
+                              'terminal backpressure; raw log preserved, console copy may be incomplete')
+        if not self._threads:
+            for reader in self.readers.values():
+                reader.close()
+            self.readers.clear()
+        with self._lock:
+            self._save_degradation()
+            self._finalized = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
 
 def assert_container_identity(docker: list[str], container_id: str, expected_name: str) -> dict:
@@ -245,27 +423,37 @@ class Worker:
         logs = self.result / 'process_logs' / ('call_' + uuid.uuid4().hex)
         validate_output_path(logs, NATIVE_ROOTS)
         logs.mkdir(parents=True, exist_ok=False, mode=0o700)
-        self.log('container_call_start', '启动容器内工具；调用原始输出保存到独立日志',
+        self.log('container_call_start', f'启动容器内工具；详细输出实时透传；独立日志目录：{logs}',
                  stdout_log=str(logs / 'stdout.raw.log'), stderr_log=str(logs / 'stderr.raw.log'))
         # Never let docker exec inherit the manager's console pipe: if only
         # the manager is killed, the completed benchmark must still be able
         # to emit its final summary and return its true exit status.
         with private_binary(logs / 'stdout.raw.log', NATIVE_ROOTS) as stdout, \
-                private_binary(logs / 'stderr.raw.log', NATIVE_ROOTS) as stderr:
+                private_binary(logs / 'stderr.raw.log', NATIVE_ROOTS) as stderr, \
+                FileConsoleMirror(logs) as mirror:
+            mirror.start()
             process = subprocess.Popen([*self.docker, 'exec', '-e', 'PYTHONUNBUFFERED=1', '-e', 'PYTHONDONTWRITEBYTECODE=1',
                 '-e', 'AISBENCH_NATIVE_ROOT=' + CONTAINER_NATIVE, '-e', 'PYTHONPATH=' + self.work_path,
                 self.container_id, *args], stdout=stdout, stderr=stderr)
             deadline = time.monotonic() + timeout
+            next_progress = time.monotonic()
+            reported_console_failures = set()
             try:
                 while True:
+                    for channel in mirror.disabled - reported_console_failures:
+                        self.log('console_mirror_degraded',
+                                 f'{channel}终端连接不可用；原始输出继续独立写盘，压测不依赖终端连接',
+                                 level='WARNING', channel=channel, raw_capture_enabled=True)
+                        reported_console_failures.add(channel)
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired(process.args, timeout)
                     try:
-                        result = process.wait(timeout=min(1, remaining))
+                        result = process.wait(timeout=min(0.2, remaining))
                     except subprocess.TimeoutExpired:
-                        if on_progress:
+                        if on_progress and time.monotonic() >= next_progress:
                             on_progress()
+                            next_progress = time.monotonic() + 1
                         continue
                     if on_progress:
                         on_progress()
@@ -370,11 +558,15 @@ class Worker:
         self.current, self.phase = scene['name'], 'peak'
         self.runtime(False)
         tag = self.run_id + '_' + str(self.index)
-        self.log('peak_start', f"摸高：初始{scene['min_cc']}..{scene['max_cc']}；TTFT≤{scene['ttft']}s，TPOT≤{scene['tpot']}ms；硬顶={self.values['PEAK_HARD_CAP']}")
+        tolerance = float(scene.get('slo_tolerance', 0))
+        self.log('peak_start', f"摸高：初始{scene['min_cc']}..{scene['max_cc']}，首轮取区间中点；"
+                 f"基础阈值TTFT≤{scene['ttft']}s、TPOT≤{scene['tpot']}ms；"
+                 f"SLO容差={tolerance:.1%}；硬顶={self.values['PEAK_HARD_CAP']}")
         args = ['python3', CONTAINER_AUTOMATION + '/aisbench_perf_matrix.py', '--config-file', CONTAINER_AUTOMATION + '/aisbench_perf_matrix_config.py',
             '--run-tag', tag, '--case-name', scene['name'], '--input-len', str(scene['input_len']), '--output-len', str(scene['output_len']),
             '--min-concurrency', str(scene['min_cc']), '--max-concurrency', str(scene['max_cc']), '--request-multiplier', str(scene['multiplier']),
             '--request-rate', scene['request_rate'], '--ttft-limit', str(scene['ttft']), '--tpot-limit', str(scene['tpot']),
+            '--slo-tolerance', str(tolerance),
             '--wait-seconds', str(scene['wait']), '--failed-req-limit', self.values['FAILED_REQ_LIMIT'],
             '--npu_num', self.values['NPU_NUM'], '--repeat-rate', scene['repeat_rate'], *scene['extra_args']]
         for _, (_, field, option) in PEAK_NEW_DEFAULTS.items():
@@ -402,7 +594,27 @@ class Worker:
                 self.append_row(scene, trial, 'peak_round', evaluation_file=str(file), scope=scope,
                     measurement_state=trial.get('measurement_state', trial.get('state', '')))
                 seen.add(identity)
-                self.log('peak_round', f"摸高轮次完成：配置并发={trial.get('concurrency')}，测量={trial.get('measurement_state', trial.get('state', ''))}",
+                measurement = trial.get('measurement_state', trial.get('state', ''))
+                strict = trial.get('strict_slo_passed')
+                label = ('严格通过' if strict is True else '容差通过' if strict is False else '通过') if measurement == 'PASS' else {
+                    'SLO_FAIL': '超限', 'INVALID': '测量无效', 'ERROR': '执行错误',
+                    'REQUEST_ERROR': '请求错误', 'UNSTABLE': '本轮测量不一致',
+                }.get(measurement, measurement)
+                actual_ttft = trial.get(trial.get('ttft_column', 'TTFT avg'), '')
+                try:
+                    value = float(actual_ttft)
+                    actual_ttft = f'{value / 1000:.4f}s' if math.isfinite(value) else '无有效测量'
+                except (ValueError, TypeError):
+                    actual_ttft = '无适用测量'
+                actual_tpot = trial.get(trial.get('tpot_column', 'TPOT avg'), '')
+                actual_tpot = str(actual_tpot) + 'ms' if actual_tpot != '' else '无适用测量'
+                profile = '确认复测' if trial.get('profile') == 'confirm' else '区间搜索'
+                ttft_limit = f"基础阈值{scene['ttft']}s，容差上限{scene['ttft'] * (1 + tolerance):g}s" if scene['ttft'] > 0 else '此项SLO未启用'
+                tpot_limit = f"基础阈值{scene['tpot']}ms，容差上限{scene['tpot'] * (1 + tolerance):g}ms" if scene['tpot'] > 0 else '此项SLO未启用'
+                self.log('peak_round', f"摸高轮次完成：配置并发={trial.get('concurrency')}，阶段={profile}，测量={label}；"
+                         f"TTFT[{trial.get('ttft_column', 'TTFT avg')}]={actual_ttft}（{ttft_limit}）；"
+                         f"TPOT[{trial.get('tpot_column', 'TPOT avg')}]={actual_tpot}（{tpot_limit}）；"
+                         f"说明={trial.get('reason', '')}",
                     evidence=str(file))
 
         rc = self.run_container(args, float(scene['peak_total_timeout']) + 90, on_progress=publish_rounds)
@@ -430,8 +642,19 @@ class Worker:
             _, scope = self.evaluation(Path(reference)) if reference else ({}, {})
             self.append_row(scene, row, status, evaluation_file=reference, scope=scope, report_file=str(path),
                 selected_trial_id=row.get('selected_trial_id', ''), termination_reason=row.get('termination', ''))
-            self.log('peak_end', f"摸高结束：{status}；配置并发={row.get('concurrency', '未确认')}；实测平均并发={row.get('cc', '无')}；原因={row.get('reason', '')}",
-                level='INFO' if status in {'peak_confirmed', 'peak_capped'} else 'ERROR', evidence=str(path))
+            if status == 'peak_unstable':
+                summaries = report.get('summaries', [])
+                unstable = sorted({point for summary in summaries for point in summary.get('unstable_points', [])})
+                message = (f"摸高结束：边界存在波动；已复测稳定并发={row.get('concurrency') or '尚未找到'}；"
+                           f"实测平均并发={row.get('cc') or '无适用测量'}；最高边界尚未确认；"
+                           f"波动并发={unstable or '详见搜索轨迹'}；"
+                           f"说明=同一并发的完整复测出现通过与超限，已保留独立确认的稳定点和原始证据；详细记录={path}")
+            else:
+                message = (f"摸高结束：{status}；配置并发={row.get('concurrency') or '未确认'}；"
+                           f"实测平均并发={row.get('cc') or '无适用测量'}；说明={row.get('reason', '')}；详细记录={path}")
+            level = ('INFO' if status in {'peak_confirmed', 'peak_capped'} else
+                     'WARNING' if status in {'peak_unstable', 'peak_budget', 'peak_no_pass', 'peak_cancelled'} else 'ERROR')
+            self.log('peak_end', message, level=level, evidence=str(path), raw_reason=row.get('reason', ''))
         # Path conversion changes JSON bytes after the container's final seal.
         # Seal the completed host evidence only after every conversion is done.
         previous = json.loads((path.parent / 'archive_manifest.json').read_text(encoding='utf-8'))

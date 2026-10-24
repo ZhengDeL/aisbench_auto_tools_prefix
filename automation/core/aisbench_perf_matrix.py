@@ -86,6 +86,7 @@ class SearchCase:
     total_timeout: float = 14400
     invalid_retries: int = 1
     floor_concurrency: int = 1
+    slo_tolerance: float = 0.0
 
     @property
     def slug(self) -> str:
@@ -142,7 +143,7 @@ class EvaluationResult:
 
 
 def parse_args() -> Tuple[argparse.Namespace, List[str]]:
-    parser = argparse.ArgumentParser(description="Run standalone aisbench peak search with binary search and full logs.")
+    parser = argparse.ArgumentParser(description="Run standalone aisbench peak search with window bisection and fresh confirmation.")
     parser.add_argument("--config-file", type=str, default=DEFAULT_CONFIG_FILE, help="python config file for peak search")
     parser.add_argument("--python-bin", type=str, default=sys.executable, help="python interpreter used to invoke aisbench_test.py")
     parser.add_argument("--run-tag", type=str, default="", help="optional suffix appended to the output directory")
@@ -156,6 +157,8 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
     parser.add_argument("--request-multiplier", type=int, default=None, help="request count multiplier, data_num = concurrency * multiplier")
     parser.add_argument("--ttft-limit", type=float, default=None, help="override TTFT threshold, 0 disables the threshold")
     parser.add_argument("--tpot-limit", type=float, default=None, help="override TPOT threshold, 0 disables the threshold")
+    parser.add_argument("--slo-tolerance", type=float, default=None,
+                        help="relative SLO threshold tolerance in [0,1]; 0 keeps strict limits")
     parser.add_argument("--wait-seconds", type=int, default=None, help="wait time after each run")
     parser.add_argument("--ttft-column", type=str, default=None, help="CSV column used for TTFT threshold evaluation")
     parser.add_argument("--tpot-column", type=str, default=None, help="CSV column used for TPOT threshold evaluation")
@@ -267,6 +270,13 @@ def finite_setting(value: Any, name: str) -> float:
     return result
 
 
+def tolerance_setting(value: Any) -> float:
+    result = finite_setting(value, "slo_tolerance")
+    if not 0 <= result <= 1:
+        raise ValueError("slo_tolerance must be between 0 and 1")
+    return result
+
+
 def build_case(raw_case: Dict[str, Any], default_case: Dict[str, Any], index: int) -> SearchCase:
     merged = dict(default_case)
     merged.update(dict(raw_case or {}))
@@ -330,6 +340,8 @@ def build_case(raw_case: Dict[str, Any], default_case: Dict[str, Any], index: in
         wait_seconds=wait_seconds,
         args=case_args,
         forward_args=forward_args,
+        slo_tolerance=tolerance_setting(raw_case.get("peak_slo_tolerance", raw_case.get("slo_tolerance",
+            merged.get("peak_slo_tolerance", merged.get("slo_tolerance", 0.0))))),
         **settings,
     )
 
@@ -375,6 +387,7 @@ def load_runner_config(args: argparse.Namespace, forwarded: Sequence[str]) -> Ru
     global_args = dict(getattr(module, "GLOBAL_ARGS", {}) or {})
     global_forward_args = list(getattr(module, "GLOBAL_FORWARD_ARGS", []) or [])
     default_case = dict(getattr(module, "DEFAULT_CASE", {}) or {})
+    default_case.setdefault("slo_tolerance", getattr(module, "DEFAULT_SLO_TOLERANCE", 0.0))
     search_cases = list(getattr(module, "SEARCH_CASES", []) or [])
     if not search_cases:
         if not default_case:
@@ -436,6 +449,10 @@ def load_runner_config(args: argparse.Namespace, forwarded: Sequence[str]) -> Ru
 
     global_forward_args.extend(str(item) for item in forwarded)
     for case in cases:
+        tolerance = getattr(args, "slo_tolerance", None)
+        if tolerance is not None:
+            case.slo_tolerance = tolerance
+        case.slo_tolerance = tolerance_setting(case.slo_tolerance)
         for key in PEAK_SETTINGS:
             value = getattr(args, key, None)
             if value is not None:
@@ -568,6 +585,9 @@ def resolve_threshold_reason(case: SearchCase, csv_row: Dict[str, Any], ttft_col
     try:
         finite_setting(case.ttft_limit, "ttft_limit")
         finite_setting(case.tpot_limit, "tpot_limit")
+        tolerance = tolerance_setting(case.slo_tolerance)
+        effective_ttft = finite_setting(case.ttft_limit * (1 + tolerance), "effective_ttft_limit") if case.ttft_limit > 0 else case.ttft_limit
+        effective_tpot = finite_setting(case.tpot_limit * (1 + tolerance), "effective_tpot_limit") if case.tpot_limit > 0 else case.tpot_limit
     except ValueError as error:
         return False, str(error), metrics
     if not metrics:
@@ -575,23 +595,67 @@ def resolve_threshold_reason(case: SearchCase, csv_row: Dict[str, Any], ttft_col
     invalid_reason = invalid_result_reason(metrics, (ttft_column, tpot_column))
     if invalid_reason:
         return False, invalid_reason, metrics
+    tolerated = []
     if case.ttft_limit > 0:
         ttft_value_ms = parse_metric_float(metrics.get(ttft_column, ""))
         if ttft_value_ms is None:
             return False, f"结果缺少 {ttft_column}", metrics
         ttft_value_seconds = convert_ttft_ms_to_seconds(ttft_value_ms)
+        effective = effective_ttft
+        if ttft_value_seconds > effective:
+            return False, f"{ttft_column}={ttft_value_ms}ms（{ttft_value_seconds:.3f}s）超过有效限制 {effective}s（原限制 {case.ttft_limit}s，容差 {tolerance:g}）", metrics
         if ttft_value_seconds > case.ttft_limit:
-            return False, f"{ttft_column}={ttft_value_ms}ms（{ttft_value_seconds:.3f}s）超过限制 {case.ttft_limit}s", metrics
+            tolerated.append(f"{ttft_column}={ttft_value_seconds:g}s，原限制 {case.ttft_limit:g}s，有效限制 {effective:g}s")
     if case.tpot_limit > 0:
         tpot_value = parse_metric_float(metrics.get(tpot_column, ""))
         if tpot_value is None:
             return False, f"结果缺少 {tpot_column}", metrics
+        effective = effective_tpot
+        if tpot_value > effective:
+            return False, f"{tpot_column}={tpot_value}ms 超过有效限制 {effective}ms（原限制 {case.tpot_limit}ms，容差 {tolerance:g}）", metrics
         if tpot_value > case.tpot_limit:
-            return False, f"{tpot_column}={tpot_value}ms 超过限制 {case.tpot_limit}ms", metrics
+            tolerated.append(f"{tpot_column}={tpot_value:g}ms，原限制 {case.tpot_limit:g}ms，有效限制 {effective:g}ms")
+    if tolerated:
+        return True, "容差通过（相对阈值 " + format(tolerance, ".6g") + "）：" + "; ".join(tolerated), metrics
     return True, "满足阈值", metrics
 
 
+def combine_strict_results(values):
+    """Keep missing SLO evidence unknown instead of inventing tolerance usage."""
+    if any(value is False for value in values):
+        return False
+    return True if values and all(value is True for value in values) else None
+
+
+def slo_metadata(case, result, config):
+    """Policy metadata accompanies raw metrics; it never changes their values."""
+    tolerance = tolerance_setting(case.slo_tolerance)
+    strict = None
+    if result is not None and result.state in {"PASS", "SLO_FAIL", "UNSTABLE"} and result.metrics:
+        strict_case = SearchCase(**dict(asdict(case), slo_tolerance=0.0))
+        if not invalid_result_reason(result.metrics, (config.ttft_column, config.tpot_column)):
+            strict = resolve_threshold_reason(strict_case, result.metrics, config.ttft_column, config.tpot_column)[0]
+        main_scopes = [scope for scope in result.scopes if scope.get("phase") == "main"]
+        if main_scopes:
+            values = []
+            for scope in main_scopes:
+                value = scope.get("strict_slo_passed")
+                if value is not True and value is not False:
+                    raw = scope.get("raw_row", {})
+                    value = (resolve_threshold_reason(strict_case, raw, config.ttft_column, config.tpot_column)[0]
+                             if raw and not invalid_result_reason(raw, (config.ttft_column, config.tpot_column))
+                             else None)
+                values.append(value)
+            strict = combine_strict_results(values)
+    return dict(slo_tolerance=tolerance,
+                effective_limits=dict(ttft_limit=finite_setting(case.ttft_limit * (1 + tolerance), "effective_ttft_limit") if case.ttft_limit > 0 else case.ttft_limit,
+                                      tpot_limit=finite_setting(case.tpot_limit * (1 + tolerance), "effective_tpot_limit") if case.tpot_limit > 0 else case.tpot_limit),
+                strict_slo_passed=strict)
+
+
 def validate_aisbench_arguments(tokens: Sequence[str]) -> None:
+    if any(str(token).split("=", 1)[0] in {"--slo-tolerance", "--slo_tolerance"} for token in tokens):
+        raise ValueError("slo_tolerance is a matrix policy; do not forward it to native AISBench")
     if "--test_accuracy" in tokens:
         raise ValueError("peak search cannot use test_accuracy; fixed-concurrency accuracy remains supported")
     numeric_options = {
@@ -646,6 +710,8 @@ def validate_aisbench_arguments(tokens: Sequence[str]) -> None:
 def build_run_command(config: RunnerConfig, case: SearchCase, concurrency: int, num_prompts: int) -> List[str]:
     finite_setting(case.ttft_limit, "ttft_limit")
     finite_setting(case.tpot_limit, "tpot_limit")
+    tolerance_setting(case.slo_tolerance)
+    slo_metadata(case, None, config)
     command = [config.python_bin, str(AISBENCH_TEST_SCRIPT)]
     command.extend(args_dict_to_cli(config.global_args))
     command.extend(config.global_forward_args)
@@ -717,6 +783,9 @@ def run_single_evaluation(
             else:
                 passed, why, _ = resolve_threshold_reason(case, raw, config.ttft_column, config.tpot_column)
                 scope.update(metric_state="PASS" if passed else "SLO_FAIL", metric_reason=why)
+                strict_case = SearchCase(**dict(asdict(case), slo_tolerance=0.0))
+                scope.update(slo_tolerance=case.slo_tolerance,
+                             strict_slo_passed=resolve_threshold_reason(strict_case, raw, config.ttft_column, config.tpot_column)[0])
             outcomes.append(scope["metric_state"])
         if not outcomes:
             state, reason = "INVALID", "no main measurement scope for peak evaluation"
@@ -724,9 +793,10 @@ def run_single_evaluation(
             state = "INVALID"
             reason = "; ".join(scope["metric_reason"] for scope in main_scopes if scope["metric_state"] == "INVALID")
         elif all(value == "PASS" for value in outcomes):
-            state, reason = "PASS", "all main scopes satisfy configured constraints"
+            tolerated = [scope["metric_reason"] for scope in main_scopes if scope.get("strict_slo_passed") is False]
+            state, reason = "PASS", ("; ".join(tolerated) if tolerated else "all main scopes satisfy configured constraints")
         elif all(value == "SLO_FAIL" for value in outcomes):
-            state, reason = "SLO_FAIL", "all main scopes exceed configured SLO"
+            state, reason = "SLO_FAIL", "; ".join(scope["metric_reason"] for scope in main_scopes)
         else:
             state, reason = "UNSTABLE", "repeat scopes disagree under the same trial"
     selection_report = dict(report, state=state)
@@ -750,7 +820,8 @@ def run_single_evaluation(
     )
     # Keep execution details and searchable peak policy together in one document.
     report.update(peak_evaluation=asdict(result), state=state, reason=reason, profile=profile,
-                  selected_scope_id=selected_scope_id, raw_row=row, selection_reason=selection_reason)
+                  selected_scope_id=selected_scope_id, raw_row=row, selection_reason=selection_reason,
+                  slo_policy=slo_metadata(case, result, config))
     atomic_json(run_dir / "evaluation.json", report)
     atomic_json(run_dir / "request_meta.json", dict(case=asdict(case), sequence_id=sequence_id,
                                                    concurrency=concurrency, num_prompts=num_prompts,
@@ -765,6 +836,7 @@ def run_single_evaluation(
 
 def trace_row(case: SearchCase, result: EvaluationResult, config: RunnerConfig) -> Dict[str, Any]:
     row = dict(result.metrics)
+    row.update(slo_metadata(case, result, config))
     row.update(
         {
             "case_name": case.name,
@@ -807,7 +879,14 @@ class SearchStop(Exception):
 
 
 class PeakSearcher:
-    """Bounded exponential bracketing and bisection with independent confirmation."""
+    """Search unknown integer windows, then confirm both measured boundaries.
+
+    Initial min/max are probe bounds, never invented passing/failing samples.
+    An uncapped passing endpoint opens a doubled window whose midpoint is
+    measured first. Only independent, complete confirmation measurements may
+    produce a selected stable result; a noisy upper point cannot certify it as
+    the highest passing boundary.
+    """
     def __init__(self, case, config, case_dir, logger, on_evaluation=None):
         self.case, self.config, self.case_dir, self.logger = case, config, case_dir, logger
         self.on_evaluation = on_evaluation
@@ -815,8 +894,14 @@ class PeakSearcher:
         self.history = []
         self.profile = "explore"
         self.started = time.monotonic()
+        self.next_eval_at = self.started
         self.confirmed_pass = {}
         self.confirmed_fail = {}
+        self.confirmation_trials = {}
+        self.confirmation_attempts = []
+        self.confirmation_candidate = None
+        self.unstable_points = set()
+        self.recovery_reason = ""
         self.termination = ""
         self.reason = ""
 
@@ -828,7 +913,88 @@ class PeakSearcher:
         if len(self.history) >= self.case.max_trials or self.remaining <= 0:
             raise SearchStop("budget_limit", "trial count or total elapsed time budget exhausted")
 
-    def evaluate(self, concurrency, fresh=False):
+    def wait_before_evaluation(self):
+        """Spend recovery time only when another real measurement is needed.
+
+        Cached observations and completed searches must not pay a final sleep.
+        The next deadline starts after evaluation/publication callbacks, matching
+        the previous inter-round recovery guarantee. Waiting remains part of the
+        total budget and may never authorize a request after that budget expires.
+        """
+        self._check_budget()
+        while True:
+            delay = self.next_eval_at - time.monotonic()
+            if delay <= 0:
+                return
+            delay = min(delay, max(0, self.remaining))
+            if delay <= 0:
+                self._check_budget()
+            self.logger.info("下一轮真实评测前等待 %.3fs 恢复间隔（计入总时间预算）", delay)
+            time.sleep(delay)
+            self._check_budget()
+
+    def measurement_text(self, result):
+        """Render measured units and configured policy together for decisions."""
+        ttft = result.metrics.get(self.config.ttft_column)
+        tpot = result.metrics.get(self.config.tpot_column)
+        ttft_seconds = parse_metric_float(ttft) if ttft is not None else None
+        ttft_text = (str(ttft) + "ms（" + format(ttft_seconds / 1000, ".6g") + "s）"
+                     if ttft_seconds is not None else "未取得可信值")
+        policy = slo_metadata(self.case, result, self.config)
+        limits = policy["effective_limits"]
+        return ("scope=" + (result.selected_scope_id or "无")
+                + "；TTFT[" + self.config.ttft_column + "]=" + ttft_text
+                + "，原阈值=" + str(self.case.ttft_limit) + "s，有效阈值=" + str(limits["ttft_limit"]) + "s"
+                + "；TPOT[" + self.config.tpot_column + "]=" + (str(tpot) + "ms" if tpot is not None else "未取得可信值")
+                + "，原阈值=" + str(self.case.tpot_limit) + "ms，有效阈值=" + str(limits["tpot_limit"]) + "ms"
+                + "；相对容差=" + str(self.case.slo_tolerance)
+                + "；严格阈值判定=" + ({True: "通过", False: "未通过", None: "未知"}[policy["strict_slo_passed"]]))
+
+    def complete_repeat_disagreement(self, result):
+        """Accept only a sourced, complete repeat mix as recoverable noise.
+
+        This is still UNSTABLE, never a failing SLO boundary. Reuse the existing
+        original-CSV/selection checks for every main scope before allowing a
+        confirmation caller to retain its identity and seek a lower point.
+        """
+        main = [scope for scope in result.scopes if scope.get("phase") == "main"]
+        if (result.state != "UNSTABLE" or type(result.return_code) is not int or result.return_code != 0
+                or len(main) < 2 or not result.selected_scope_id or not result.metrics
+                or {scope.get("metric_state") for scope in main} != {"PASS", "SLO_FAIL"}):
+            return False
+        selected_row = None
+        for scope in main:
+            if scope.get("state") != "PASS":
+                return False
+            selected, row, _ = selected_measurement(dict(state="UNSTABLE", return_code=0,
+                selected_scope_id=scope.get("scope_id"), scopes=result.scopes), Path(result.run_dir))
+            if not selected or invalid_result_reason(row, (self.config.ttft_column, self.config.tpot_column)):
+                return False
+            counts = scope.get("counts", {})
+            success = parse_metric_float(counts.get("success", scope.get("success_requests", "")))
+            failed = parse_metric_float(counts.get("failed", scope.get("failed_requests", "")))
+            total = parse_metric_float(row.get("total_req", ""))
+            # A cancelled/interrupted request is not ordinary repeat noise.
+            # Missing cancellation counters are inferable as zero only from a
+            # complete success+failure total; every explicit alias must be a
+            # valid zero instead of being hidden by another counter field.
+            cancelled = ([counts["cancelled"]] if "cancelled" in counts else [])
+            if "cancelled_requests" in scope:
+                cancelled.append(scope["cancelled_requests"])
+            if (success is None or success <= 0 or success != int(success)
+                    or failed is None or failed < 0 or failed != int(failed)
+                    or failed > self.config.failed_req_limit or total is None or total <= 0 or total != int(total)
+                    or success + failed != total or any(parse_metric_float(value) != 0 for value in cancelled)
+                    or total < self.case.confirm_min_requests):
+                return False
+            passed, _, _ = resolve_threshold_reason(self.case, row, self.config.ttft_column, self.config.tpot_column)
+            if scope["metric_state"] != ("PASS" if passed else "SLO_FAIL"):
+                return False
+            if scope.get("scope_id") == result.selected_scope_id:
+                selected_row = row
+        return selected_row == result.metrics
+
+    def evaluate(self, concurrency, fresh=False, allow_unstable=False):
         cap = self.config.auto_expand_max_concurrency
         if concurrency < self.case.floor_concurrency or (cap and concurrency > cap):
             raise ValueError("probe outside hard floor/cap")
@@ -836,7 +1002,7 @@ class PeakSearcher:
         if not fresh and key in self.cache:
             return self.cache[key][-1]
         for attempt in range(self.case.invalid_retries + 1):
-            self._check_budget()
+            self.wait_before_evaluation()
             remaining = self.remaining
             if remaining <= 0:
                 raise SearchStop("budget_limit", "total elapsed time budget exhausted before trial")
@@ -857,12 +1023,9 @@ class PeakSearcher:
             self.history.append(result)
             if self.on_evaluation:
                 self.on_evaluation(result, self.history)
+            self.next_eval_at = time.monotonic() + self.case.wait_seconds
             if result.state in {"PASS", "SLO_FAIL"}:
                 self.cache.setdefault(key, []).append(result)
-            if self.case.wait_seconds:
-                wait = min(self.case.wait_seconds, max(0, self.remaining))
-                if wait:
-                    time.sleep(wait)
             if result.state == "INVALID":
                 if attempt < self.case.invalid_retries:
                     continue
@@ -874,15 +1037,95 @@ class PeakSearcher:
                     raise SearchStop("budget_limit", "total elapsed time budget exhausted during trial")
                 raise SearchStop("error", result.reason)
             if result.state == "UNSTABLE":
+                if allow_unstable and fresh and self.profile == "confirm" and self.complete_repeat_disagreement(result):
+                    return result
                 raise SearchStop("unstable", result.reason)
             if result.state not in {"PASS", "SLO_FAIL"}:
                 raise SearchStop("error", "unknown measurement state: " + result.state)
             return result
         raise AssertionError("unreachable retry state")
 
-    def confirm(self, concurrency):
+    def confirm(self, concurrency, expected_state=None):
+        """Continue this case's fresh sequence, stopping on its first mismatch.
+
+        A candidate's first failure is enough to reject an all-PASS target;
+        recovery runs before spending more requests on that point. The same
+        actual fresh trial may subsequently be the first member of an all-FAIL
+        boundary sequence. Explore/cache results never enter this collection,
+        and each trial/sequence identity is counted at most once. Mixed fresh
+        states remain unstable even if later samples would make a majority.
+        """
         self.profile = "confirm"
-        results = [self.evaluate(concurrency, fresh=True) for _ in range(self.case.confirm_runs)]
+        results = self.confirmation_trials.setdefault(concurrency, [])
+        resumed = len(results)
+        self.logger.info("独立复测：并发%s，目标%s，已有本次fresh测量%s/%s（不含探索或历史结果）",
+                         concurrency, expected_state or "一致判定", resumed, self.case.confirm_runs)
+
+        def record(outcome):
+            self.confirmation_attempts.append(dict(
+                concurrency=concurrency, expected_state=expected_state,
+                states=[item.state for item in results],
+                trial_ids=[item.trial_id for item in results],
+                sequence_ids=[item.sequence_id for item in results],
+                resumed_trial_count=resumed, new_trial_count=len(results) - resumed,
+                required_runs=self.case.confirm_runs,
+                complete=(len(results) == self.case.confirm_runs
+                          and {item.state for item in results} in ({"PASS"}, {"SLO_FAIL"})),
+                outcome=outcome,
+            ))
+
+        while True:
+            states = {item.state for item in results}
+            if "UNSTABLE" in states:
+                self.unstable_points.add(concurrency)
+                self.confirmed_pass.pop(concurrency, None)
+                self.confirmed_fail.pop(concurrency, None)
+                record("unstable_measurement")
+                self.logger.warning("并发%s的单轮repeat出现完整但相互矛盾的SLO结果；保留UNSTABLE，不作全失败边界；下一步%s",
+                                    concurrency, "先寻找更低稳定点" if expected_state == "PASS" else "保留已确认稳定下界并结束未确认边界")
+                if expected_state == "PASS":
+                    return next(item for item in reversed(results) if item.state == "UNSTABLE")
+                raise SearchStop("unstable", "complete repeat scopes disagree at concurrency " + str(concurrency))
+            if len(states) > 1:
+                self.unstable_points.add(concurrency)
+                self.confirmed_pass.pop(concurrency, None)
+                self.confirmed_fail.pop(concurrency, None)
+                record("unstable")
+                if expected_state == "PASS":
+                    self.logger.warning("并发%s的fresh结果%s不一致；不作通过或全失败，先寻找更低稳定点",
+                                        concurrency, [item.state for item in results])
+                    # Find a lower fully confirmed point before ending with an
+                    # unstable upper boundary. Return the actual failing trial,
+                    # never relabel the most recent passing measurement.
+                    return next(item for item in reversed(results) if item.state == "SLO_FAIL")
+                self.logger.warning("并发%s的fresh结果%s不一致；保留已确认稳定点，最高边界尚未确认",
+                                    concurrency, [item.state for item in results])
+                raise SearchStop("unstable", "fresh confirmation trials disagree at concurrency " + str(concurrency))
+            if results and expected_state and states != {expected_state}:
+                record("target_rejected")
+                self.logger.warning("并发%s未满足复测目标%s（实际%s）；%s；下一步%s",
+                                    concurrency, expected_state, results[-1].state, self.measurement_text(results[-1]),
+                                    "先降档寻找稳定点，不机械跑完剩余复测" if expected_state == "PASS" else "重建搜索区间，不能将通过点当失败边界")
+                return results[-1]
+            if len(results) == self.case.confirm_runs:
+                break
+            try:
+                self.logger.info("独立复测：并发%s，第%s/%s轮，目标%s",
+                                 concurrency, len(results) + 1, self.case.confirm_runs, expected_state or "一致判定")
+                result = self.evaluate(concurrency, fresh=True, allow_unstable=True)
+            except SearchStop as stop:
+                record("interrupted_" + stop.termination)
+                raise
+            except KeyboardInterrupt:
+                record("interrupted_cancelled")
+                raise
+            if (any(item.sequence_id == result.sequence_id for item in results)
+                    or (result.trial_id and any(item.trial_id == result.trial_id for item in results))):
+                raise SearchStop("error", "fresh confirmation reused a measurement identity")
+            results.append(result)
+            self.logger.info("复测测量：并发%s，第%s/%s轮=%s；%s；原因=%s",
+                             concurrency, len(results), self.case.confirm_runs, result.state,
+                             self.measurement_text(result), result.reason)
         states = {item.state for item in results}
         if states == {"PASS"}:
             if concurrency in self.confirmed_fail or any(cc < concurrency for cc in self.confirmed_fail):
@@ -894,19 +1137,43 @@ class PeakSearcher:
                 raise SearchStop("unstable", "confirmed higher pass contradicts lower failure")
             self.confirmed_fail[concurrency] = results[-1]
             self.confirmed_pass.pop(concurrency, None)
-        else:
-            raise SearchStop("unstable", "fresh confirmation trials disagree")
+        record("confirmed")
+        self.logger.info("并发%s独立复测完成：%s/%s全部%s；trial=%s",
+                         concurrency, len(results), self.case.confirm_runs, results[-1].state,
+                         [item.trial_id for item in results])
         return results[-1]
+
+    def probe_window(self, lower, upper):
+        """Bisect inclusive unknown bounds without fabricating endpoint states."""
+        success = failure = None
+        while lower <= upper:
+            if success is not None and failure is not None and failure.concurrency - success.concurrency <= self.case.precision:
+                break
+            middle = (lower + upper) // 2
+            self.logger.info("区间二分：当前[%s,%s]，先测中点%s，端点不预设通过或失败", lower, upper, middle)
+            result = self.evaluate(middle)
+            if result.passed:
+                success, lower = result, result.concurrency + 1
+            else:
+                failure, upper = result, result.concurrency - 1
+            action = ("搜索" + ("上" if result.passed else "下") + "半区间[" + str(lower) + "," + str(upper) + "]"
+                      if lower <= upper else "当前区间结束，进入独立复测或下一窗口")
+            self.logger.info("二分判定：并发%s=%s；%s；下一步%s", middle, result.state, self.measurement_text(result), action)
+        return success, failure
 
     def binary_between(self, success_result, fail_result):
         left, right = success_result.concurrency, fail_result.concurrency
         best = success_result
         while right - left > self.case.precision:
-            result = self.evaluate((left + right) // 2)
+            middle = (left + right) // 2
+            self.logger.info("边界二分：已观测通过%s、失败%s，中点%s", left, right, middle)
+            result = self.evaluate(middle)
             if result.passed:
                 best, left = result, result.concurrency
             else:
                 fail_result, right = result, result.concurrency
+            self.logger.info("边界更新：并发%s=%s；%s；下一步区间[%s,%s]（精度%s）",
+                             middle, result.state, self.measurement_text(result), left, right, self.case.precision)
         return best, fail_result
 
     def find_downward_success(self, failing_result):
@@ -914,6 +1181,7 @@ class PeakSearcher:
         floor = self.case.floor_concurrency
         while current.concurrency > floor:
             probe = max(floor, current.concurrency // 2)
+            self.logger.info("向下找通过点：已观测失败%s，半降到%s（硬下限%s）", current.concurrency, probe, floor)
             result = self.evaluate(probe)
             if result.passed:
                 return result, current
@@ -924,16 +1192,107 @@ class PeakSearcher:
         current = success_result
         cap = self.config.auto_expand_max_concurrency
         while not cap or current.concurrency < cap:
-            probe = max(current.concurrency + 1, current.concurrency * 2)
-            if current.concurrency < self.case.max_concurrency < probe:
-                probe = self.case.max_concurrency
+            upper = max(current.concurrency + 1, current.concurrency * 2)
             if cap:
-                probe = min(probe, cap)
-            result = self.evaluate(probe)
-            if not result.passed:
-                return current, result
-            current = result
+                upper = min(upper, cap)
+            self.logger.info("端点%s已测通过；扩展窗口[%s,%s]，先测中点%s；硬顶=%s",
+                             current.concurrency, current.concurrency + 1, upper,
+                             (current.concurrency + 1 + upper) // 2, cap or "关闭")
+            # For a measured endpoint 200 this probes 201..400 at 300 first,
+            # rather than paying for an unmeasured 400 before using the range.
+            success, failure = self.probe_window(current.concurrency + 1, upper)
+            if success is not None:
+                current = success
+            if failure is not None:
+                return current, failure
         return current, None
+
+    def recover_stable(self, rejected):
+        """Try the adjacent lower point first; halve after repeated rejection.
+
+        Every returned success has its own complete fresh PASS sequence. A
+        long failing region is not scanned one concurrency at a time: after
+        the adjacent attempt fails, halve toward the hard floor and let the
+        existing bisection refine a passing/failing bracket.
+        """
+        failure = rejected
+        adjacent = True
+        floor = self.case.floor_concurrency
+        self.recovery_reason = ("candidate concurrency " + str(rejected.concurrency)
+                                + " confirmation failed: " + rejected.reason
+                                + "; searching lower independently confirmed concurrency")
+        self.logger.warning("并发%s确认未通过；%s；原因=%s；下一步优先验证相邻低点，随后必要时半降/二分",
+                            rejected.concurrency, self.measurement_text(rejected), rejected.reason)
+        while failure.concurrency > floor:
+            # The adjacent candidate deserves immediate full confirmation.
+            # After it fails, use single complete measurements for halving and
+            # bisection; only their final candidate spends the full fresh set.
+            if adjacent:
+                probe = failure.concurrency - 1
+                adjacent = False
+                self.confirmation_candidate = probe
+                self.logger.info("稳定点恢复：由%s退到%s，对新点独立复测%s轮", failure.concurrency, probe, self.case.confirm_runs)
+                result = self.confirm(probe, "PASS")
+            else:
+                self.logger.info("相邻点%s仍未稳定；向硬下限%s半降并二分，不线性遍历所有并发", failure.concurrency, floor)
+                success, failed = self.find_downward_success(failure)
+                if success is None:
+                    failure = failed
+                    break
+                candidate, failed = self.binary_between(success, failed)
+                self.confirmation_candidate = candidate.concurrency
+                result = self.confirm(candidate.concurrency, "PASS")
+                if result.passed:
+                    return result, failed
+            if result.passed:
+                return result, failure
+            failure = result
+        floor_result = self.confirm(floor, "SLO_FAIL")
+        if not floor_result.passed:
+            raise SearchStop("no_pass", "no passing point found; hard floor independently reconfirmed")
+        return None, floor_result
+
+    def confirm_boundary(self, candidate, failure):
+        """Return a certified endpoint, or rebuild if the full profile moves it."""
+        original_failure = failure
+        recovered = False
+        while True:
+            self.confirmation_candidate = candidate.concurrency
+            candidate_check = self.confirm(candidate.concurrency, "PASS")
+            if not candidate_check.passed:
+                candidate, failure = self.recover_stable(candidate_check)
+                recovered = True
+                if candidate is None:
+                    return None
+                candidate, failure = self.binary_between(candidate, failure)
+                continue
+            if failure is None:
+                self.termination, self.reason = "capped", "configured hard cap passed; higher failure not observed"
+                return candidate_check
+            failure_check = self.confirm(failure.concurrency, "SLO_FAIL")
+            if failure_check.passed:
+                # The stronger measurement changed the exploratory boundary.
+                # Keep the confirm profile permanently; do not reuse short data.
+                return None
+            if failure.concurrency - candidate.concurrency > self.case.precision:
+                candidate, failure = self.binary_between(candidate_check, failure_check)
+                continue
+            if recovered and original_failure is not None and original_failure.concurrency > failure.concurrency:
+                # A single fresh check guards a previously observed higher
+                # failure after recovery moved the boundary. It is not counted
+                # as a complete FAIL confirmation or substituted for the nearest
+                # boundary's full sequence.
+                guard = self.evaluate(original_failure.concurrency, fresh=True)
+                self.confirmation_attempts.append(dict(
+                    concurrency=guard.concurrency, expected_state="SLO_FAIL",
+                    states=[guard.state], trial_ids=[guard.trial_id], sequence_ids=[guard.sequence_id],
+                    resumed_trial_count=0, new_trial_count=1, required_runs=self.case.confirm_runs,
+                    complete=False, outcome="monotonicity_guard"))
+                if guard.passed:
+                    self.unstable_points.add(guard.concurrency)
+                    raise SearchStop("unstable", "measured higher pass contradicts confirmed lower failure")
+            self.termination, self.reason = "boundary_confirmed", "fresh boundary confirmed within configured precision"
+            return candidate_check
 
     def _best_confirmed(self):
         return max(self.confirmed_pass.values(), key=lambda item: item.concurrency, default=None)
@@ -942,34 +1301,26 @@ class PeakSearcher:
         try:
             while True:
                 cap = self.config.auto_expand_max_concurrency
-                initial = min(self.case.min_concurrency, cap) if cap else self.case.min_concurrency
-                baseline = self.evaluate(initial)
-                if not baseline.passed:
-                    success, failure = self.find_downward_success(baseline)
-                    if success is None:
-                        floor_result = self.confirm(self.case.floor_concurrency)
-                        if not floor_result.passed:
-                            self.termination = "no_pass"
-                            self.reason = "no passing point found; hard floor independently reconfirmed"
-                            return None, self.history
-                        # Confirmation changed the floor classification; never reuse explore cache.
-                        continue
-                else:
-                    success, failure = self.find_upward_failure(baseline)
-                if failure is not None:
-                    candidate, failure = self.binary_between(success, failure)
-                    candidate_check = self.confirm(candidate.concurrency)
-                    failure_check = self.confirm(failure.concurrency)
-                    if candidate_check.passed and not failure_check.passed:
-                        self.termination, self.reason = "boundary_confirmed", "fresh boundary confirmed within configured precision"
-                        return candidate_check, self.history
-                    # Short profile invalidated: profile remains confirm permanently.
+                upper = min(self.case.max_concurrency, cap) if cap else self.case.max_concurrency
+                lower = min(self.case.min_concurrency, upper)
+                success, failure = self.probe_window(lower, upper)
+                if success is None and lower > self.case.floor_concurrency:
+                    success, lower_failure = self.probe_window(self.case.floor_concurrency, lower - 1)
+                    if lower_failure is not None:
+                        failure = lower_failure
+                if success is None:
+                    floor_result = self.confirm(self.case.floor_concurrency, "SLO_FAIL")
+                    if not floor_result.passed:
+                        self.termination, self.reason = "no_pass", "no passing point found; hard floor independently reconfirmed"
+                        return None, self.history
                     continue
-                cap_check = self.confirm(success.concurrency)
-                if cap_check.passed:
-                    self.termination, self.reason = "capped", "configured hard cap passed; higher failure not observed"
-                    return cap_check, self.history
-                # Cap failed with confirmation samples; rebuild under this profile.
+                if failure is None:
+                    success, failure = self.find_upward_failure(success)
+                if failure is not None:
+                    success, failure = self.binary_between(success, failure)
+                confirmed = self.confirm_boundary(success, failure)
+                if confirmed is not None:
+                    return confirmed, self.history
         except SearchStop as stop:
             self.termination, self.reason = stop.termination, stop.reason
         except KeyboardInterrupt:
@@ -985,7 +1336,7 @@ class PeakSearcher:
             values = [scope.get(key) for scope in scopes]
             return sum(values) if values and all(isinstance(value, int) for value in values) else None
         return dict(
-            algorithm="exponential-bracket-bisection-confirmation-v1",
+            algorithm="window-bisection-fresh-confirmation-v2",
             termination=self.termination, reason=self.reason,
             profile=self.profile, trial_count=len(self.history),
             elapsed_seconds=time.monotonic() - self.started,
@@ -1000,12 +1351,21 @@ class PeakSearcher:
             constraints_enabled=self.case.ttft_limit > 0 or self.case.tpot_limit > 0,
             initial_range=[self.case.min_concurrency, self.case.max_concurrency],
             hard_cap=self.config.auto_expand_max_concurrency,
+            slo_tolerance=self.case.slo_tolerance,
+            effective_limits=slo_metadata(self.case, confirmed, self.config)["effective_limits"],
+            strict_slo_passed=(combine_strict_results([slo_metadata(self.case, item, self.config)["strict_slo_passed"]
+                                  for item in self.confirmation_trials.get(confirmed.concurrency, [])])
+                               if confirmed is not None else None),
+            confirmation_candidate=self.confirmation_candidate,
+            confirmation_attempts=self.confirmation_attempts,
+            unstable_points=sorted(self.unstable_points),
+            recovery_reason=self.recovery_reason,
             main_scope_count=sum(scope.get("phase") == "main" for scope in scopes),
             prefix_scope_count=sum(scope.get("phase") == "prefix" for scope in scopes),
             success_requests=complete_sum("success_requests"),
             failed_requests=complete_sum("failed_requests"),
             attempts=None,
-            settings={name: getattr(self.case, name) for name in PEAK_SETTINGS},
+            settings=dict({name: getattr(self.case, name) for name in PEAK_SETTINGS}, slo_tolerance=self.case.slo_tolerance),
         )
 
 
@@ -1063,6 +1423,8 @@ def write_case_summary(
         "tpot_limit": case.tpot_limit,
         "run_dir": str(case_dir),
     }
+    if best_result is None:
+        best_row.update(slo_metadata(case, None, config))
     write_csv_report(case_dir / "search_trace.csv", trace_rows)
     write_markdown_report(case_dir / "search_trace.md", trace_rows)
     write_csv_report(case_dir / "best_result.csv", [best_row])

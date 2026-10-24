@@ -27,6 +27,117 @@ import uuid
 
 from aisbench_result_adapter import read_last_result, read_accuracy_scope
 _ACTIVE_PROCESSES = []
+_CONSOLE_FAILURES = {}
+
+
+def disable_console_mirror(descriptor, error):
+    _CONSOLE_FAILURES[descriptor] = dict(
+        stream="stdout" if descriptor == 1 else "stderr",
+        error_type=type(error).__name__, errno=getattr(error, "errno", None))
+    try:
+        sink = os.open(os.devnull, os.O_WRONLY)
+        if sink != descriptor:
+            try:
+                os.dup2(sink, descriptor)
+            finally:
+                os.close(sink)
+    except OSError:
+        pass
+
+
+def console_message(message):
+    """Status text is optional; the independent raw files own the evidence."""
+    try:
+        print(message, flush=True)
+    except (OSError, ValueError, UnicodeError) as error:
+        disable_console_mirror(1, error)
+
+
+class RawConsoleMirror:
+    """Best-effort bounded-memory tails; console I/O never owns raw capture."""
+
+    def __init__(self, stdout_path, stderr_path, enabled):
+        self.enabled = enabled
+        self.paths = {1: Path(stdout_path), 2: Path(stderr_path)}
+        self.done = threading.Event()
+        self.notice = threading.Event()
+        self.stopped = {1: threading.Event(), 2: threading.Event()}
+        self.lock = threading.Lock()
+        self.failures = list(_CONSOLE_FAILURES.values())
+        self.threads = {}
+        self.sealed = False
+        if not enabled:
+            return
+        for descriptor in self.paths:
+            if descriptor in _CONSOLE_FAILURES:
+                self.stopped[descriptor].set()
+            else:
+                reader = threading.Thread(target=self._tail, args=(descriptor,), daemon=True)
+                self.threads[descriptor] = reader
+                reader.start()
+
+    def _save_failure(self, failures):
+        try:
+            atomic_json(self.paths[1].parent / "console_forwarding.json",
+                        dict(schema_version=1, state="degraded", raw_capture_enabled=True,
+                             console_complete=False, failures=failures))
+        except (OSError, ValueError):
+            # Raw-file failures remain fatal in the mandatory capture path.
+            pass
+
+    def _degrade(self, descriptor, error, reason):
+        with self.lock:
+            if self.sealed or self.stopped[descriptor].is_set():
+                return
+            self.stopped[descriptor].set()
+            disable_console_mirror(descriptor, error)
+            self.failures.append(dict(_CONSOLE_FAILURES[descriptor], reason=reason))
+
+    def _tail(self, descriptor):
+        try:
+            with self.paths[descriptor].open("rb", buffering=0) as source:
+                while not self.stopped[descriptor].is_set():
+                    block = source.read(65536)
+                    if not block:
+                        if self.done.is_set():
+                            return
+                        self.notice.wait(.02)
+                        self.notice.clear()
+                        continue
+                    pending = memoryview(block)
+                    while pending and not self.stopped[descriptor].is_set():
+                        try:
+                            written = os.write(descriptor, pending)
+                        except InterruptedError:
+                            continue
+                        if written <= 0:
+                            raise OSError("console write made no progress")
+                        pending = pending[written:]
+        except (OSError, ValueError) as error:
+            self._degrade(descriptor, error, "console tail write/read failed")
+
+    def finish(self):
+        if not self.enabled:
+            return
+        self.done.set()
+        self.notice.set()
+        # A blocked observer must not extend a request/process deadline or
+        # keep the engine alive. Each tail owns at most one 64KiB block.
+        deadline = time.monotonic() + .25
+        for reader in self.threads.values():
+            reader.join(timeout=max(0, deadline - time.monotonic()))
+        for descriptor, reader in self.threads.items():
+            if reader.is_alive():
+                self._degrade(descriptor, TimeoutError("console tail did not drain"),
+                              "console backpressure; bounded 0.25s final drain exhausted")
+        with self.lock:
+            self.sealed = True
+            failures = list(self.failures)
+        if failures:
+            # Only the controlling thread commits evidence, once all observers
+            # are finished or sealed. Late blocked writes cannot mutate files
+            # after the caller creates its artifact manifest.
+            self._save_failure(failures)
 
 
 def split_native_pipeline(command):
@@ -377,7 +488,7 @@ def stop_process(process):
 
 def stream_process(command, cwd, stdout_path, stderr_path, *, timeout=None, echo=False,
                    group=True, tee_paths=(), chunk_index=None, **kwargs):
-    """Drain both streams concurrently; write failures terminate the process."""
+    """Keep raw streams mandatory; a disconnected console is only a mirror."""
     errors = []
     from contextlib import ExitStack
     with ExitStack() as stack:
@@ -393,6 +504,8 @@ def stream_process(command, cwd, stdout_path, stderr_path, *, timeout=None, echo
         options.update(kwargs)
         process = subprocess.Popen(command, **options)
         _ACTIVE_PROCESSES.append(process)
+        mirror = RawConsoleMirror(stdout_path, stderr_path, echo)
+        stack.callback(mirror.finish)
 
         def drain(pipe, target, descriptor):
             try:
@@ -412,8 +525,7 @@ def stream_process(command, cwd, stdout_path, stderr_path, *, timeout=None, echo
                             journal.write(json.dumps(dict(sequence=sequence[0], stream="stdout" if descriptor == 1 else "stderr",
                                                           offset=offset, size=len(block))) + "\n")
                             journal.flush()
-                        if echo:
-                            os.write(descriptor, block)
+                    mirror.notice.set()
             except BaseException as error:
                 errors.append(str(error))
                 stop_process(process)
@@ -597,7 +709,7 @@ def _child(native_root, evidence_dir, arguments, native_script, source_root=None
         except (AttributeError, OSError, ImportError):
             pass
         scopes.append(scope)
-        print("AISBENCH_SCOPE_START " + json.dumps({"scope_id": scope_id, "phase": phase}), flush=True)
+        console_message("AISBENCH_SCOPE_START " + json.dumps({"scope_id": scope_id, "phase": phase}))
         atomic_json(evidence_dir / "scopes.json", scopes)
         # Bash pipefail repairs shell pipeline status at runtime; no native file changes.
         original_command = command
@@ -612,7 +724,7 @@ def _child(native_root, evidence_dir, arguments, native_script, source_root=None
             executable = keywords.get("executable")
         try:
             rc, _ = stream_process(command, native_root, scope["stdout_log"], scope["stderr_log"],
-                                   echo=False, group=True, shell=keywords.get("shell", False),
+                                   echo=True, group=True, shell=keywords.get("shell", False),
                                    tee_paths=[native_root / name for name in ("aisbench.log", "aisbench_all.log")] if split_streams else (),
                                    chunk_index=root / "stream_chunks.jsonl",
                                    **({"executable": executable} if executable else {}))
@@ -668,7 +780,7 @@ def _child(native_root, evidence_dir, arguments, native_script, source_root=None
         artifact_manifest(root)
         atomic_json(root / "scope.json", scope)
         atomic_json(evidence_dir / "scopes.json", scopes)
-        print("AISBENCH_SCOPE_END " + json.dumps({"scope_id": scope_id, "phase": phase, "return_code": rc}), flush=True)
+        console_message("AISBENCH_SCOPE_END " + json.dumps({"scope_id": scope_id, "phase": phase, "return_code": rc}))
         if rc and keywords.get("check"):
             raise subprocess.CalledProcessError(rc, command)
         return subprocess.CompletedProcess(command, rc)
@@ -683,7 +795,7 @@ def _child(native_root, evidence_dir, arguments, native_script, source_root=None
 
 
 def execute_native(native_root, evidence_dir, arguments, *, timeout=1800, failed_req_limit=0,
-                   python_bin=None, native_script=None, echo=False):
+                   python_bin=None, native_script=None, echo=True):
     started_monotonic = time.monotonic()
     if not math.isfinite(float(timeout)) or float(timeout) <= 0:
         raise ValueError("trial timeout must be a finite positive number")
@@ -811,15 +923,15 @@ def main():
         return 0
     if not args.timeout > 0 or args.failed_req_limit < 0:
         parser.error("timeout must be positive and failed-req-limit nonnegative")
-    print("AISBench trial starting; raw streams are saved under " + str(args.evidence_dir), flush=True)
+    console_message("AISBench trial starting; raw streams are saved under " + str(args.evidence_dir))
     result = execute_native(args.native_root, args.evidence_dir, arguments,
                             timeout=args.timeout, failed_req_limit=args.failed_req_limit,
-                            native_script=args.native_script, echo=False)
-    print("AISBench trial finished: state=" + result['state'] + ", main_scopes="
+                            native_script=args.native_script, echo=True)
+    console_message("AISBench trial finished: state=" + result['state'] + ", main_scopes="
           + str(len(result.get('main_scopes', []))) + "; evidence="
-          + str(Path(args.evidence_dir) / 'evaluation.json'), flush=True)
+          + str(Path(args.evidence_dir) / 'evaluation.json'))
     if args.json:
-        print(json.dumps(result, ensure_ascii=False))
+        console_message(json.dumps(result, ensure_ascii=False))
     return 0 if result["state"] == "PASS" else (1 if result["state"] == "ERROR" else 2)
 
 

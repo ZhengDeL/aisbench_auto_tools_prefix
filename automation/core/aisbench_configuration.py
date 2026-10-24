@@ -34,7 +34,7 @@ ENV_DEFAULTS = {
     'DATA_NUM_MULTIPLIER': '4', 'PEAK_MIN_CONCURRENCY': '1',
     'PEAK_MAX_MULTIPLIER': '20', 'PEAK_DATA_MULTIPLIER': '4',
     'PEAK_WAIT_SECONDS': '10', 'PEAK_TTFT_LIMIT': '5', 'PEAK_TPOT_LIMIT': '50',
-    'PEAK_HARD_CAP': '0',
+    'PEAK_HARD_CAP': '0', 'PEAK_SLO_TOLERANCE': '0.0',
     **{name: entry[0] for name, entry in PEAK_NEW_DEFAULTS.items()},
 }
 PUBLIC_ENV_NAMES = tuple(ENV_DEFAULTS)
@@ -46,7 +46,7 @@ VALUE_OPTIONS = {
 }
 SCENE_KEYS = {'name', 'input_len', 'output_len', 'concurrency', 'request_rate',
               'ttft_limit', 'tpot_limit', 'peak_min_cc', 'peak_max_cc',
-              'peak_data_multiplier', 'peak_wait',
+              'peak_data_multiplier', 'peak_wait', 'peak_slo_tolerance',
               *(entry[1] for entry in PEAK_NEW_DEFAULTS.values())}
 
 
@@ -83,6 +83,12 @@ def effective_environment(environment: dict[str, str], release_root: Path) -> di
         integer(values[key], key, minimum)
     for key in ('PEAK_TTFT_LIMIT', 'PEAK_TPOT_LIMIT'):
         number(values[key], key)
+    if not 0 <= number(values['PEAK_SLO_TOLERANCE'], 'PEAK_SLO_TOLERANCE') <= 1:
+        raise ValueError('PEAK_SLO_TOLERANCE 必须为0..1之间的有限比例，例如0.05表示5%')
+    for key in ('PEAK_TTFT_LIMIT', 'PEAK_TPOT_LIMIT'):
+        limit = number(values[key], key)
+        if limit > 0:
+            number(limit * (1 + float(values['PEAK_SLO_TOLERANCE'])), key + '有效上限')
     for key in PEAK_NEW_NAMES:
         if key.endswith('TIMEOUT'):
             if number(values[key], key, 0) <= 0:
@@ -232,7 +238,13 @@ def build_plan(environment: dict[str, str], config_path: Path) -> dict[str, Any]
                     wait=integer(scene.get('peak_wait', env['PEAK_WAIT_SECONDS']), 'peak_wait', 0),
                     ttft=number(scene.get('ttft_limit', env['PEAK_TTFT_LIMIT']), 'ttft_limit'),
                     tpot=number(scene.get('tpot_limit', env['PEAK_TPOT_LIMIT']), 'tpot_limit'),
+                    slo_tolerance=number(scene.get('peak_slo_tolerance', env['PEAK_SLO_TOLERANCE']), 'peak_slo_tolerance'),
                     extra_args=cli_arguments(extra), repeat_rate=str(extra.get('repeat_rate', '0')))
+        if not 0 <= peak['slo_tolerance'] <= 1:
+            raise ValueError('peak_slo_tolerance 必须为0..1之间的有限比例，例如0.05表示5%')
+        for key in ('ttft', 'tpot'):
+            if peak[key] > 0:
+                number(peak[key] * (1 + peak['slo_tolerance']), key + '有效上限')
         for key, (_, scene_key, option) in PEAK_NEW_DEFAULTS.items():
             value = scene.get(scene_key, env[key])
             if key.endswith('TIMEOUT'):
