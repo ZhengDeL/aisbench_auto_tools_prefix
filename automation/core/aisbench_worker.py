@@ -1,6 +1,7 @@
 """Run one reserved task using a container copy of the native source."""
 from __future__ import annotations
 import csv
+from datetime import datetime
 import hashlib
 import io
 import json
@@ -8,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -277,11 +279,18 @@ class Worker:
         validate_output_path(self.result, NATIVE_ROOTS)
         self.result.mkdir(parents=True, exist_ok=False)
         self.phase, self.current, self.index, self.sequence = 'initializing', '', 0, 0
+        self.current_kind, self.current_scene = '', {}
+        self.scenario_outcomes = []
+        # Managed workers publish control events through their durable journal.
+        # stdout/stderr remain the independent native-detail transport.
+        self.managed = all(os.environ.get(name) for name in (
+            'AISBENCH_BATCH_ID', 'AISBENCH_TASK_NAME', 'AISBENCH_RUNTIME_REPORT'))
         self.rows, self.scopes = [], []
         self.task_log = Path(os.environ.get('AISBENCH_TASK_LOG') or self.result / 'execution.log')
         validate_output_path(self.task_log, [RELEASE_ROOT / 'aisbench_auto_tools_prefix', values['TOOLS_HOST_DIR']])
         self.human = private_binary(self.task_log, NATIVE_ROOTS)
-        self.events = private_binary(self.result / 'events.jsonl', NATIVE_ROOTS)
+        self.events_file = self.result / 'events.jsonl'
+        self.events = private_binary(self.events_file, NATIVE_ROOTS)
         REDACTOR.register(values['API_KEY'])
         self.runtime(False)
         self.save_rows()
@@ -294,22 +303,93 @@ class Worker:
                            complete=complete, phase=self.phase, current_scenario=self.current,
                            planned_tests=len(self.plan['planned_scenarios']), test_index=self.index,
                            result_scopes=str(self.result / 'result_scopes.json'),
-                           planned_scenarios=self.plan['planned_scenarios'])
+                           planned_scenarios=self.plan['planned_scenarios'],
+                           events_file=str(self.events_file),
+                           outcome_counts=self.outcome_counts(),
+                           scenario_outcomes=REDACTOR.value(self.scenario_outcomes),
+                           non_success_scenarios=REDACTOR.value([
+                               item for item in self.scenario_outcomes if not item['passed']]))
+            if getattr(self, 'task_error', None):
+                payload['task_error'] = REDACTOR.value(self.task_error)
             if exit_code is not None:
                 payload['worker_exit'] = exit_code
             if logging_error:
                 payload['logging_error'] = logging_error
             atomic_json(Path(target), payload)
 
+    def scenario_context(self):
+        """Describe the configured workload without substituting measurements."""
+        scene = getattr(self, 'current_scene', {})
+        context = dict(test_index=getattr(self, 'index', 0),
+                       planned_tests=len(getattr(self, 'plan', {}).get('planned_scenarios', [])),
+                       run_kind=getattr(self, 'current_kind', ''))
+        for source, target in (('input_len', 'configured_input_len'),
+                               ('output_len', 'configured_output_len'),
+                               ('request_rate', 'request_rate'),
+                               ('test_type', 'test_type'), ('accuracy', 'accuracy')):
+            if source in scene:
+                context[target] = scene[source]
+        if context['run_kind'] == 'fixed':
+            context.update(configured_concurrency=scene.get('concurrency'),
+                           configured_requests=scene.get('data_num'))
+        elif context['run_kind'] == 'peak':
+            tolerance = scene.get('slo_tolerance', 0)
+            context.update(initial_concurrency_range=[scene.get('min_cc'), scene.get('max_cc')],
+                           request_multiplier=scene.get('multiplier'),
+                           ttft_limit=scene.get('ttft'), tpot_limit=scene.get('tpot'),
+                           slo_tolerance=tolerance, hard_cap=self.values['PEAK_HARD_CAP'])
+        return context
+
+    def outcome_counts(self):
+        """Count terminal scene outcomes; a fixed PASS is not an SLO claim."""
+        outcomes = getattr(self, 'scenario_outcomes', [])
+        counts = dict(planned=len(self.plan['planned_scenarios']), completed=len(outcomes),
+                      passed=sum(item['passed'] for item in outcomes),
+                      non_success=sum(not item['passed'] for item in outcomes),
+                      fixed_passed=sum(item['kind'] == 'fixed' and item['passed'] for item in outcomes),
+                      fixed_failed=sum(item['kind'] == 'fixed' and not item['passed'] for item in outcomes))
+        for status in ('peak', 'peak_confirmed', 'peak_capped', 'peak_budget', 'peak_unstable',
+                       'peak_error', 'peak_request_error', 'peak_no_pass', 'peak_cancelled',
+                       'peak_mixed', 'execution_error', 'cancelled'):
+            counts[status] = sum(item['status'] == status for item in outcomes)
+        return counts
+
+    def record_outcome(self, status, passed, reason, *, evidence='', selected_concurrency=None,
+                       actual_concurrency='', return_code=None, **fields):
+        """Retain one final outcome per expanded scene, separate from CSV rows."""
+        outcome = dict(test_index=self.index, scenario=self.current, kind=self.current_kind,
+                       status=status, passed=bool(passed), reason=str(reason), evidence=str(evidence),
+                       selected_concurrency=selected_concurrency, actual_concurrency=actual_concurrency,
+                       return_code=return_code, **fields)
+        safe = REDACTOR.value(outcome)
+        self.scenario_outcomes = [item for item in self.scenario_outcomes
+                                  if item['test_index'] != self.index] + [safe]
+        self.runtime(False)
+
+    def record_interrupted_scene(self, status, reason):
+        """Explain an unfinished scene without manufacturing a measurement row."""
+        if (not self.current or not self.current_kind
+                or any(item['test_index'] == self.index for item in self.scenario_outcomes)):
+            return
+        evidence = getattr(self, 'current_evidence', self.result)
+        if not Path(evidence).exists():
+            evidence = self.result
+        self.record_outcome(status, False, reason, evidence=evidence)
+
     def log(self, event, message, *, level='INFO', **fields):
         self.sequence += 1
         now, safe = timestamp(), REDACTOR.text(message)
+        scope = ('task' if event.startswith('task_') else 'trial' if event == 'peak_round'
+                 else 'scenario' if self.current else 'task')
         payload = dict(schema_version=1, seq=self.sequence, time=now, level=level, event=event,
                        message=safe, phase=self.phase, batch_id=os.environ.get('AISBENCH_BATCH_ID', ''),
                        task=os.environ.get('AISBENCH_TASK_NAME', ''), model=self.values['MODEL_NAME'],
-                       scenario=self.current, **REDACTOR.value(fields))
+                       scenario=self.current, run_id=getattr(self, 'run_id', ''), scope=scope)
+        payload.update(self.scenario_context())
+        payload.update(REDACTOR.value(fields))
         try:
-            self.human.write(f'{now} {level} [{self.current or "initializing"}] [{event}] {safe}\n'.encode())
+            context = 'task' if scope == 'task' else (self.current or 'task')
+            self.human.write(f'{now} {level} [{context}] [{event}] {safe}\n'.encode())
             self.events.write((json.dumps(payload, ensure_ascii=False, allow_nan=False) + '\n').encode())
             for stream in (self.human, self.events):
                 stream.flush()
@@ -317,7 +397,8 @@ class Worker:
         except OSError:
             self.runtime(False, logging_error='任务持久日志写入失败')
             raise
-        console_message(f'{now} {level} [{event}] {safe}')
+        if not getattr(self, 'managed', False):
+            console_message(f'{now} {level} [{event}] {safe}')
 
     def checked(self, args, *, input_bytes=None, timeout=60):
         result = command([*self.docker, *args], input_bytes=input_bytes, timeout=timeout)
@@ -423,8 +504,9 @@ class Worker:
         logs = self.result / 'process_logs' / ('call_' + uuid.uuid4().hex)
         validate_output_path(logs, NATIVE_ROOTS)
         logs.mkdir(parents=True, exist_ok=False, mode=0o700)
-        self.log('container_call_start', f'启动容器内工具；详细输出实时透传；独立日志目录：{logs}',
-                 stdout_log=str(logs / 'stdout.raw.log'), stderr_log=str(logs / 'stderr.raw.log'))
+        self.log('container_call_start', f'启动容器内工具；原始stdout/stderr独立保存；详情目录：{logs}',
+                 call_id=logs.name, stdout_log=str(logs / 'stdout.raw.log'),
+                 stderr_log=str(logs / 'stderr.raw.log'))
         # Never let docker exec inherit the manager's console pipe: if only
         # the manager is killed, the completed benchmark must still be able
         # to emit its final summary and return its true exit status.
@@ -527,8 +609,10 @@ class Worker:
 
     def fixed(self, scene):
         self.current, self.phase = scene['name'], 'fixed'
+        self.current_kind, self.current_scene = 'fixed', scene
         self.runtime(False)
         evidence = self.result / ('fixed_' + str(self.index))
+        self.current_evidence = evidence
         validate_output_path(evidence, NATIVE_ROOTS)
         self.log('fixed_start', f"固定测试：配置并发={scene['concurrency']}，每主测请求={scene['data_num']}，输出配置={scene['output_len']}",
             request_rate=scene['request_rate'], test_type=scene['test_type'], accuracy=scene['accuracy'])
@@ -549,19 +633,40 @@ class Worker:
             run_tag=self.run_id, output_root=self.output, source_root=evidence / 'native_runtime',
             extra_metadata={'test_type': scene['test_type'], 'test_accuracy': scene['accuracy'],
                             'selected_scope_id': scope.get('scope_id', ''), 'evaluation_file': str(file)})
-        self.log('fixed_end', '固定测试通过' if passed else '固定测试失败，完整原因见evaluation.json',
+        reason = report.get('reason') or report.get('selection_reason') or (
+            '执行与数据完整性检查通过' if passed else '未取得可信测量报告或作用域')
+        if rc != 0:
+            reason = f'工具退出码={rc}；{reason}'
+        self.record_outcome('passed' if passed else 'failed', passed, reason,
+            evidence=str(file), actual_concurrency=raw.get('cc', ''), return_code=rc,
+            configured_concurrency=scene['concurrency'], configured_requests=scene['data_num'],
+            selected_scope_id=scope.get('scope_id', ''), measurement_state=report.get('state', 'missing'),
+            slo_evaluated=False)
+        fixed_message = (f"固定测试通过：执行与数据完整性检查通过；配置并发={scene['concurrency']}，"
+                         f"实测平均并发={raw.get('cc') or '无适用测量'}；本轮未作摸高SLO判定" if passed else
+                         f'固定测试失败：{reason}；证据={file}')
+        self.log('fixed_end', fixed_message,
             level='INFO' if passed else 'ERROR', return_code=rc, state=report.get('state', 'missing'),
-            reason=report.get('reason', ''), evidence=str(file), actual_concurrency=raw.get('cc', ''))
+            status='passed' if passed else 'failed', passed=passed, reason=reason,
+            evidence=str(file), actual_concurrency=raw.get('cc', ''),
+            selected_scope_id=scope.get('scope_id', ''), slo_evaluated=False,
+            measurements={key: raw.get(key, '') for key in (
+                'total_req', 'input_len', 'output_len', 'cc', 'TTFT avg', 'TTFT P90',
+                'TPOT avg', 'TPOT SLO_P90', 'E2E_time', 'output_throughput', 'qps')})
         return passed
 
     def peak(self, scene):
         self.current, self.phase = scene['name'], 'peak'
+        self.current_kind, self.current_scene = 'peak', scene
+        self.current_evidence = self.result
         self.runtime(False)
         tag = self.run_id + '_' + str(self.index)
         tolerance = float(scene.get('slo_tolerance', 0))
         self.log('peak_start', f"摸高：初始{scene['min_cc']}..{scene['max_cc']}，首轮取区间中点；"
                  f"基础阈值TTFT≤{scene['ttft']}s、TPOT≤{scene['tpot']}ms；"
-                 f"SLO容差={tolerance:.1%}；硬顶={self.values['PEAK_HARD_CAP']}")
+                 f"SLO容差={tolerance:.1%}；硬顶={self.values['PEAK_HARD_CAP']}",
+                 confirm_runs=scene.get('peak_confirm_runs'),
+                 confirm_min_requests=scene.get('peak_confirm_min_requests'))
         args = ['python3', CONTAINER_AUTOMATION + '/aisbench_perf_matrix.py', '--config-file', CONTAINER_AUTOMATION + '/aisbench_perf_matrix_config.py',
             '--run-tag', tag, '--case-name', scene['name'], '--input-len', str(scene['input_len']), '--output-len', str(scene['output_len']),
             '--min-concurrency', str(scene['min_cc']), '--max-concurrency', str(scene['max_cc']), '--request-multiplier', str(scene['multiplier']),
@@ -574,15 +679,94 @@ class Worker:
         if self.values['PEAK_HARD_CAP'] == '1':
             args.extend(['--max-concurrency', str(scene['max_cc']), '--auto-expand-max-concurrency', str(scene['max_cc'])])
         seen = set()
+        decision_offset, decision_sequence, decision_pending = 0, 0, b''
+        decision_identity = None
 
-        def publish_rounds():
-            paths = list(self.output.glob('peak_*_' + tag + '/peak_search_report.json'))
-            if len(paths) != 1:
+        def publish_decisions(session, final=False):
+            """Bridge only complete, ordered engine events from the owned file."""
+            nonlocal decision_offset, decision_sequence, decision_pending, decision_identity
+            source = session / 'peak_search_events.jsonl'
+            if not source.exists():
+                if decision_identity is not None:
+                    raise RuntimeError('本轮搜索决策日志已经消失，不能报告日志完整')
+                return  # Compatibility with old reports or a not-yet-started engine.
+            if (session.is_symlink() or source.is_symlink()
+                    or not path_is_relative_to(source.resolve(), self.output.resolve())):
+                raise RuntimeError('搜索决策日志不属于本次任务的真实输出目录')
+            # Never wait on a FIFO or device in the progress callback. The
+            # descriptor check also rejects a replacement after this lstat.
+            if not stat.S_ISREG(source.lstat().st_mode):
+                raise RuntimeError('搜索决策日志不是普通文件，拒绝读取')
+            flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+            while True:
+                with os.fdopen(os.open(source, flags), 'rb') as stream:
+                    info = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(info.st_mode):
+                        raise RuntimeError('搜索决策日志不是普通文件，拒绝读取')
+                    identity = (info.st_dev, info.st_ino)
+                    if decision_identity is None:
+                        decision_identity = identity
+                    elif identity != decision_identity:
+                        raise RuntimeError('本轮搜索决策日志已被替换，拒绝读取其他日志')
+                    if info.st_size < decision_offset:
+                        raise RuntimeError('搜索决策日志被截断，不能继续发布不完整决策')
+                    stream.seek(decision_offset)
+                    block = stream.read(1024 * 1024)
+                    decision_offset = stream.tell()
+                decision_pending += block
+                while b'\n' in decision_pending:
+                    line, decision_pending = decision_pending.split(b'\n', 1)
+                    try:
+                        event = self.convert_paths(json.loads(line.decode('utf-8')))
+                    except (UnicodeError, ValueError) as error:
+                        raise RuntimeError('搜索决策日志包含无效的完整JSON记录') from error
+                    if (not isinstance(event, dict) or type(event.get('schema_version')) is not int
+                            or event['schema_version'] != 1
+                            or type(event.get('seq')) is not int or event['seq'] != decision_sequence + 1
+                            or event.get('scenario') != scene['name']
+                            or not isinstance(event.get('event'), str) or not event['event']
+                            or not isinstance(event.get('message'), str)
+                            or not isinstance(event.get('time'), str)
+                            or not isinstance(event.get('fields'), dict)
+                            or event.get('level') not in {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}):
+                        raise RuntimeError('搜索决策日志身份、顺序或字段无效，不能跳过后继续')
+                    try:
+                        if datetime.fromisoformat(event['time']).utcoffset() is None:
+                            raise ValueError('missing timezone')
+                    except ValueError as error:
+                        raise RuntimeError('搜索决策日志时间无效或缺少时区') from error
+                    fields = event['fields']
+                    reserved = {'event', 'message', 'level', 'scope', 'schema_version', 'seq', 'time',
+                                'batch_id', 'task', 'run_id', 'scenario', 'phase', 'model',
+                                'test_index', 'planned_tests', 'run_kind', 'decision_event',
+                                'decision_seq', 'decision_time', 'decision_evidence'}
+                    if reserved.intersection(fields):
+                        raise RuntimeError('搜索决策字段覆盖了业务事件身份')
+                    self.log('peak_decision', event['message'], level=event['level'],
+                             decision_event=event['event'], decision_seq=event['seq'],
+                             decision_time=event.get('time', ''), decision_evidence=str(source),
+                             **fields)
+                    decision_sequence = event['seq']
+                if len(decision_pending) > 1024 * 1024:
+                    raise RuntimeError('搜索决策单条记录超过1MiB，拒绝不受限缓存')
+                if not final or not block:
+                    break
+            if final and decision_pending:
+                raise RuntimeError('搜索决策日志结束时仍有未完成记录')
+
+        def publish_rounds(final=False):
+            sessions = list(self.output.glob('peak_*_' + tag))
+            if len(sessions) != 1:
                 return
-            try:
-                current = self.convert_paths(json.loads(paths[0].read_text(encoding='utf-8')))
-            except (FileNotFoundError, json.JSONDecodeError):
-                return  # A report write may be in progress; retry the next tick.
+            report_path = sessions[0] / 'peak_search_report.json'
+            current = {}
+            if report_path.is_file():
+                try:
+                    current = self.convert_paths(json.loads(report_path.read_text(encoding='utf-8')))
+                except (FileNotFoundError, json.JSONDecodeError):
+                    if final:
+                        raise
+                    return  # A report write may be in progress; retry the next tick.
             for trial in current.get('all', []):
                 identity = trial.get('trial_id') or trial.get('evaluation_file')
                 if not identity or identity in seen:
@@ -611,30 +795,58 @@ class Worker:
                 profile = '确认复测' if trial.get('profile') == 'confirm' else '区间搜索'
                 ttft_limit = f"基础阈值{scene['ttft']}s，容差上限{scene['ttft'] * (1 + tolerance):g}s" if scene['ttft'] > 0 else '此项SLO未启用'
                 tpot_limit = f"基础阈值{scene['tpot']}ms，容差上限{scene['tpot'] * (1 + tolerance):g}ms" if scene['tpot'] > 0 else '此项SLO未启用'
+                round_fields = dict(evidence=str(file), trial_id=trial.get('trial_id', ''),
+                    sequence_id=trial.get('sequence_id'), selected_scope_id=scope.get('scope_id', ''),
+                    profile=trial.get('profile', ''), configured_concurrency=trial.get('concurrency'),
+                    configured_requests=trial.get('num_prompts'), measurement_state=measurement,
+                    strict_slo_passed=strict, actual_concurrency=trial.get('cc', ''),
+                    ttft_column=trial.get('ttft_column', 'TTFT avg'),
+                    tpot_column=trial.get('tpot_column', 'TPOT avg'),
+                    measurements={key: trial.get(key, '') for key in (
+                        'total_req', 'input_len', 'output_len', 'cc',
+                        trial.get('ttft_column', 'TTFT avg'), trial.get('tpot_column', 'TPOT avg'))},
+                    effective_limits=trial.get('effective_limits', {}), reason=trial.get('reason', ''),
+                    decision_evidence=str(sessions[0] / 'peak_search.log'))
+                # The search engine owns the next decision. Its current trace
+                # has no next_action field; do not infer one from PASS/FAIL.
+                if 'next_action' in trial:
+                    round_fields['next_action'] = trial['next_action']
                 self.log('peak_round', f"摸高轮次完成：配置并发={trial.get('concurrency')}，阶段={profile}，测量={label}；"
                          f"TTFT[{trial.get('ttft_column', 'TTFT avg')}]={actual_ttft}（{ttft_limit}）；"
                          f"TPOT[{trial.get('tpot_column', 'TPOT avg')}]={actual_tpot}（{tpot_limit}）；"
                          f"说明={trial.get('reason', '')}",
-                    evidence=str(file))
+                    **round_fields)
+            publish_decisions(sessions[0], final=final)
 
         rc = self.run_container(args, float(scene['peak_total_timeout']) + 90, on_progress=publish_rounds)
         paths = list(self.output.glob('peak_*_' + tag + '/peak_search_report.json'))
         if len(paths) != 1:
+            publish_rounds(final=True)
             self.append_row(scene, {}, 'peak_error', termination_reason='report_missing', measurement_state='ERROR')
-            self.log('peak_error', '本轮报告缺失或身份不唯一，不读取历史报告', level='ERROR')
+            reason = '本轮报告缺失或身份不唯一，不读取历史报告'
+            self.record_outcome('peak_error', False, reason, evidence=str(self.result), return_code=rc,
+                                report_candidates=[str(item) for item in paths])
+            self.log('peak_error', reason, level='ERROR', status='peak_error', passed=False,
+                     return_code=rc, reason=reason, report_candidates=[str(item) for item in paths],
+                     evidence=str(self.result))
             return False
         path = paths[0]
+        self.current_evidence = path
         report = self.convert_paths(json.loads(path.read_text(encoding='utf-8')))
         atomic_json(path, report)
-        publish_rounds()
+        publish_rounds(final=True)
         if report.get('complete') is not True or not (path.parent / 'archive_manifest.json').is_file():
             self.append_row(scene, {}, 'peak_error', measurement_state='ERROR', termination_reason='incomplete_report')
-            self.log('peak_error', '摸高进程未完成最终报告和归档，不能将临时最佳轮次作为结论', level='ERROR',
-                return_code=rc, evidence=str(path))
+            reason = '摸高进程未完成最终报告和归档，不能将临时最佳轮次作为结论'
+            self.record_outcome('peak_error', False, reason, evidence=str(path), return_code=rc,
+                                termination='incomplete_report')
+            self.log('peak_error', reason, level='ERROR', status='peak_error', passed=False,
+                return_code=rc, reason=reason, evidence=str(path), termination='incomplete_report')
             write_archive_manifest(path.parent, task_kind='peak-search-incomplete', archive_name=scene['name'],
                 run_tag=tag, output_root=self.output, extra_metadata={'termination': 'incomplete_report'})
             return False
         successful = rc == 0 and bool(report.get('best'))
+        final_outcomes = []
         for row in report.get('best') or [{}]:
             status = row.get('status', 'peak_error')
             successful = successful and status in {'peak_confirmed', 'peak_capped'}
@@ -654,7 +866,23 @@ class Worker:
                            f"实测平均并发={row.get('cc') or '无适用测量'}；说明={row.get('reason', '')}；详细记录={path}")
             level = ('INFO' if status in {'peak_confirmed', 'peak_capped'} else
                      'WARNING' if status in {'peak_unstable', 'peak_budget', 'peak_no_pass', 'peak_cancelled'} else 'ERROR')
-            self.log('peak_end', message, level=level, evidence=str(path), raw_reason=row.get('reason', ''))
+            reason = row.get('reason') or '最终报告未提供具体原因，需核查选中作用域和搜索轨迹'
+            if rc != 0 and status in {'peak_confirmed', 'peak_capped'}:
+                reason = f'工具退出码={rc}，报告记录状态={status}；{reason}'
+                message = f'摸高调用未成功：{reason}；保留报告中的测量记录；详细记录={path}'
+                level = 'ERROR'
+            outcome = dict(status=status, passed=rc == 0 and status in {'peak_confirmed', 'peak_capped'},
+                reason=reason, selected_concurrency=row.get('concurrency'),
+                actual_concurrency=row.get('cc', ''), selected_trial_id=row.get('selected_trial_id', ''),
+                selected_scope_id=scope.get('scope_id', ''), evaluation_file=reference,
+                termination=row.get('termination', ''), evidence=str(path), return_code=rc)
+            final_outcomes.append(outcome)
+            self.log('peak_end', message, level=level, status=status, passed=outcome['passed'],
+                evidence=str(path), return_code=rc, raw_reason=reason, reason=reason,
+                selected_concurrency=row.get('concurrency'), actual_concurrency=row.get('cc', ''),
+                selected_trial_id=row.get('selected_trial_id', ''), selected_scope_id=scope.get('scope_id', ''),
+                evaluation_file=reference, termination=row.get('termination', ''),
+                unstable_points=(unstable if status == 'peak_unstable' else []))
         # Path conversion changes JSON bytes after the container's final seal.
         # Seal the completed host evidence only after every conversion is done.
         previous = json.loads((path.parent / 'archive_manifest.json').read_text(encoding='utf-8'))
@@ -663,6 +891,15 @@ class Worker:
             source_root=Path(previous['source_root']) if previous.get('source_root') else None,
             captured_outputs_dir=previous.get('captured_outputs_dir', ''),
             extra_metadata=self.convert_paths(previous.get('extra_metadata', {})))
+        if len(final_outcomes) == 1:
+            outcome = dict(final_outcomes[0])
+            status, reason = outcome.pop('status'), outcome.pop('reason')
+            outcome.pop('passed')
+            self.record_outcome(status, successful, reason, **outcome)
+        else:
+            self.record_outcome('peak_mixed', successful,
+                '多个最终记录：' + '；'.join(str(item['status']) + ': ' + str(item['reason']) for item in final_outcomes),
+                evidence=str(path), return_code=rc, final_records=final_outcomes)
         return successful
 
     def run(self):
@@ -675,10 +912,21 @@ class Worker:
                 good = self.fixed(scene) if kind == 'fixed' else self.peak(scene)
                 passed = good and passed
                 self.assert_container_ready()
-        self.phase, self.current = 'finished', ''
+        self.phase, self.current, self.current_kind, self.current_scene = 'finished', '', '', {}
         rc = 0 if passed else 1
-        self.log('task_end', '全部场景通过' if passed else '存在失败或未确认场景，请按状态和证据检查',
-            level='INFO' if passed else 'ERROR', exit_code=rc, result_csv=str(self.result / 'all_results.csv'))
+        counts = self.outcome_counts()
+        non_success = [item for item in self.scenario_outcomes if not item['passed']]
+        unconfirmed = {'peak_unstable', 'peak_budget', 'peak_no_pass', 'peak_cancelled'}
+        terminal_level = ('INFO' if passed else
+                          'WARNING' if non_success and all(item['status'] in unconfirmed for item in non_success) else 'ERROR')
+        attention = '；需检查=' + '、'.join(item['scenario'] + '[' + item['status'] + ']'
+                                         for item in non_success) if non_success else ''
+        self.log('task_end', f"任务结束：已完成{counts['completed']}/{counts['planned']}个场景，"
+                 f"执行判定通过={counts['passed']}，未通过或未确认={counts['non_success']}；"
+                 f"固定测试通过={counts['fixed_passed']}仅表示执行与完整性，摸高结论按各场景状态判断{attention}",
+            level=terminal_level, exit_code=rc,
+            result_csv=str(self.result / 'all_results.csv'), outcome_counts=counts,
+            scenario_outcomes=self.scenario_outcomes, non_success_scenarios=non_success)
         for stream in (self.human, self.events):
             stream.flush()
             os.fsync(stream.fileno())
@@ -716,12 +964,16 @@ def main():
         return worker.run()
     except KeyboardInterrupt:
         if worker:
+            worker.record_interrupted_scene('cancelled', '任务收到中断信号，当前场景未完成')
             worker.runtime(False, 130)
         return 130
     except Exception as error:
         message = REDACTOR.text(str(error))
         if worker:
             try:
+                worker.task_error = dict(type=type(error).__name__, reason=message,
+                                         scenario=worker.current, phase=worker.phase)
+                worker.record_interrupted_scene('execution_error', message)
                 worker.log('task_error', message, level='ERROR')
                 worker.runtime(False, 1)
             except (OSError, ValueError):

@@ -31,7 +31,7 @@ from typing import IO, Any
 from urllib.parse import urlsplit
 
 from aisbench_batch_results import prepare_task_outputs, publish_batch, save_effective_config
-from aisbench_logging import BatchLog, LogWriteError, REDACTOR, private_binary, validate_output_path
+from aisbench_logging import AsyncConsoleMirror, BatchLog, LogWriteError, REDACTOR, private_binary, validate_output_path
 from aisbench_configuration import PUBLIC_ENV_NAMES as CONFIG_PUBLIC_ENV_NAMES
 
 
@@ -49,6 +49,8 @@ INTERNAL_PARAMETERS = frozenset({
 _STOP_REQUESTED = 0
 _PRINT_LOCK = threading.Lock()
 _BATCH_LOG: BatchLog | None = None
+_CONSOLE: AsyncConsoleMirror | None = None
+_CONSOLE_MODE = "auto"
 _LOG_ERROR = ""
 _NATIVE_ROOTS: list[Path] = []
 
@@ -80,6 +82,7 @@ def docker_executable(environment: dict[str, str]) -> str:
 
 
 def emit(alias: str, message: str, event: str = "manager_progress", level: str = "INFO", **fields: Any) -> None:
+    """Persist business events first; optional display never owns this lock."""
     global _LOG_ERROR
     with _PRINT_LOCK:
         message = REDACTOR.text(message)
@@ -88,15 +91,88 @@ def emit(alias: str, message: str, event: str = "manager_progress", level: str =
                 _BATCH_LOG.emit(event, message, task=alias, level=level, **fields)
             except (OSError, ValueError):
                 _LOG_ERROR = "BATCH_LOG_WRITE_FAILED"
-                try:
-                    print("ERROR [日志写入失败] 停止新轮次并清理本批次工具任务；请检查磁盘与日志目录权限。", file=sys.stderr, flush=True)
-                except OSError:
-                    pass
+    if _CONSOLE is not None:
+        _CONSOLE.drain()
+    elif _BATCH_LOG is None:
+        # Standalone utility calls have no live workload to supervise. The
+        # production manager binds its asynchronous mirror before its first emit.
         try:
             print(f"[{timestamp()}] [{alias}] {message}", flush=True)
         except (BrokenPipeError, OSError, UnicodeError):
-            # A closed terminal must not abandon supervised container processes.
             pass
+
+
+def console_arguments(arguments: list[str]) -> tuple[list[str], str]:
+    """One batch display setting, independent from each service configuration."""
+    configs, mode, index = [], "auto", 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value == "--":
+            configs.extend(arguments[index + 1:])
+            break
+        if value == "--console":
+            index += 1
+            if index >= len(arguments):
+                raise RunError("--console 需要 auto、summary 或 full")
+            mode = arguments[index]
+        elif value.startswith("--console="):
+            mode = value.split("=", 1)[1]
+        elif value.startswith("--"):
+            raise RunError("不支持的启动选项；使用 --help 查看用法")
+        else:
+            configs.append(value)
+        index += 1
+    if mode not in {"auto", "summary", "full"}:
+        raise RunError("--console 必须为 auto、summary 或 full")
+    return configs, mode
+
+
+def console_mode(requested: str) -> str:
+    if requested != "auto":
+        return requested
+    try:
+        return "full" if sys.stdout.isatty() else "summary"
+    except (OSError, ValueError, AttributeError):
+        return "summary"
+
+
+def final_console_message(message: str) -> None:
+    """Best-effort final display after the closed log archive is immutable."""
+    encoded = (REDACTOR.text(message) + "\n").encode("utf-8", errors="replace")
+    try:
+        descriptor = os.dup(sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        return
+
+    def write() -> None:
+        try:
+            pending = memoryview(encoded)
+            while pending:
+                try:
+                    count = os.write(descriptor, pending[:4096])
+                except InterruptedError:
+                    continue
+                if count <= 0:
+                    break
+                pending = pending[count:]
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
+
+    try:
+        observer = threading.Thread(target=write, daemon=True, name="aisbench-final-console")
+        observer.start()
+    except Exception:
+        # This optional display runs after the durable final state is sealed.
+        # Thread resource exhaustion must not change that state or its exit
+        # code, and no observer owns the duplicated descriptor on this path.
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        return
+    observer.join(timeout=0.1)
 
 
 def check_batch_logging() -> None:
@@ -411,6 +487,7 @@ class Job:
     metadata: dict[str, Any] = field(default_factory=dict)
     daemon_id: str = ""
     run_id: str = ""
+    batch_id: str = ""
     runtime_path: Path | None = None
     launcher_path: Path | None = None
     process: subprocess.Popen[str] | None = None
@@ -431,6 +508,11 @@ class Job:
     finished_at: str = ""
     started_monotonic: float | None = None
     finished_monotonic: float | None = None
+    event_offset: int = 0
+    event_pending: bytes = b""
+    event_sequence: int = 0
+    event_identity: tuple[int, int] | None = None
+    event_context: dict[str, Any] = field(default_factory=dict)
 
     def status(self) -> dict[str, Any]:
         runtime = read_json(self.runtime_path) if self.runtime_path else {}
@@ -475,6 +557,8 @@ class Job:
             "planned_scenarios": self.metadata.get("planned_scenarios", []),
             "result_scopes": scopes,
             "scope_metadata": runtime.get("scope_metadata", {}) if matching else {},
+            "outcome_counts": runtime.get("outcome_counts", {}) if matching else {},
+            "non_success_scenarios": runtime.get("non_success_scenarios", []) if matching else [],
         }
 
 
@@ -1050,15 +1134,18 @@ def stream_output(job: Job, channel: str = "stdout") -> None:
 
     def display(line: str) -> None:
         safe = REDACTOR.text(line)
+        if not safe.strip():
+            return
         with job.log_lock:
             job.log_handle.write(f"{timestamp()} [{channel}] {safe}\n")
             job.log_handle.flush()
-        # Raw output belongs in the task's diagnostics, not repeated as large
-        # structured batch events. The console still identifies its task.
-        # Every native progress line remains visible; raw bytes are also
-        # retained independently above. Task/channel prefixes disambiguate
-        # concurrent clients without suppressing their AISBench output.
-        with _PRINT_LOCK:
+        if _BATCH_LOG is not None:
+            _BATCH_LOG.detail(job.alias, channel, safe, context=dict(job.event_context))
+            if _CONSOLE is not None:
+                _CONSOLE.drain()
+        else:
+            # Keep the standalone reader helper useful. Live supervisors never
+            # write a terminal from this mandatory raw-drain thread.
             try:
                 print(f"[{job.alias}][{channel}] {safe}", flush=True)
             except (OSError, UnicodeError):
@@ -1098,6 +1185,105 @@ def stream_output(job: Job, channel: str = "stdout") -> None:
             pipe.close()
         except (OSError, ValueError):
             job.logging_error = job.logging_error or "LOG_STREAM_CLOSE_FAILED"
+
+
+def drain_worker_events(job: Job, runtime: dict[str, Any], final: bool = False) -> None:
+    """Bridge only the current worker's durable business journal, once per seq.
+
+    Native stdout/stderr never supplies business classification. Partial JSON
+    lines wait for the next poll; an advertised journal that is replaced,
+    truncated, malformed or belongs to another run makes logging incomplete.
+    """
+    if runtime.get("run_id") != job.run_id or job.logging_error == "WORKER_EVENT_JOURNAL_INVALID":
+        return
+    advertised = runtime.get("events_file")
+    if not advertised:
+        return  # Legacy/custom workers retain their original diagnostics.
+    expected = Path(job.metadata["host_output_dir"]) / "scenario_results" / job.run_id / "events.jsonl"
+    try:
+        if not isinstance(advertised, str) or canonical_path(advertised) != canonical_path(str(expected)):
+            raise ValueError("worker journal path differs from current run")
+        validate_output_path(expected, _NATIVE_ROOTS)
+        owned = Path(job.metadata["host_output_dir"]).absolute()
+        cursor = owned
+        for component in (None,) + expected.absolute().relative_to(owned).parts:
+            if component is not None:
+                cursor /= component
+            try:
+                info = cursor.lstat()
+            except FileNotFoundError:
+                break
+            if cursor.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise ValueError("worker journal or parent is a linked alias")
+        if os.path.commonpath((canonical_path(str(owned)), canonical_path(str(expected)))) != canonical_path(str(owned)):
+            raise ValueError("worker journal escaped its owned output")
+        if not expected.exists():
+            if final:
+                raise ValueError("completed worker journal missing")
+            return
+        # A journal is always a regular file. Reject special files before
+        # opening, then open nonblocking and recheck the descriptor so a FIFO
+        # substituted between lstat/open cannot stall process supervision.
+        if not stat.S_ISREG(expected.lstat().st_mode):
+            raise ValueError("worker journal is not a regular file")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        with os.fdopen(os.open(expected, flags), "rb") as source:
+            info = os.fstat(source.fileno())
+            identity = (info.st_dev, info.st_ino)
+            if (not stat.S_ISREG(info.st_mode) or info.st_size < job.event_offset
+                    or (job.event_identity is not None and job.event_identity != identity)):
+                raise ValueError("worker journal identity or length changed")
+            job.event_identity = identity
+            job.diagnostic_paths["worker_events"] = str(expected)
+            source.seek(job.event_offset)
+            # Bound work per live poll; the completed finite journal is drained
+            # fully before success, with a bounded individual record size.
+            budget = info.st_size - job.event_offset if final else 1024 * 1024
+            while budget > 0:
+                chunk = source.read(min(65536, budget))
+                if not chunk:
+                    break
+                budget -= len(chunk)
+                job.event_offset += len(chunk)
+                job.event_pending += chunk
+                while b"\n" in job.event_pending:
+                    line, job.event_pending = job.event_pending.split(b"\n", 1)
+                    if not line or len(line) > 1024 * 1024:
+                        raise ValueError("invalid worker event record size")
+                    event = json.loads(line.decode("utf-8"))
+                    if (not isinstance(event, dict) or type(event.get("seq")) is not int
+                            or type(event.get("schema_version")) is not int or event["schema_version"] != 1
+                            or event["seq"] != job.event_sequence + 1
+                            or event.get("run_id") != job.run_id
+                            or event.get("task") != job.alias
+                            or event.get("batch_id") != job.batch_id
+                            or not isinstance(event.get("event"), str)
+                            or not isinstance(event.get("message"), str)
+                            or not isinstance(event.get("time"), str)
+                            or "source_time" in event or "source_seq" in event
+                            or event.get("level") not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}):
+                        raise ValueError("worker event identity, sequence or schema invalid")
+                    event_time = datetime.fromisoformat(event["time"].replace("Z", "+00:00"))
+                    if event_time.tzinfo is None:
+                        raise ValueError("worker event timestamp has no timezone")
+                    job.event_sequence = event["seq"]
+                    # Missing trial/scope metadata means unknown, never the
+                    # previous scene's identity. Publish one complete snapshot.
+                    job.event_context = {key: event[key] for key in
+                        ("scenario", "phase", "trial_id", "scope_id", "configured_concurrency")
+                        if key in event and event[key] not in (None, "")}
+                    excluded = {"schema_version", "seq", "time", "task", "batch_id", "level", "event", "message"}
+                    fields = {key: value for key, value in event.items() if key not in excluded}
+                    emit(job.alias, event["message"], event["event"], event["level"],
+                         source_time=event.get("time", ""), source_seq=event["seq"], **fields)
+                if len(job.event_pending) > 1024 * 1024:
+                    raise ValueError("worker event exceeds maximum record size")
+        if final and job.event_pending:
+            raise ValueError("completed worker event is not newline terminated")
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError) as error:
+        job.logging_error = "WORKER_EVENT_JOURNAL_INVALID"
+        emit(job.alias, "任务结构化日志不完整，停止受影响任务；原始诊断保留。",
+             "worker_event_invalid", "ERROR", error_type=type(error).__name__, evidence=str(expected))
 
 
 def write_batch(path: Path | None, batch_id: str, jobs: list[Job],
@@ -1231,6 +1417,7 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
             environment["HOST_OUTPUT_DIR"] = (environment.get("HOST_OUTPUT_DIR")
                                               or str(batch_path / "tasks" / alias))
             job = Job(alias, config, environment)
+            job.batch_id = batch_id
             job.parameter_sources = sources
             job.diagnostic_paths = {"config_stdout": str(diagnostic) + ".stdout.raw.log",
                                     "config_stderr": str(diagnostic) + ".stderr.raw.log"}
@@ -1335,8 +1522,7 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
                                           "AISBENCH_RUN_TAG": job.run_id,
                                           "AISBENCH_RUNTIME_REPORT": str(job.runtime_path),
                                           "AISBENCH_BATCH_ID": batch_id, "AISBENCH_TASK_NAME": job.alias,
-                                          "AISBENCH_TASK_LOG": str(Path(job.metadata["host_output_dir"]) / (job.output_label + "__execution.log")),
-                                          "AISBENCH_EVENTS_PATH": str(log_directory / "worker_events.jsonl")}
+                                          "AISBENCH_TASK_LOG": str(Path(job.metadata["host_output_dir"]) / (job.output_label + "__execution.log"))}
                     options = _process_options()
                     if os.name == "posix":
                         options["pass_fds"] = locks.descriptors
@@ -1370,6 +1556,7 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
                     for job in list(remaining):
                         locks.refresh(job)
                         runtime = read_json(job.runtime_path)
+                        drain_worker_events(job, runtime)
                         if runtime.get("run_id") == job.run_id and runtime.get("logging_error"):
                             job.logging_error = "WORKER_LOG_WRITE_FAILED"
                         if job.logging_error:
@@ -1393,6 +1580,11 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
                             continue
                         job.exit_code = returncode
                         runtime = read_json(job.runtime_path)
+                        drain_worker_events(job, runtime, final=True)
+                        if job.logging_error:
+                            abort_jobs([job], False, batch_path, batch_id, jobs)
+                            remaining.remove(job)
+                            continue
                         complete = runtime.get("run_id") == job.run_id and runtime.get("complete") is True
                         if not complete:
                             cleaned = stop_owned_container(job)
@@ -1404,8 +1596,31 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
                             cleaned = stop_owned_container(job)
                             job.state = "failed" if cleaned else "cleanup_failed"
                         finish_job(job, job.state, returncode)
-                        emit(job.alias, f"任务结束：状态={job.state}，退出码={returncode}。", "task_finished",
-                             state=job.state, exit_code=returncode, cleanup=job.cleanup)
+                        outcomes = runtime.get("outcome_counts") or {}
+                        unsuccessful = runtime.get("non_success_scenarios") or []
+                        labels = {
+                            "peak_unstable": "边界复测存在波动，最高边界未确认",
+                            "peak_budget": "搜索预算耗尽，尚未确认完整边界",
+                            "peak_no_pass": "本轮范围内没有满足条件且完成确认的点",
+                            "peak_cancelled": "摸高被取消，结果未完成",
+                        }
+                        for item in unsuccessful:
+                            if not isinstance(item, dict):
+                                continue
+                            status = item.get("status", "unknown")
+                            scene = item.get("scenario", item.get("name", "未知场景"))
+                            reason = labels.get(status, item.get("reason", "见场景原始报告"))
+                            evidence = item.get("evidence", "")
+                            emit(job.alias, f"场景={scene}；状态={status}；原因={reason}；"
+                                 f"已确认配置并发={item.get('selected_concurrency') or '无'}；证据={evidence}",
+                                 "task_scenario_attention", "WARNING" if status in labels else "ERROR",
+                                 scenario=scene, status=status, raw_reason=item.get("reason", ""), evidence=evidence)
+                        detail = "；未通过/未确认场景=" + ", ".join(
+                            str(item.get("name", item.get("scenario", "未知场景"))) + ":" + str(item.get("status", "unknown"))
+                            for item in unsuccessful if isinstance(item, dict)) if unsuccessful else ""
+                        emit(job.alias, f"任务结束：状态={job.state}，退出码={returncode}{detail}。", "task_finished",
+                             state=job.state, exit_code=returncode, cleanup=job.cleanup,
+                             outcome_counts=outcomes, non_success_scenarios=unsuccessful)
                         remaining.remove(job)
                         write_batch(batch_path, batch_id, jobs)
                         last_refresh = time.monotonic()
@@ -1432,6 +1647,8 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
                             reader.join(timeout=10)
                             if reader.is_alive():
                                 job.logging_error = "LOG_READER_DID_NOT_FINISH"
+                    runtime = read_json(job.runtime_path) if job.runtime_path else {}
+                    drain_worker_events(job, runtime, final=True)
                     for handle in (job.log_handle, job.stdout_handle, job.stderr_handle):
                         if handle is not None:
                             try:
@@ -1480,8 +1697,14 @@ def _emergency_log(batch_id: str, error: BaseException) -> None:
 
 
 def supervise(script: Path, arguments: list[str]) -> int:
-    global _BATCH_LOG, _LOG_ERROR, _NATIVE_ROOTS
+    global _BATCH_LOG, _CONSOLE, _CONSOLE_MODE, _LOG_ERROR, _NATIVE_ROOTS
     _LOG_ERROR = ""
+    option_error = None
+    try:
+        arguments, requested_console = console_arguments(arguments)
+    except RunError as error:
+        option_error, requested_console = error, "auto"
+    _CONSOLE_MODE = console_mode(requested_console)
     release_root = script.parent
     # Protect the authoritative release even if a caller supplies a bogus
     # script path whose derived output root lies inside the native subtree.
@@ -1497,18 +1720,27 @@ def supervise(script: Path, arguments: list[str]) -> int:
     except (OSError, ValueError) as error:
         _emergency_log(batch_id, error)
         return 1
+    console_source = _BATCH_LOG.console_path if _CONSOLE_MODE == "full" else _BATCH_LOG.human_path
+    _CONSOLE = AsyncConsoleMirror(console_source).start()
     jobs: list[Job] = []
     state = {"schema_version": 1, "batch_id": batch_id, "state": "preflight",
              "started_at": timestamp(), "finished_at": "", "exit_code": None,
              "owner": process_identity(os.getpid()),
              "reason_code": "", "logging_error": "", "log_dir": str(_BATCH_LOG.directory),
-             "configuration_count": len(arguments) or 1,
-             "configurations": arguments or [str(script.parent / "config.env")]}
+             "console_mode": _CONSOLE_MODE, "console_requested": requested_console,
+             "main_log": str(_BATCH_LOG.human_path), "detail_log": str(_BATCH_LOG.console_path),
+             "configuration_count": 0 if option_error is not None else (len(arguments) or 1),
+             "configurations": [] if option_error is not None else (arguments or [str(script.parent / "config.env")])}
     code = 1
     try:
         atomic_json(batch_path / "batch_state.json", state)
+        if option_error is not None:
+            raise option_error
         emit("manager", f"批次 {batch_id} 开始；先验证全部配置，日志目录: {_BATCH_LOG.directory}", "batch_started",
              configuration_count=len(arguments) or 1, mode="explicit" if arguments else "default_with_export_overrides")
+        emit("manager", f"主日志（业务摘要）：{_BATCH_LOG.human_path}；完整控制台转录：{_BATCH_LOG.console_path}；"
+             f"当前显示={_CONSOLE_MODE}；各任务/轮次原生stdout、stderr独立保存。", "log_locations",
+             console_mode=_CONSOLE_MODE, main_log=str(_BATCH_LOG.human_path), detail_log=str(_BATCH_LOG.console_path))
         check_batch_logging()
         code = _supervise(script, arguments, batch_path, batch_id, jobs, state)
         state["state"] = "cancelled" if _STOP_REQUESTED else ("success" if code == 0 else "failed")
@@ -1560,33 +1792,28 @@ def supervise(script: Path, arguments: list[str]) -> int:
                         candidate = Path(output) / (job.output_label + suffix)
                         if candidate.is_file():
                             related_logs.append(candidate)
+            # The optional observer owns the terminal. Bound its shutdown before
+            # freezing the durable source files used by the management archive.
+            state["console_forwarding"] = _CONSOLE.close()
+            atomic_json(_BATCH_LOG.directory / "console_state.json", state["console_forwarding"])
             state['log_archive'] = _BATCH_LOG.close(related_logs)
         except (OSError, ValueError) as error:
             code = code or 1
             state.update(state="failed", logging_error="BATCH_LOG_CLOSE_FAILED", reason_code="BATCH_LOG_CLOSE_FAILED", exit_code=code)
             state['log_archive_error_type'] = type(error).__name__
-            try:
-                print('ERROR: 日志关闭或分段封存失败，原始日志保留；请检查批次日志目录和batch_state.json，不能视为成功。',
-                      file=sys.stderr, flush=True)
-            except OSError:
-                pass
+            final_console_message('ERROR: 日志关闭或分段封存失败，原始日志保留；请检查批次日志目录和batch_state.json，不能视为成功。')
         state['finished_at'] = timestamp()
         try:
             atomic_json(batch_path / "batch_state.json", state)
         except OSError:
             code = code or 1
             state.update(state='failed', exit_code=code, reason_code='BATCH_STATE_WRITE_FAILED')
-            try:
-                print("ERROR: 批次终态未能写入；请检查日志和磁盘，不能视为成功。", file=sys.stderr, flush=True)
-            except OSError:
-                pass
-        try:
-            archive = state.get('log_archive') or {}
-            print(f"[{timestamp()}] [manager] 批次结束：{state['state']}，退出码={code}，结果目录={batch_path}，"
-                  f"日志封存索引={archive.get('index', '未完成，请检查错误和原始日志')}", flush=True)
-        except (BrokenPipeError, OSError, UnicodeError):
-            pass
+            final_console_message("ERROR: 批次终态未能写入；请检查日志和磁盘，不能视为成功。")
+        archive = state.get('log_archive') or {}
+        final_console_message(f"{timestamp()} INFO [manager] [batch_finished] 批次结束：{state['state']}，退出码={code}，结果目录={batch_path}，"
+                              f"日志封存索引={archive.get('index', '未完成，请检查错误和原始日志')}")
         _BATCH_LOG = None
+        _CONSOLE = None
     return code
 
 

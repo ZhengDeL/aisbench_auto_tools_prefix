@@ -209,7 +209,9 @@ outputs/default/<批次号>/
 ├── merged_metrics.csv               # 带任务身份的各任务指标行
 ├── .generations/<代号>/             # 一次完整发布的不可变快照
 ├── logs/
-│   ├── batch.log                    # 面向人的批次关键日志
+│   ├── batch.log                    # 业务主日志：管理及任务结构化事件
+│   ├── console.log                  # 完整脱敏转录：业务与原生详情
+│   ├── console_state.json           # 结束时的显示完整性及终端降级状态
 │   ├── events.jsonl                 # 批次结构化事件
 │   ├── archive_index.json           # 管理日志封存来源、分段顺序及原始/gzip校验值
 │   ├── archive/<封存号>/            # gzip字节段，原始日志继续保留
@@ -285,7 +287,30 @@ scenario,current_time,input_len,output_len,total_req,max_cc,cc,rr,TTFT avg,TTFT 
 4. 该轮 `evaluation.json`、`result_scopes.json`、原始 CSV/JSON/SQLite/NPY 和清单：核对请求数、指标、选中作用域及文件校验值。
 5. 摸高 `search_trace.*` 与 `peak_summary.json`：区分 SLO 不通过、无效测量、请求错误、预算和基础设施问题。
 
-人类关键日志带时间、级别、任务和事件；`events.jsonl` 保留序号、批次及结构化原因，任务事件由任务自身写入，不让多个进程混写一个文件。配置加载、任务和各原生测量作用域的 stdout/stderr 分别按原始字节保存；终端实时透传执行输出并带任务身份前缀，不等待整轮测量结束才打印。摸高判定日志同时显示实际指标、基础阈值、容差上限、判定分类和后续动作；`peak_unstable` 的 WARNING 明确区分已复测稳定的下界与仍波动的更高边界。原始保存与终端显示独立，终端断开不影响原始日志落盘；终端显示经过解码和任务标记，不代替原始字节证据。
+`logs/batch.log` 是业务主日志。管理器只从本轮 worker 的 `events.jsonl` 接收结构化事件，校验运行身份、连续序号和完整记录后统一写入；原生 stdout/stderr 不参与业务级别判定。主日志使用带时区的时间、级别、任务和事件标识，场景及轮次事件另带对应身份。轮次事件保留配置并发、实际指标和基础/有效阈值，决策事件记录下一动作。`<任务输出根>/peak_<场景和运行标识>/peak_search_events.jsonl` 保存搜索引擎实际作出的中点、扩窗、降档、复测和终止决策，不根据输出文本猜测动作。
+
+`logs/console.log` 是完整脱敏转录，包含原生详情，并标注任务、通道及当时已知的场景/轮次身份；它用于诊断，不作为业务主日志。各任务 `__execution.log` 及各 scope 的原始 stdout/stderr 继续独立保存。stderr 表示传输通道，AISBench 正常 INFO 也可能写在 stderr。
+
+批次级显示选项 `--console auto|summary|full` 与场景无关：
+
+| 模式 | 当前终端或重定向输出 | 持久文件 |
+|---|---|---|
+| `auto`（默认） | 标准输出连接真实 TTY 时使用 full；文件重定向、管道等非 TTY 使用 summary | 主日志、完整转录、任务及原生日志均保留 |
+| `summary` | 只显示管理、场景、轮次和决策摘要 | 原生详情仍实时独立写入 |
+| `full` | 显示完整脱敏转录，适用于希望保留详情的 tee 管道 | 各层文件照常保留 |
+
+```bash
+bash run_benchmark.sh --console summary ./service.env >benchmark.log 2>&1
+# 在调用者 Bash 中保留压测失败的非零退出码。
+set -o pipefail
+bash run_benchmark.sh --console full ./service.env | tee console.log
+```
+
+以上 summary 重定向得到的 `benchmark.log` 是可读摘要；显式 full 收集的 `console.log` 是全量转录。`auto` 仅依据标准输出是否为 TTY 选择模式；单独使用 `&` 不改变输出类型，`nohup` 通常因重定向输出而使用摘要。管道会让 `auto` 选择摘要，希望通过 `tee` 实时查看原生详情时应显式选 `full`。不要用 `2>&1` 后的通道名称判断错误。
+
+请求模式及实际显示模式分别记录在 `batch_state.json` 的 `console_requested` 和 `console_mode`。`logs/console_state.json` 在批次结束时写入，记录显示是否完整、来源、字节计数及降级原因；运行中尚未生成该文件不表示原始日志缺失。原始记录按原字节保存，CR进度刷新和显示解码不回写原始文件。可选终端显示由异步观察器读取已落盘文件，慢终端和断开不会卡住监督。
+
+固定场景的 `passed` 表示执行和适用数据完整性通过，不代表满足摸高SLO。任务结束同时列出每个非成功场景的状态、原因和证据；`peak_unstable` 表示边界未确认，保留独立确认的稳定下界，不能写成已确认最高值。任务可因该状态返回非零，主日志会区分未确认边界、无满足点、预算和实际请求/执行错误。
 
 每次 Docker 调用的原始流保存在 `process_logs/call_<标识>/`，原生各作用域的真实原始流仍在对应轮次下的 `scope_*/stdout.raw.log`、`scope_*/stderr.raw.log`。先按 `evaluation.json`、`result_scopes.json` 或试验报告记录的路径定位作用域，不把批次管理日志、终端转发副本和某次模型请求的原始结果混为同一个来源。
 

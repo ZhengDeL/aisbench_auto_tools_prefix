@@ -106,7 +106,18 @@ SLO 容差默认关闭（`PEAK_SLO_TOLERANCE=0.0`），需要时由用户显式�
 
 ## 排查与维护
 
-测试过程中，原生执行的 stdout/stderr 实时透传到终端，并带任务身份前缀；原始字节仍分别保存，终端断开不影响原始日志落盘。测试失败时，先查看 `batch_state.json` 和 `logs/batch.log`，确定任务、阶段和原因，再查看对应任务的 `__execution.log`、`result_index.json` 以及摸高搜索记录。每轮真实 `scope_*/stdout.raw.log`、`scope_*/stderr.raw.log`、测量结果和日志封存索引均保留在批次或任务目录中，详见 [日志排查与保留](automation/README.md#日志排查与保留)。
+业务主日志是 `logs/batch.log`，包含批次、任务、场景、轮次指标、搜索动作及结束原因；原生详情单独保存在 `logs/console.log` 和各轮次原始文件中。主日志从结构化事件生成，原生 stderr 中的 INFO 和进度条不会被当作错误或混入主日志。
+
+默认 `--console auto`：标准输出连接真实 TTY 时显示带任务身份的完整详情；输出到文件或管道等非 TTY 时只显示业务摘要。单独使用 `&` 不会改变标准输出是否为 TTY。可以显式选择：
+
+```bash
+bash run_benchmark.sh --console summary ./service.env >benchmark.log 2>&1
+# 通过 tee 收集时，保留压测失败的非零退出码。
+set -o pipefail
+bash run_benchmark.sh --console full ./service.env | tee console.log
+```
+
+`summary` 只影响显示，原生详情继续实时落盘；`full` 适合希望通过 `tee` 查看和收集全部输出的情况。显示模式记录在 `batch_state.json`；结束时生成的 `logs/console_state.json` 记录显示完整性及降级原因。每个配置仍有独立任务日志，每次真实测量仍有独立 `scope_*/stdout.raw.log`、`stderr.raw.log`，原始字节不改写。显示通道与监督、持久写盘分离，慢终端或断开时记录显示降级。具体路径与终态判读见 [日志排查与保留](automation/README.md#日志排查与保留)。
 
 管理器被强杀后，容器中的请求可能仍在执行。不要删锁、改容器名或换输出路径绕过隔离，应按 [恢复规则](automation/README.md#服务隔离容器与取消) 核对原任务和完整容器 ID。日志、配置和原始结果可能含真实地址、请求内容或凭据，分享前需单独审查。
 

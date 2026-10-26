@@ -211,6 +211,47 @@ def sanitize_output_name(value: str, fallback: str = "peak_search") -> str:
     return "".join(safe).strip("_") or fallback
 
 
+class SearchDecisionHandler(logging.Handler):
+    """Persist explicit search decisions without parsing human/native output.
+
+    This journal belongs to one newly created peak session.  It contains only
+    records tagged by the searcher; ordinary diagnostics and round metrics stay
+    in their existing logs/results.  A failed durable write is a logging error,
+    never a reason to invent or silently skip a search decision.
+    """
+
+    def __init__(self, path: Path):
+        super().__init__()
+        self.stream = None
+        descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        self.stream = os.fdopen(descriptor, "wb")
+        self.sequence = 0
+
+    def emit(self, record):
+        event = getattr(record, "search_event", None)
+        if not event:
+            return
+        payload = dict(
+            schema_version=1, seq=self.sequence + 1,
+            time=datetime.fromtimestamp(record.created).astimezone().isoformat(timespec="milliseconds"),
+            level=record.levelname, event=event,
+            scenario=record.scenario, message=getattr(record, "search_message", record.getMessage()),
+            fields=record.search_fields,
+        )
+        self.stream.write((json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
+        self.stream.flush()
+        os.fsync(self.stream.fileno())
+        self.sequence += 1
+
+    def close(self):
+        try:
+            if self.stream is not None and not self.stream.closed:
+                self.stream.flush()
+                self.stream.close()
+        finally:
+            super().close()
+
+
 def setup_logger(log_path: Path) -> logging.Logger:
     logger = logging.getLogger(f"aisbench_peak_search.{log_path}")
     logger.setLevel(logging.INFO)
@@ -225,6 +266,7 @@ def setup_logger(log_path: Path) -> logging.Logger:
     stream_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
+    logger.addHandler(SearchDecisionHandler(log_path.with_name("peak_search_events.jsonl")))
     logger.propagate = False
     return logger
 
@@ -913,6 +955,14 @@ class PeakSearcher:
         if len(self.history) >= self.case.max_trials or self.remaining <= 0:
             raise SearchStop("budget_limit", "trial count or total elapsed time budget exhausted")
 
+    def decision_fields(self, event, message=None, **fields):
+        """Attach typed, currently known decisions to an existing log record."""
+        extra = dict(search_event=event, scenario=self.case.name,
+                     search_fields=dict(profile=self.profile, **fields))
+        if message is not None:
+            extra["search_message"] = message
+        return extra
+
     def wait_before_evaluation(self):
         """Spend recovery time only when another real measurement is needed.
 
@@ -1082,7 +1132,11 @@ class PeakSearcher:
                 self.confirmed_fail.pop(concurrency, None)
                 record("unstable_measurement")
                 self.logger.warning("并发%s的单轮repeat出现完整但相互矛盾的SLO结果；保留UNSTABLE，不作全失败边界；下一步%s",
-                                    concurrency, "先寻找更低稳定点" if expected_state == "PASS" else "保留已确认稳定下界并结束未确认边界")
+                                    concurrency, "先寻找更低稳定点" if expected_state == "PASS" else "保留已确认稳定下界并结束未确认边界",
+                                    extra=self.decision_fields("boundary_unstable", concurrency=concurrency,
+                                        expected_state=expected_state, states=[item.state for item in results],
+                                        next_action="recover_lower" if expected_state == "PASS" else "stop_unconfirmed_boundary",
+                                        confirmed_concurrencies=sorted(self.confirmed_pass)))
                 if expected_state == "PASS":
                     return next(item for item in reversed(results) if item.state == "UNSTABLE")
                 raise SearchStop("unstable", "complete repeat scopes disagree at concurrency " + str(concurrency))
@@ -1093,25 +1147,42 @@ class PeakSearcher:
                 record("unstable")
                 if expected_state == "PASS":
                     self.logger.warning("并发%s的fresh结果%s不一致；不作通过或全失败，先寻找更低稳定点",
-                                        concurrency, [item.state for item in results])
+                                        concurrency, [item.state for item in results],
+                                        extra=self.decision_fields("boundary_unstable", concurrency=concurrency,
+                                            expected_state=expected_state, states=[item.state for item in results],
+                                            next_action="recover_lower", confirmed_concurrencies=sorted(self.confirmed_pass)))
                     # Find a lower fully confirmed point before ending with an
                     # unstable upper boundary. Return the actual failing trial,
                     # never relabel the most recent passing measurement.
                     return next(item for item in reversed(results) if item.state == "SLO_FAIL")
                 self.logger.warning("并发%s的fresh结果%s不一致；保留已确认稳定点，最高边界尚未确认",
-                                    concurrency, [item.state for item in results])
+                                    concurrency, [item.state for item in results],
+                                    extra=self.decision_fields("boundary_unstable", concurrency=concurrency,
+                                        expected_state=expected_state, states=[item.state for item in results],
+                                        next_action="stop_unconfirmed_boundary", confirmed_concurrencies=sorted(self.confirmed_pass)))
                 raise SearchStop("unstable", "fresh confirmation trials disagree at concurrency " + str(concurrency))
             if results and expected_state and states != {expected_state}:
                 record("target_rejected")
                 self.logger.warning("并发%s未满足复测目标%s（实际%s）；%s；下一步%s",
                                     concurrency, expected_state, results[-1].state, self.measurement_text(results[-1]),
-                                    "先降档寻找稳定点，不机械跑完剩余复测" if expected_state == "PASS" else "重建搜索区间，不能将通过点当失败边界")
+                                    "先降档寻找稳定点，不机械跑完剩余复测" if expected_state == "PASS" else "重建搜索区间，不能将通过点当失败边界",
+                                    extra=self.decision_fields("confirmation_rejected",
+                                        message=("并发" + str(concurrency) + "确认未满足目标" + expected_state + "；下一步"
+                                                 + ("先寻找更低稳定点" if expected_state == "PASS" else "重建搜索区间")),
+                                        concurrency=concurrency,
+                                        expected_state=expected_state, measurement_state=results[-1].state,
+                                        next_action="recover_lower" if expected_state == "PASS" else "rebuild_search_window",
+                                        trial_id=results[-1].trial_id, evaluation_file=results[-1].evaluation_file))
                 return results[-1]
             if len(results) == self.case.confirm_runs:
                 break
             try:
                 self.logger.info("独立复测：并发%s，第%s/%s轮，目标%s",
-                                 concurrency, len(results) + 1, self.case.confirm_runs, expected_state or "一致判定")
+                                 concurrency, len(results) + 1, self.case.confirm_runs, expected_state or "一致判定",
+                                 extra=self.decision_fields("confirmation_probe", next_concurrency=concurrency,
+                                     confirmation_index=len(results) + 1, required_runs=self.case.confirm_runs,
+                                     expected_state=expected_state, next_action="run_fresh_confirmation",
+                                     observation_source="fresh_measurement"))
                 result = self.evaluate(concurrency, fresh=True, allow_unstable=True)
             except SearchStop as stop:
                 record("interrupted_" + stop.termination)
@@ -1150,15 +1221,30 @@ class PeakSearcher:
             if success is not None and failure is not None and failure.concurrency - success.concurrency <= self.case.precision:
                 break
             middle = (lower + upper) // 2
-            self.logger.info("区间二分：当前[%s,%s]，先测中点%s，端点不预设通过或失败", lower, upper, middle)
+            cached = bool(self.cache.get((self.profile, middle)))
+            self.logger.info("区间二分：当前[%s,%s]，先测中点%s，端点不预设通过或失败", lower, upper, middle,
+                             extra=self.decision_fields("window_probe",
+                                 message=("当前区间[" + str(lower) + "," + str(upper) + "]，复用本轮同阶段并发"
+                                          + str(middle) + "已有观测后更新区间") if cached else None,
+                                 window=[lower, upper], next_concurrency=middle,
+                                 next_action="reuse_observation" if cached else "probe_midpoint",
+                                 observation_source="case_cache" if cached else "new_measurement"))
             result = self.evaluate(middle)
             if result.passed:
                 success, lower = result, result.concurrency + 1
             else:
                 failure, upper = result, result.concurrency - 1
-            action = ("搜索" + ("上" if result.passed else "下") + "半区间[" + str(lower) + "," + str(upper) + "]"
-                      if lower <= upper else "当前区间结束，进入独立复测或下一窗口")
-            self.logger.info("二分判定：并发%s=%s；%s；下一步%s", middle, result.state, self.measurement_text(result), action)
+            window_complete = (lower > upper or (success is not None and failure is not None
+                               and failure.concurrency - success.concurrency <= self.case.precision))
+            action = ("当前区间结束，进入独立复测或下一窗口" if window_complete else
+                      "搜索" + ("上" if result.passed else "下") + "半区间[" + str(lower) + "," + str(upper) + "]")
+            self.logger.info("二分判定：并发%s=%s；%s；下一步%s", middle, result.state, self.measurement_text(result), action,
+                             extra=self.decision_fields("window_result", message="区间测量完成；下一步" + action,
+                                 concurrency=middle,
+                                 measurement_state=result.state, window=None if window_complete else [lower, upper],
+                                 next_action="finish_window" if window_complete else
+                                     ("probe_upper_half" if result.passed else "probe_lower_half"),
+                                 trial_id=result.trial_id, evaluation_file=result.evaluation_file))
         return success, failure
 
     def binary_between(self, success_result, fail_result):
@@ -1166,14 +1252,29 @@ class PeakSearcher:
         best = success_result
         while right - left > self.case.precision:
             middle = (left + right) // 2
-            self.logger.info("边界二分：已观测通过%s、失败%s，中点%s", left, right, middle)
+            cached = bool(self.cache.get((self.profile, middle)))
+            self.logger.info("边界二分：已观测通过%s、失败%s，中点%s", left, right, middle,
+                             extra=self.decision_fields("boundary_probe",
+                                 message=("当前边界[" + str(left) + "," + str(right) + "]，复用本轮同阶段并发"
+                                          + str(middle) + "已有观测后更新边界") if cached else None,
+                                 window=[left, right],
+                                 known_pass=left, known_fail=right, next_concurrency=middle,
+                                 next_action="reuse_observation" if cached else "bisect_observed_boundary",
+                                 observation_source="case_cache" if cached else "new_measurement"))
             result = self.evaluate(middle)
             if result.passed:
                 best, left = result, result.concurrency
             else:
                 fail_result, right = result, result.concurrency
             self.logger.info("边界更新：并发%s=%s；%s；下一步区间[%s,%s]（精度%s）",
-                             middle, result.state, self.measurement_text(result), left, right, self.case.precision)
+                             middle, result.state, self.measurement_text(result), left, right, self.case.precision,
+                             extra=self.decision_fields("boundary_result",
+                                 message=("下一步确认边界" if right - left <= self.case.precision else "下一步继续二分边界")
+                                         + "[" + str(left) + "," + str(right) + "]",
+                                 concurrency=middle,
+                                 measurement_state=result.state, window=[left, right], known_pass=left, known_fail=right,
+                                 next_action="confirm_boundary" if right - left <= self.case.precision else "bisect_observed_boundary",
+                                 trial_id=result.trial_id, evaluation_file=result.evaluation_file))
         return best, fail_result
 
     def find_downward_success(self, failing_result):
@@ -1181,7 +1282,13 @@ class PeakSearcher:
         floor = self.case.floor_concurrency
         while current.concurrency > floor:
             probe = max(floor, current.concurrency // 2)
-            self.logger.info("向下找通过点：已观测失败%s，半降到%s（硬下限%s）", current.concurrency, probe, floor)
+            cached = bool(self.cache.get((self.profile, probe)))
+            self.logger.info("向下找通过点：已观测失败%s，半降到%s（硬下限%s）", current.concurrency, probe, floor,
+                             extra=self.decision_fields("downward_probe", known_fail=current.concurrency,
+                                 message=("向下找通过点，复用本轮同阶段并发" + str(probe) + "已有观测") if cached else None,
+                                 floor_concurrency=floor, next_concurrency=probe,
+                                 next_action="reuse_observation" if cached else "probe_lower_half",
+                                 observation_source="case_cache" if cached else "new_measurement"))
             result = self.evaluate(probe)
             if result.passed:
                 return result, current
@@ -1197,7 +1304,11 @@ class PeakSearcher:
                 upper = min(upper, cap)
             self.logger.info("端点%s已测通过；扩展窗口[%s,%s]，先测中点%s；硬顶=%s",
                              current.concurrency, current.concurrency + 1, upper,
-                             (current.concurrency + 1 + upper) // 2, cap or "关闭")
+                             (current.concurrency + 1 + upper) // 2, cap or "关闭",
+                             extra=self.decision_fields("window_expand", known_pass=current.concurrency,
+                                 window=[current.concurrency + 1, upper], hard_cap=cap,
+                                 next_concurrency=(current.concurrency + 1 + upper) // 2,
+                                 next_action="expand_and_bisect"))
             # For a measured endpoint 200 this probes 201..400 at 300 first,
             # rather than paying for an unmeasured 400 before using the range.
             success, failure = self.probe_window(current.concurrency + 1, upper)
@@ -1222,7 +1333,12 @@ class PeakSearcher:
                                 + " confirmation failed: " + rejected.reason
                                 + "; searching lower independently confirmed concurrency")
         self.logger.warning("并发%s确认未通过；%s；原因=%s；下一步优先验证相邻低点，随后必要时半降/二分",
-                            rejected.concurrency, self.measurement_text(rejected), rejected.reason)
+                            rejected.concurrency, self.measurement_text(rejected), rejected.reason,
+                            extra=self.decision_fields("recovery_start",
+                                message="并发" + str(rejected.concurrency) + "确认未通过；下一步寻找更低稳定点",
+                                concurrency=rejected.concurrency,
+                                next_action="recover_lower", floor_concurrency=floor,
+                                trial_id=rejected.trial_id, evaluation_file=rejected.evaluation_file))
         while failure.concurrency > floor:
             # The adjacent candidate deserves immediate full confirmation.
             # After it fails, use single complete measurements for halving and
@@ -1231,10 +1347,15 @@ class PeakSearcher:
                 probe = failure.concurrency - 1
                 adjacent = False
                 self.confirmation_candidate = probe
-                self.logger.info("稳定点恢复：由%s退到%s，对新点独立复测%s轮", failure.concurrency, probe, self.case.confirm_runs)
+                self.logger.info("稳定点恢复：由%s退到%s，对新点独立复测%s轮", failure.concurrency, probe, self.case.confirm_runs,
+                                 extra=self.decision_fields("recovery_probe", concurrency=failure.concurrency,
+                                     next_concurrency=probe, required_runs=self.case.confirm_runs,
+                                     next_action="confirm_adjacent_lower"))
                 result = self.confirm(probe, "PASS")
             else:
-                self.logger.info("相邻点%s仍未稳定；向硬下限%s半降并二分，不线性遍历所有并发", failure.concurrency, floor)
+                self.logger.info("相邻点%s仍未稳定；向硬下限%s半降并二分，不线性遍历所有并发", failure.concurrency, floor,
+                                 extra=self.decision_fields("recovery_bisect", concurrency=failure.concurrency,
+                                     floor_concurrency=floor, next_action="half_then_bisect"))
                 success, failed = self.find_downward_success(failure)
                 if success is None:
                     failure = failed
@@ -1282,6 +1403,11 @@ class PeakSearcher:
                 # failure after recovery moved the boundary. It is not counted
                 # as a complete FAIL confirmation or substituted for the nearest
                 # boundary's full sequence.
+                self.logger.info("相邻边界已确认；下一步对原先更高失败点并发%s作一次新测量，检查边界是否矛盾",
+                                 original_failure.concurrency,
+                                 extra=self.decision_fields("monotonicity_guard", known_pass=candidate.concurrency,
+                                     known_fail=failure.concurrency, next_concurrency=original_failure.concurrency,
+                                     next_action="check_original_higher_point", observation_source="fresh_measurement"))
                 guard = self.evaluate(original_failure.concurrency, fresh=True)
                 self.confirmation_attempts.append(dict(
                     concurrency=guard.concurrency, expected_state="SLO_FAIL",
@@ -1290,6 +1416,12 @@ class PeakSearcher:
                     complete=False, outcome="monotonicity_guard"))
                 if guard.passed:
                     self.unstable_points.add(guard.concurrency)
+                    self.logger.warning("更高并发%s新测量通过，与较低并发%s的失败边界矛盾；保留已确认稳定下界，最高边界未确认",
+                                        guard.concurrency, failure.concurrency,
+                                        extra=self.decision_fields("boundary_unstable", concurrency=guard.concurrency,
+                                            known_fail=failure.concurrency, confirmed_concurrencies=sorted(self.confirmed_pass),
+                                            next_action="stop_unconfirmed_boundary", trial_id=guard.trial_id,
+                                            evaluation_file=guard.evaluation_file))
                     raise SearchStop("unstable", "measured higher pass contradicts confirmed lower failure")
             self.termination, self.reason = "boundary_confirmed", "fresh boundary confirmed within configured precision"
             return candidate_check
