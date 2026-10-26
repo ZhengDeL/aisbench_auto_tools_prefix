@@ -854,6 +854,7 @@ class Worker:
             _, scope = self.evaluation(Path(reference)) if reference else ({}, {})
             self.append_row(scene, row, status, evaluation_file=reference, scope=scope, report_file=str(path),
                 selected_trial_id=row.get('selected_trial_id', ''), termination_reason=row.get('termination', ''))
+            reason = row.get('reason') or '最终报告未提供具体原因，需核查选中作用域和搜索轨迹'
             if status == 'peak_unstable':
                 summaries = report.get('summaries', [])
                 unstable = sorted({point for summary in summaries for point in summary.get('unstable_points', [])})
@@ -863,10 +864,9 @@ class Worker:
                            f"说明=同一并发的完整复测出现通过与超限，已保留独立确认的稳定点和原始证据；详细记录={path}")
             else:
                 message = (f"摸高结束：{status}；配置并发={row.get('concurrency') or '未确认'}；"
-                           f"实测平均并发={row.get('cc') or '无适用测量'}；说明={row.get('reason', '')}；详细记录={path}")
+                           f"实测平均并发={row.get('cc') or '无适用测量'}；说明={reason}；详细记录={path}")
             level = ('INFO' if status in {'peak_confirmed', 'peak_capped'} else
                      'WARNING' if status in {'peak_unstable', 'peak_budget', 'peak_no_pass', 'peak_cancelled'} else 'ERROR')
-            reason = row.get('reason') or '最终报告未提供具体原因，需核查选中作用域和搜索轨迹'
             if rc != 0 and status in {'peak_confirmed', 'peak_capped'}:
                 reason = f'工具退出码={rc}，报告记录状态={status}；{reason}'
                 message = f'摸高调用未成功：{reason}；保留报告中的测量记录；详细记录={path}'
