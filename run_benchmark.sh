@@ -18,14 +18,18 @@ print_usage() {
   bash run_benchmark.sh ./service.env           # 运行一份指定配置
   bash run_benchmark.sh ./a.env ./b.env         # 并行运行多份配置，文件名自定
   bash run_benchmark.sh --console summary      # 只显示业务摘要，原生详情独立保存
-  bash run_benchmark.sh --console full ./a.env  # 实时显示完整详情，适用于终端或tee
+  bash run_benchmark.sh --console full ./a.env  # 显式显示完整详情（默认）
+  nohup bash run_benchmark.sh ./a.env >benchmark.log 2>&1 &  # 后台保存完整输出
+  tail -f benchmark.log                        # 跟踪后台压测和 AISBench 详情
   bash run_benchmark.sh --help                  # 查看本说明
 
 无需单独 source。每份配置对应一个专用压测容器和独立输出目录；
 并行配置必须指向不同服务，冲突由任务管理器在发起压测前检查。
-默认 --console auto：标准输出连接真实TTY时显示完整详情，文件或管道等非TTY显示业务摘要。
-单独使用&不改变TTY属性；通过tee收集时，请在调用者Bash中先set -o pipefail。
-主日志 logs/batch.log；完整转录 logs/console.log；每轮原生stdout/stderr另存。
+默认 --console full：终端、文件重定向和管道均输出 AISBench 详细日志。
+只看业务摘要时指定 --console summary；显式 auto 仍按TTY选择 full 或 summary。
+通过tee收集时，请在调用者Bash中先set -o pipefail。
+外部benchmark.log由调用者重定向生成；内部logs/batch.log只含业务摘要，
+logs/console.log保存完整输出；每轮原生stdout/stderr另存。
 
 宿主机需要 Linux、Bash、Python 3.7+ 和 Docker；镜像内使用自带 Python。
 配置参考见 config.env 末尾；使用与排查说明见 automation/README.md。

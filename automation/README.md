@@ -1,6 +1,6 @@
 # AISBench 自动化使用与维护
 
-本说明对应 v2026.10.27，介绍配置、运行、结果判读和维护方法。日常启动入口和默认配置均在仓库根目录：`run_benchmark.sh`、`config.env`。说明中的示例和检查命令不代表对应环境已经完成验收。
+本说明对应 v2026.10.28，介绍配置、运行、结果判读和维护方法。日常启动入口和默认配置均在仓库根目录：`run_benchmark.sh`、`config.env`。说明中的示例和检查命令不代表对应环境已经完成验收。
 
 ## 目录与修改位置
 
@@ -295,18 +295,26 @@ scenario,current_time,input_len,output_len,total_req,max_cc,cc,rr,TTFT avg,TTFT 
 
 | 模式 | 当前终端或重定向输出 | 持久文件 |
 |---|---|---|
-| `auto`（默认） | 标准输出连接真实 TTY 时使用 full；文件重定向、管道等非 TTY 使用 summary | 主日志、完整转录、任务及原生日志均保留 |
-| `summary` | 只显示管理、场景、轮次和决策摘要 | 原生详情仍实时独立写入 |
-| `full` | 显示完整脱敏转录，适用于希望保留详情的 tee 管道 | 各层文件照常保留 |
+| `full`（默认） | 显示完整输出，包括 AISBench 原生进度和详细日志；文件重定向和管道同样保留 | 主日志、完整转录、任务及原生日志均保留 |
+| `summary` | 用户主动选择时，只显示管理、场景、轮次和决策摘要 | 原生详情仍实时独立写入 |
+| `auto` | 显式选择时，标准输出连接真实 TTY 使用 full；文件或管道使用 summary | 各层文件照常保留 |
 
 ```bash
-bash run_benchmark.sh --console summary ./service.env >benchmark.log 2>&1
-# 在调用者 Bash 中保留压测失败的非零退出码。
+# 后台运行，benchmark.log 包含 AISBench 详细输出。
+nohup bash run_benchmark.sh ./service.env >benchmark.log 2>&1 &
+tail -n 50 -f benchmark.log
+
+# 在终端查看并保存完整输出，保留压测失败的非零退出码。
 set -o pipefail
-bash run_benchmark.sh --console full ./service.env | tee console.log
+bash run_benchmark.sh ./service.env 2>&1 | tee benchmark.log
+
+# 只看业务摘要时主动指定。
+bash run_benchmark.sh --console summary ./service.env >benchmark.summary.log 2>&1
 ```
 
-以上 summary 重定向得到的 `benchmark.log` 是可读摘要；显式 full 收集的 `console.log` 是全量转录。`auto` 仅依据标准输出是否为 TTY 选择模式；单独使用 `&` 不改变输出类型，`nohup` 通常因重定向输出而使用摘要。管道会让 `auto` 选择摘要，希望通过 `tee` 实时查看原生详情时应显式选 `full`。不要用 `2>&1` 后的通道名称判断错误。
+`benchmark.log` 和 `benchmark.summary.log` 是上述命令创建的外部文件，文件名由调用者决定。批次目录内的 `logs/batch.log` 始终只含业务摘要，`logs/console.log` 始终保存完整输出。选择显示模式不会改变这两份内部日志，也不会关闭任务和轮次的原始日志。
+
+`auto` 保留原有的 TTY 判断规则，但不再是默认值。显式使用 `--console auto` 配合重定向、`nohup` 或 `tee` 时，输出仍为摘要；单独使用 `&` 不改变 TTY 属性。不要用 `2>&1` 后的通道名称判断错误。
 
 请求模式及实际显示模式分别记录在 `batch_state.json` 的 `console_requested` 和 `console_mode`。`logs/console_state.json` 在批次结束时写入，记录显示是否完整、来源、字节计数及降级原因；运行中尚未生成该文件不表示原始日志缺失。原始记录按原字节保存，CR进度刷新和显示解码不回写原始文件。可选终端显示由异步观察器读取已落盘文件，慢终端和断开不会卡住监督。
 
@@ -355,7 +363,7 @@ python3 -B automation/core/aisbench_result_validation.py \
 - 配置加载失败、启动异常、容器丢失/替换、日志及磁盘错误、终端断开、取消和停止失败均有明确状态及证据，不碰其他服务。
 - 发布内容、原生文件字节和模式、公开隐私检查、本地回归结果及实机证据对应同一版本；未覆盖项明确列出。
 
-版本以 `v2026.10.27` 注释标签对应的源码为准。更换镜像、上游或被测服务后应重新验证，不能只凭其他环境的检查结果判断当前运行正常。
+版本以 `v2026.10.28` 注释标签对应的源码为准。更换镜像、上游或被测服务后应重新验证，不能只凭其他环境的检查结果判断当前运行正常。
 
 ## 更新原生仓
 

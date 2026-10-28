@@ -1,6 +1,6 @@
 # AISBench 自动化压测工具
 
-版本：v2026.10.27
+版本：v2026.10.28
 
 基于 AISBench，对已部署的模型服务执行固定并发测试和并发摸高，支持前缀缓存、GSM8K 精度测试，以及多个独立服务并行测试。每份配置独立执行，分别保存结果、日志和原始数据。
 
@@ -108,16 +108,23 @@ SLO 容差默认关闭（`PEAK_SLO_TOLERANCE=0.0`），需要时由用户显式�
 
 业务主日志是 `logs/batch.log`，包含批次、任务、场景、轮次指标、搜索动作及结束原因；原生详情单独保存在 `logs/console.log` 和各轮次原始文件中。主日志从结构化事件生成，原生 stderr 中的 INFO 和进度条不会被当作错误或混入主日志。
 
-默认 `--console auto`：标准输出连接真实 TTY 时显示带任务身份的完整详情；输出到文件或管道等非 TTY 时只显示业务摘要。单独使用 `&` 不会改变标准输出是否为 TTY。可以显式选择：
+默认显示完整输出，包括 AISBench 原生进度和详细日志。终端、文件重定向和 `tee` 使用相同规则。后台运行后，可以直接跟踪 `benchmark.log`：
 
 ```bash
-bash run_benchmark.sh --console summary ./service.env >benchmark.log 2>&1
-# 通过 tee 收集时，保留压测失败的非零退出码。
+nohup bash run_benchmark.sh ./service.env >benchmark.log 2>&1 &
+tail -n 50 -f benchmark.log
+
+# 在终端查看并保存完整输出；保留压测失败的非零退出码。
 set -o pipefail
-bash run_benchmark.sh --console full ./service.env | tee console.log
+bash run_benchmark.sh ./service.env 2>&1 | tee benchmark.log
+
+# 只需要业务摘要时，主动指定 summary。
+bash run_benchmark.sh --console summary ./service.env >benchmark.summary.log 2>&1
 ```
 
-`summary` 只影响显示，原生详情继续实时落盘；`full` 适合希望通过 `tee` 查看和收集全部输出的情况。显示模式记录在 `batch_state.json`；结束时生成的 `logs/console_state.json` 记录显示完整性及降级原因。每个配置仍有独立任务日志，每次真实测量仍有独立 `scope_*/stdout.raw.log`、`stderr.raw.log`，原始字节不改写。显示通道与监督、持久写盘分离，慢终端或断开时记录显示降级。具体路径与终态判读见 [日志排查与保留](automation/README.md#日志排查与保留)。
+这里的 `benchmark.log` 是调用者重定向生成的文件，名称可自定。批次目录内的 `logs/batch.log` 始终只保存业务摘要，`logs/console.log` 始终保存完整输出。`--console summary` 只改变终端或重定向输出，不会关闭原生日志保存。显式使用 `--console auto` 时，仍按 TTY 选择：终端显示完整输出，文件或管道显示摘要。
+
+显示模式记录在 `batch_state.json`；结束时生成的 `logs/console_state.json` 记录显示完整性及降级原因。每个配置仍有独立任务日志，每次真实测量仍有独立 `scope_*/stdout.raw.log`、`stderr.raw.log`，原始字节不改写。显示通道与监督、持久写盘分离，慢终端或断开时记录显示降级。具体路径与终态判读见 [日志排查与保留](automation/README.md#日志排查与保留)。
 
 管理器被强杀后，容器中的请求可能仍在执行。不要删锁、改容器名或换输出路径绕过隔离，应按 [恢复规则](automation/README.md#服务隔离容器与取消) 核对原任务和完整容器 ID。日志、配置和原始结果可能含真实地址、请求内容或凭据，分享前需单独审查。
 

@@ -50,7 +50,7 @@ _STOP_REQUESTED = 0
 _PRINT_LOCK = threading.Lock()
 _BATCH_LOG: BatchLog | None = None
 _CONSOLE: AsyncConsoleMirror | None = None
-_CONSOLE_MODE = "auto"
+_CONSOLE_MODE = "full"
 _LOG_ERROR = ""
 _NATIVE_ROOTS: list[Path] = []
 
@@ -104,7 +104,9 @@ def emit(alias: str, message: str, event: str = "manager_progress", level: str =
 
 def console_arguments(arguments: list[str]) -> tuple[list[str], str]:
     """One batch display setting, independent from each service configuration."""
-    configs, mode, index = [], "auto", 0
+    # Background jobs and tee must retain native output by default. A redirected
+    # stdout is a common way to keep a benchmark log, not a request for summary.
+    configs, mode, index = [], "full", 0
     while index < len(arguments):
         value = arguments[index]
         if value == "--":
@@ -1703,7 +1705,7 @@ def supervise(script: Path, arguments: list[str]) -> int:
     try:
         arguments, requested_console = console_arguments(arguments)
     except RunError as error:
-        option_error, requested_console = error, "auto"
+        option_error, requested_console = error, "full"
     _CONSOLE_MODE = console_mode(requested_console)
     release_root = script.parent
     # Protect the authoritative release even if a caller supplies a bogus
