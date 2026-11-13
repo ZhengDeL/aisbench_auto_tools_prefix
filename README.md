@@ -32,6 +32,7 @@ ghcr.io/aisbench/aisbench_benchmark:v3.1-20261013-master-openeuler24.03-py311
 | `MODEL_HOST_PATH` | 压测主机上的模型 tokenizer 目录 |
 | `HOST_IP`、`HOST_PORT` | 模型服务地址和端口 |
 | `NPU_NUM` | 吞吐归一化使用的卡数或 NPU 芯片数，报告时注明口径 |
+| `POD_INFO` | 可选的后端缓存计数端点；为空时不采集，不自动使用模型服务端口 |
 | `SCENARIOS_JSON` | 输入长度、输出长度、并发、摸高阈值等测试场景 |
 
 仓库中的地址、模型名和路径均为示例，使用前应填写实际值。默认 `config.env` 包含两组 64K 输入场景、固定并发和摸高。首次检查流程时，建议先编辑小规模示例：

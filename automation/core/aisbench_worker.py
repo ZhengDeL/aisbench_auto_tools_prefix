@@ -594,6 +594,43 @@ class Worker:
         self.rows.append(row)
         self.save_rows()
 
+    def cache_metrics_plan(self, scene):
+        arguments = scene.get('args') or scene.get('extra_args') or ()
+        if '--prefix_test' not in arguments:
+            return
+        endpoints = [item.strip() for item in self.values['POD_INFO'].split(',') if item.strip()]
+        message = (f'附加缓存指标：使用POD_INFO中的{len(endpoints)}个端点采集前后计数'
+                   if endpoints else '附加缓存指标：POD_INFO未配置，跳过/metrics采集；前缀准备与主测照常执行')
+        self.log('cache_metrics_plan', message + '；全局Prefill吞吐使用独立来源，无来源时CSV留空',
+                 cache_metrics_state='configured' if endpoints else 'not_configured')
+
+    def cache_metrics_result(self, report, file):
+        metrics = report.get('cache_metrics')
+        if not isinstance(metrics, dict):
+            return
+        seen = getattr(self, '_cache_metrics_reported', set())
+        identity = str(file)
+        if identity in seen:
+            return
+        state, reason = metrics.get('state', 'unavailable'), metrics.get('reason', '')
+        if state == 'not_configured':
+            message = '附加缓存指标未配置：已跳过采集，不报告实测命中率'
+        elif state == 'complete':
+            message = ('附加缓存计数采集完成；部分命中率未定义（无查询）'
+                       if metrics.get('undefined_rates') else '附加缓存计数采集完成')
+            measurement = (metrics.get('measurements') or [{}])[-1]
+            phase = {'main': '主测', 'prefix': '前缀准备'}.get(measurement.get('phase'), '该阶段')
+            for field, title in (('normal', 'HBM'), ('external', '外部缓存')):
+                value = measurement.get('summary', {}).get(field, {}).get('rate')
+                message += '；' + phase + title + '=' + (format(value, '.2%') if value is not None else '未定义')
+        else:
+            message = '附加缓存指标不可用：' + str(reason or '采集未完成')
+        self.log('cache_metrics', message + '；该状态与模型性能判定分别记录；原生Prefill 9999为占位，无来源时CSV留空',
+                 level='WARNING' if state not in {'not_configured', 'complete'} else 'INFO',
+                 cache_metrics_state=state, cache_metrics_reason=reason, evidence=str(file))
+        seen.add(identity)
+        self._cache_metrics_reported = seen
+
     def evaluation(self, file):
         if not path_is_relative_to(file.resolve(), self.output.resolve()):
             raise ValueError('测量证据不属于本任务输出目录')
@@ -610,6 +647,7 @@ class Worker:
             if report.get('state') in {'PASS', 'SLO_FAIL', 'UNSTABLE'}:
                 report.update(state='INVALID', reason='selected measurement unavailable: ' + reason)
         atomic_json(file, report)
+        self.cache_metrics_result(report, file)
         return report, scope
 
     def fixed(self, scene):
@@ -621,6 +659,7 @@ class Worker:
         validate_output_path(evidence, NATIVE_ROOTS)
         self.log('fixed_start', f"固定测试：配置并发={scene['concurrency']}，每主测请求={scene['data_num']}，输出配置={scene['output_len']}",
             request_rate=scene['request_rate'], test_type=scene['test_type'], accuracy=scene['accuracy'])
+        self.cache_metrics_plan(scene)
         rc = self.run_container(['python3', CONTAINER_AUTOMATION + '/aisbench_execution.py', '--native-root', CONTAINER_NATIVE,
             '--evidence-dir', self.container_path(evidence), '--timeout', self.values['PEAK_TRIAL_TIMEOUT'],
             '--failed-req-limit', self.values['FAILED_REQ_LIMIT'], '--', *scene['args']], float(self.values['PEAK_TRIAL_TIMEOUT']) + 60)
@@ -672,6 +711,7 @@ class Worker:
                  f"SLO容差={tolerance:.1%}；硬顶={self.values['PEAK_HARD_CAP']}",
                  confirm_runs=scene.get('peak_confirm_runs'),
                  confirm_min_requests=scene.get('peak_confirm_min_requests'))
+        self.cache_metrics_plan(scene)
         args = ['python3', CONTAINER_AUTOMATION + '/aisbench_perf_matrix.py', '--config-file', CONTAINER_AUTOMATION + '/aisbench_perf_matrix_config.py',
             '--run-tag', tag, '--case-name', scene['name'], '--input-len', str(scene['input_len']), '--output-len', str(scene['output_len']),
             '--min-concurrency', str(scene['min_cc']), '--max-concurrency', str(scene['max_cc']), '--request-multiplier', str(scene['multiplier']),

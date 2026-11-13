@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import uuid
 
 from aisbench_result_adapter import read_last_result, read_accuracy_scope
@@ -647,6 +648,246 @@ def classify_scope(scope, failed_limit, test_type):
     return scope
 
 
+class _CacheMetricsCapture:
+    """Observe optional cache counters without changing native source or streams.
+
+    Complete means complete counter evidence, not a cache/SLA pass. These
+    counters do not provide the separate global prefill throughput CSV field.
+    """
+
+    counter_names = ('normal_queries', 'external_queries', 'normal_hits', 'external_hits')
+
+    def __init__(self, namespace, evidence_dir, scopes=None):
+        self.path = Path(evidence_dir) / 'cache_metrics.json'
+        self.original_snapshot = namespace['get_pod_metrics_info']
+        self.original_calculate = namespace['cal_prefix_hit_info']
+        self.scopes = scopes if scopes is not None else []
+        pods = namespace.get('POD_INFO') or []
+        valid = isinstance(pods, (list, tuple)) and all(isinstance(pod, str) and pod.strip() for pod in pods)
+        self.endpoints = list(pods) if valid else []
+        self.configuration_error = '' if valid and len(set(self.endpoints)) == len(self.endpoints) else 'invalid or duplicate POD_INFO endpoints'
+        self.raw_snapshots = []
+        self.probe_module = None
+        self.original_fetch = None
+        self.probe_lock = threading.Lock()
+        self.report = dict(schema_version=1, configured=bool(pods), endpoints=self.endpoints,
+                           state='configured' if pods else 'not_configured',
+                           reason='awaiting cache counter snapshots' if pods else 'POD_INFO is empty; optional cache metrics are disabled',
+                           snapshots=[], measurements=[], probes=[], undefined_rates=[],
+                           global_prefill_throughput='not_provided_by_cache_counters')
+        self.save()
+
+    def save(self):
+        atomic_json(self.path, self.report)
+
+    @staticmethod
+    def evidence(value):
+        """Keep invalid counter evidence valid JSON; never turn NaN into a rate."""
+        if isinstance(value, dict):
+            return {str(key): _CacheMetricsCapture.evidence(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [_CacheMetricsCapture.evidence(item) for item in value]
+        if isinstance(value, float) and not math.isfinite(value):
+            return repr(value)
+        return value
+
+    def observe_probes(self):
+        # The native collector swallows HTTP errors after logging them. Observe
+        # its fetch boundary so the optional evidence also retains the cause.
+        module = sys.modules.get('cal_prefix_hit_rate')
+        original = getattr(module, '_fetch_metrics', None)
+        if not self.report['configured'] or not callable(original):
+            return
+        self.probe_module, self.original_fetch = module, original
+
+        def fetch(ip, port):
+            probe = dict(snapshot_id='snapshot_%03d' % (len(self.raw_snapshots) + 1),
+                         endpoint=str(ip) + ':' + str(port), state='complete', reason='')
+            try:
+                return original(ip, port)
+            except Exception as error:
+                probe.update(state='unavailable', reason=type(error).__name__ + ': ' + str(error),
+                             http_status=getattr(getattr(error, 'response', None), 'status_code', None))
+                raise  # Preserve the native collector's real error log.
+            finally:
+                with self.probe_lock:
+                    self.report['probes'].append(probe)
+        module._fetch_metrics = fetch
+
+    def snapshot(self, pods):
+        if not self.report['configured']:
+            return {}, {}, {}, {}  # Do not let native fallback probe the proxy.
+        record = dict(snapshot_id='snapshot_%03d' % (len(self.raw_snapshots) + 1),
+                      state='complete', reason='', started_at=time.time())
+        counters = ({}, {}, {}, {})
+        try:
+            if self.configuration_error or list(pods) != self.endpoints:
+                raise ValueError(self.configuration_error or 'native metrics endpoints differ from POD_INFO')
+            counters = self.original_snapshot(pods)
+            if not isinstance(counters, (tuple, list)) or len(counters) != 4:
+                raise ValueError('native cache snapshot must contain four counter dictionaries')
+            if any(not isinstance(item, dict) or set(item) != set(self.endpoints) for item in counters):
+                raise ValueError('cache snapshot is missing configured endpoint counters')
+            for pod in self.endpoints:
+                maps = [item[pod] for item in counters]
+                if any(not isinstance(item, dict) or not item for item in maps):
+                    raise ValueError('missing cache metric fields or engines for ' + pod)
+                if any(set(item) != set(maps[0]) for item in maps[1:]):
+                    raise ValueError('cache metric engine sets differ within a snapshot')
+                for engine in maps[0]:
+                    values = [item[engine] for item in maps]
+                    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+                           or not math.isfinite(value) or value < 0 for value in values):
+                        raise ValueError('cache counters must be finite nonnegative numbers')
+                    if values[2] > values[0] or values[3] > values[1]:
+                        raise ValueError('cache hit counters exceed query counters')
+        except Exception as error:
+            record.update(state='unavailable', reason=type(error).__name__ + ': ' + str(error))
+            if not isinstance(counters, (tuple, list)) or len(counters) != 4:
+                record['invalid_counters'] = self.evidence(counters)
+                counters = ({}, {}, {}, {})
+        failed = [probe for probe in self.report['probes']
+                  if probe['snapshot_id'] == record['snapshot_id'] and probe['state'] == 'unavailable']
+        if failed:
+            record.update(state='unavailable', reason='; '.join(probe['reason'] for probe in failed))
+        record.update(ended_at=time.time(), counters=self.evidence(dict(zip(self.counter_names, counters))))
+        self.raw_snapshots.append(counters)
+        self.report['snapshots'].append(record)
+        self.save()
+        return counters
+
+    @staticmethod
+    def ratio(queries, hits):
+        if not math.isfinite(queries) or not math.isfinite(hits) or queries < 0 or hits < 0 or hits > queries:
+            raise ValueError('invalid aggregate cache query/hit increments')
+        return dict(queries=queries, hits=hits, rate=hits / queries if queries else None,
+                    reason='' if queries else 'zero_queries')
+
+    def calculate(self, *counters):
+        if not self.report['configured']:
+            return
+        index = len(self.report['measurements'])
+        scope = self.scopes[-1] if self.scopes else {}
+        row = dict(phase=scope.get('phase', 'prefix' if index == 0 else 'main'),
+                   scope_id=scope.get('scope_id', ''), state='complete', reason='',
+                   pods={}, summary={}, undefined_rates=[])
+        try:
+            if len(self.raw_snapshots) != 2 * (index + 1):
+                raise ValueError('cache calculation has no exclusive before/after snapshot pair')
+            before, after = self.raw_snapshots[-2:]
+            pair = self.report['snapshots'][-2:]
+            row.update(before_snapshot_id=pair[0]['snapshot_id'], after_snapshot_id=pair[1]['snapshot_id'])
+            if any(item['state'] != 'complete' for item in pair):
+                raise ValueError('; '.join(item['reason'] for item in pair if item['reason']))
+            if len(counters) != 8 or tuple(counters) != tuple(before) + tuple(after):
+                raise ValueError('cache calculation counters do not match the captured snapshots')
+            totals = dict(normal=[0, 0], external=[0, 0])
+            for pod in self.endpoints:
+                maps = [item[pod] for item in (*before, *after)]
+                if any(not isinstance(item, dict) or not item for item in maps):
+                    raise ValueError('missing cache metric fields or engines for ' + pod)
+                engines = set(maps[0])
+                if any(set(item) != engines for item in maps[1:]):
+                    raise ValueError('cache metric engine sets changed or differ for ' + pod)
+                pod_row = dict(engines={}, summary={})
+                pod_totals = dict(normal=[0, 0], external=[0, 0])
+                for engine in sorted(engines, key=str):
+                    values = [item[engine] for item in maps]
+                    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+                           or not math.isfinite(value) or value < 0 for value in values):
+                        raise ValueError('cache counters must be finite nonnegative numbers')
+                    delta = [values[i + 4] - values[i] for i in range(4)]
+                    if any(not math.isfinite(value) or value < 0 for value in delta):
+                        raise ValueError('cache counter increments are nonfinite, decreased or reset')
+                    if delta[2] > delta[0] or delta[3] > delta[1]:
+                        raise ValueError('cache hit increments exceed query increments')
+                    engine_row = {}
+                    for name, q, h in (('normal', delta[0], delta[2]), ('external', delta[1], delta[3])):
+                        engine_row[name] = self.ratio(q, h)
+                        pod_totals[name][0] += q
+                        pod_totals[name][1] += h
+                        if not q:
+                            row['undefined_rates'].append(pod + '/engine' + str(engine) + '/' + name)
+                    pod_row['engines'][str(engine)] = engine_row
+                for name, (queries, hits) in pod_totals.items():
+                    pod_row['summary'][name] = self.ratio(queries, hits)
+                    totals[name][0] += queries
+                    totals[name][1] += hits
+                row['pods'][pod] = pod_row
+            row['summary'] = {name: self.ratio(*values) for name, values in totals.items()}
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            row.update(state='unavailable', reason=str(error), pods={}, summary={}, undefined_rates=[])
+        self.report['measurements'].append(row)
+        self.report['undefined_rates'].extend(dict(phase=row['phase'], scope_id=row['scope_id'], scope=name,
+                                                   reason='zero_queries') for name in row['undefined_rates'])
+        self.save()
+        # Native formatting turns 0/0 into 0.00%. Keep the real counters but
+        # leave those rates undefined instead of emitting a fabricated ratio.
+        if row['state'] == 'complete' and not row['undefined_rates']:
+            self.original_calculate(*counters)
+
+    def finish(self, native_completed=True):
+        if self.original_fetch is not None:
+            self.probe_module._fetch_metrics = self.original_fetch
+        if self.report['configured']:
+            failures = [row['reason'] for row in self.report['measurements'] if row['state'] != 'complete']
+            complete = native_completed and bool(self.report['measurements']) and len(self.raw_snapshots) == 2 * len(self.report['measurements'])
+            self.report.update(state='complete' if complete and not failures else 'unavailable',
+                               reason='cache counters captured; this is not an SLA verdict' if complete and not failures
+                               else '; '.join(failures) or 'native execution ended without complete cache counter pairs')
+        self.report['native_execution_completed'] = native_completed
+        self.save()
+
+
+def _run_native_with_cache_metrics(native_script, evidence_dir, scopes=None):
+    """Bind optional-metrics hooks before the known native main guard runs.
+
+    Only this in-memory namespace is adapted. Native files and output streams
+    are untouched. Custom wrappers without the native hook functions retain
+    the original runpy path; unexpected layouts fail before model requests.
+    """
+    path = Path(native_script)
+    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    names = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    required = {'get_pod_metrics_info', 'cal_prefix_hit_info'}
+    if not required.intersection(names):
+        return False
+    if not required.issubset(names):
+        raise ValueError('incomplete native optional cache metrics hook interface')
+    guards = [node for node in tree.body if isinstance(node, ast.If)
+              and ast.dump(node.test) == ast.dump(ast.parse("__name__ == '__main__'", mode='eval').body)]
+    if len(guards) != 1 or tree.body[-1] is not guards[0] or guards[0].orelse:
+        raise ValueError('unsupported native main layout for optional cache metrics hooks')
+    guard = guards[0]
+    tree.body = tree.body[:-1]
+    module = types.ModuleType('__main__')
+    namespace = module.__dict__
+    namespace.update(__file__=str(path), __package__='', __cached__=None, __spec__=None)
+    previous_main = sys.modules.get('__main__')
+    controller = None
+    native_completed = False
+    sys.modules['__main__'] = module
+    try:
+        exec(compile(tree, str(path), 'exec'), namespace)
+        controller = _CacheMetricsCapture(namespace, evidence_dir, scopes)
+        namespace['get_pod_metrics_info'] = controller.snapshot
+        namespace['cal_prefix_hit_info'] = controller.calculate
+        controller.observe_probes()
+        tree.body = [guard]
+        exec(compile(tree, str(path), 'exec'), namespace)
+        native_completed = True
+    finally:
+        try:
+            if controller is not None:
+                controller.finish(native_completed)
+        finally:
+            if previous_main is None:
+                sys.modules.pop('__main__', None)
+            else:
+                sys.modules['__main__'] = previous_main
+    return True
+
+
 def _child(native_root, evidence_dir, arguments, native_script, source_root=None):
     native_root, evidence_dir = Path(native_root).resolve(), Path(evidence_dir).resolve()
     os.chdir(native_root)
@@ -788,7 +1029,8 @@ def _child(native_root, evidence_dir, arguments, native_script, source_root=None
     subprocess.run = observed_run
     sys.argv = [str(native_script)] + list(arguments)
     try:
-        runpy.run_path(str(native_script), run_name="__main__")
+        if not is_prefix or not _run_native_with_cache_metrics(native_script, evidence_dir, scopes):
+            runpy.run_path(str(native_script), run_name="__main__")
     finally:
         subprocess.run = original_run
         atomic_json(evidence_dir / "scopes.json", scopes)
@@ -838,6 +1080,13 @@ def execute_native(native_root, evidence_dir, arguments, *, timeout=1800, failed
         rc, timed_out = stream_process(command, working_root, report["stdout_log"], report["stderr_log"],
                                        timeout=remaining, echo=echo, env=environment)
         report.update(return_code=rc, timed_out=timed_out)
+        cache_file = evidence_dir / 'cache_metrics.json'
+        if cache_file.is_file():
+            report['cache_metrics'] = json.loads(cache_file.read_text(encoding='utf-8'))
+            report['cache_metrics']['evidence_file'] = str(cache_file)
+            if report['cache_metrics'].get('state') == 'configured':
+                report['cache_metrics'].update(state='unavailable',
+                    reason='native execution ended without completed cache counter evidence')
         generation_file = evidence_dir / "generation_template.json"
         if generation_file.is_file():
             report["generation_template"] = json.loads(generation_file.read_text(encoding="utf-8"))
