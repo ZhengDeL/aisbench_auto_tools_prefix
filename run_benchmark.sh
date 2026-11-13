@@ -28,8 +28,10 @@ print_usage() {
 默认 --console full：终端、文件重定向和管道均输出 AISBench 详细日志。
 只看业务摘要时指定 --console summary；显式 auto 仍按TTY选择 full 或 summary。
 通过tee收集时，请在调用者Bash中先set -o pipefail。
-外部benchmark.log由调用者重定向生成；内部logs/batch.log只含业务摘要，
-logs/console.log保存完整输出；每轮原生stdout/stderr另存。
+外部benchmark.log由调用者重定向生成；logs/automation.log保存工具流程，
+logs/aisbench/<配置名>__<模型名>.log是该任务所有轮次的完整原生汇总；
+logs/console.log保存可读实时视图：工具状态标[AUTOMATION]，原生表格整块显示，
+任务切换时显示来源；重复进度刷新合并显示，每轮原生stdout/stderr全量另存。
 
 宿主机需要 Linux、Bash、Python 3.7+ 和 Docker；镜像内使用自带 Python。
 配置参考见 config.env 末尾；使用与排查说明见 automation/README.md。

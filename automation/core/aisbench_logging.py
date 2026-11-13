@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
@@ -93,6 +94,208 @@ class Redactor:
 
 REDACTOR = Redactor()
 LOG_SEGMENT_BYTES = 16 * 1024 * 1024
+NATIVE_TABLE_MAX_BYTES = 256 * 1024
+NATIVE_TABLE_MAX_LINES = 256
+NATIVE_TABLE_TIMEOUT = 0.5
+NATIVE_REFRESH_INTERVAL = 1.0
+
+
+class _NativeConsoleView:
+    """Build a readable view after raw capture; never parse business outcomes.
+
+    BatchLog's lock protects this assembler and its eventual file write. A table
+    is held only until its bottom border, so another stream's warning cannot
+    split its rows. Raw files and their chunk journal retain the original order;
+    this display may place such warnings immediately before the whole table.
+    """
+    _TOP = re.compile(r'^╒[═╤]+╕$')
+    _BOTTOM = re.compile(r'^╘[═╧]+╛$')
+    _SEPARATOR = re.compile(r'^(?:╞[═╪]+╡|├[─┼]+┤)$')
+    _HEADERS = {
+        ('Performance Parameters', 'Stage', 'Average', 'Min', 'Max',
+         'Median', 'P75', 'P90', 'P99', 'N'),
+        ('Common Metric', 'Stage', 'Value'),
+    }
+    _COUNTER = re.compile(
+        r'^POST=(\d+) \([0-9.]+/s\)\s+RECV=(\d+) \([0-9.]+/s\)\s+'
+        r'FAIL=(\d+) \([0-9.]+/s\)\s+(FIN|FINISH)=(\d+) \([0-9.]+/s\)\s*$')
+    _PROGRESS = re.compile(
+        r'^(Progress:|Calculating performance details:)\s+(\d+(?:\.\d+)?)%\|[^|]*\|'
+        r'\s+\d+/\d+\s+\[[^\]\r\n]*\]\s*$')
+    _INTERNAL_PREFIXES = ('AISBENCH_SCOPE_START ', 'AISBENCH_SCOPE_END ',
+                          'AISBench trial starting; ', 'AISBench trial finished: ')
+
+    def __init__(self):
+        self._streams = {}
+        self._section = None
+
+    @staticmethod
+    def _context(context):
+        return tuple((key, REDACTOR.text((context or {})[key]).replace('\n', '\\n'))
+                     for key in ('scenario', 'trial_id', 'scope_id', 'phase')
+                     if (context or {}).get(key) not in (None, ''))
+
+    def _native(self, state, text):
+        """One title per source switch; the original lines have no prefix."""
+        # Both native descriptors belong to one visible source. Switching
+        # stdout/stderr must not repeatedly re-title a single task's output.
+        identity = (state['task'], tuple((key, value) for key, value in state['context']
+                                        if key in ('scenario', 'trial_id', 'scope_id')))
+        heading = ''
+        if self._section != identity:
+            fields = ['task=' + state['task']]
+            fields.extend(key + '=' + value for key, value in state['context'])
+            fields.append('streams=stdout+stderr')
+            heading = '\n=== AISBench | ' + ' | '.join(fields) + ' ===\n'
+            self._section = identity
+        return heading + text
+
+    def business(self, text):
+        return '[AUTOMATION] ' + text
+
+    def _partial_table(self, state, reason):
+        table = state['table']
+        if table is None:
+            return ''
+        state['table'] = None
+        # Never silently discard a candidate, even if an unexpected native
+        # version changed the header/borders or the child exited mid-table.
+        note = '[AUTOMATION] [' + state['task'] + '] '
+        note += '原生表格显示未完整（' + reason + '）；保留已收到的内容。\n'
+        self._section = None
+        return note + self._native(state, ''.join(table['lines']))
+
+    def _refreshes(self, state, now, final=False):
+        rendered = []
+        for progress in state['progress'].values():
+            if progress['pending'] is not None and (final or now - progress['written_at'] >= NATIVE_REFRESH_INTERVAL):
+                text = progress['pending']
+                rendered.append(self._native(state, text + '\n'))
+                progress.update(pending=None, written_at=now, last=text)
+        return ''.join(rendered)
+
+    def _flush(self, state, now, final=False, reason='输出结束'):
+        rendered = self._refreshes(state, now, final)
+        table = state['table']
+        if table is not None and (final or now - table['started_at'] >= NATIVE_TABLE_TIMEOUT):
+            rendered += self._partial_table(state, reason if final else '等待表格结束超时')
+        return rendered
+
+    @classmethod
+    def _refresh_kind(cls, text):
+        match = cls._PROGRESS.match(text)
+        if match:
+            complete = float(match.group(2)) == 100
+            return match.group(1), complete
+        match = cls._COUNTER.fullmatch(text)
+        if match:
+            complete = match.group(4) == 'FINISH' and int(match.group(1)) > 0 and match.group(1) == match.group(5)
+            return 'request counters', complete
+        return None, False
+
+    def _progress(self, state, text, kind, complete, now):
+        progress = state['progress'].get(kind)
+        if progress is None:
+            state['progress'][kind] = dict(written_at=now, last=text, pending=None)
+            return self._native(state, text + '\n')
+        if progress['last'] == text:
+            progress['pending'] = None
+            return ''
+        if complete:
+            progress.update(pending=None, written_at=now)
+            if progress['last'] == text:
+                return ''
+            progress['last'] = text
+            return self._native(state, text + '\n')
+        if now - progress['written_at'] >= NATIVE_REFRESH_INTERVAL:
+            progress.update(written_at=now, last=text, pending=None)
+            return self._native(state, text + '\n')
+        progress['pending'] = text
+        return ''
+
+    def _line(self, state, text, now):
+        rendered = self._flush(state, now)
+        table = state['table']
+        if table is not None:
+            stripped = text.strip()
+            if not table['confirmed']:
+                columns = tuple(part.strip() for part in stripped.split('│')[1:-1])
+                valid = stripped.startswith('│') and stripped.endswith('│') and columns in self._HEADERS
+                if not valid:
+                    rendered += self._partial_table(state, '未识别的表头')
+                    return rendered + self._ordinary(state, text, now)
+                table['confirmed'] = True
+            elif not (self._BOTTOM.fullmatch(stripped) or self._SEPARATOR.fullmatch(stripped)
+                      or (stripped.startswith('│') and stripped.endswith('│'))):
+                rendered += self._partial_table(state, '表格中出现其他输出')
+                return rendered + self._ordinary(state, text, now)
+            table['lines'].append(text + '\n')
+            table['bytes'] += len((text + '\n').encode('utf-8'))
+            if len(table['lines']) > NATIVE_TABLE_MAX_LINES or table['bytes'] > NATIVE_TABLE_MAX_BYTES:
+                return rendered + self._partial_table(state, '超过显示缓冲上限')
+            if self._BOTTOM.fullmatch(stripped):
+                state['table'] = None
+                return rendered + self._native(state, ''.join(table['lines']))
+            return rendered
+        return rendered + self._ordinary(state, text, now)
+
+    def _ordinary(self, state, text, now):
+        # Only the known native refresh formats are compacted. Some tqdm modes
+        # prepend CR/cursor movement but end each frame with LF, so the caller's
+        # CR flag alone cannot identify them. Warnings and unknown lines pass.
+        kind, complete = self._refresh_kind(text)
+        if kind is not None:
+            return self._progress(state, text, kind, complete, now)
+        if not text.strip():
+            # Cursor-only tqdm frames can become empty after sanitization.
+            # They must not force every buffered progress update to print.
+            return self._native(state, text + '\n')
+        rendered = self._refreshes(state, now, final=True)
+        if text.startswith('[AUTOMATION] '):
+            return rendered + self.business('[' + state['task'] + '] ' + text[len('[AUTOMATION] '):] + '\n')
+        if text.startswith(self._INTERNAL_PREFIXES):
+            return rendered + self.business('[' + state['task'] + '] ' + text + '\n')
+        if state['channel'] == 'stdout' and self._TOP.fullmatch(text.strip()):
+            state['table'] = dict(lines=[text + '\n'], bytes=len((text + '\n').encode('utf-8')),
+                                  confirmed=False, started_at=now)
+            if NATIVE_TABLE_MAX_LINES < 1 or state['table']['bytes'] > NATIVE_TABLE_MAX_BYTES:
+                return rendered + self._partial_table(state, '超过显示缓冲上限')
+            return rendered
+        return rendered + self._native(state, text + '\n')
+
+    def feed(self, task, channel, line, context=None, refresh=False):
+        """Consume a decoded frame; raw bytes are already durably captured."""
+        now = time.monotonic()
+        task = REDACTOR.text(task).replace('\n', '\\n')
+        channel = REDACTOR.text(channel).replace('\n', '\\n')
+        identity = (task, channel)
+        context = self._context(context)
+        state = self._streams.get(identity)
+        rendered = ''
+        if state is None or state['context'] != context:
+            if state is not None:
+                rendered += self._flush(state, now, final=True, reason='场景或作用域切换')
+            state = dict(task=task, channel=channel, context=context, table=None, progress={})
+            self._streams[identity] = state
+        # Blank lines are meaningful around native tables. Keep them rather
+        # than treating them as absent messages. Escapes/secrets remain subject
+        # to the same human-view sanitizer as the previous implementation.
+        for text in REDACTOR.text(line).split('\n'):
+            rendered += self._line(state, text, now)
+        return rendered
+
+    def flush(self, task=None, channel=None, final=False):
+        now = time.monotonic()
+        rendered = []
+        for identity, state in tuple(self._streams.items()):
+            if task is not None and state['task'] != task:
+                continue
+            if channel is not None and state['channel'] != channel:
+                continue
+            rendered.append(self._flush(state, now, final))
+            if final:
+                del self._streams[identity]
+        return ''.join(rendered)
 
 
 def private_binary(path: Path, native_roots: list[Path | str], mode: str = "xb"):
@@ -130,11 +333,14 @@ def archive_management_logs(batch_path, native_roots, related_logs=(), segment_b
     batch = validate_output_path(batch_path, native_roots)
     logs = validate_output_path(batch / 'logs', native_roots)
     candidates = [path for path in logs.rglob('*')
-                  if path.is_file() and path.suffix in {'.log', '.jsonl'} and 'archive' not in path.relative_to(logs).parts]
+                  if path.is_file() and path.suffix in {'.log', '.jsonl'}
+                  and not {'archive', 'aisbench'}.intersection(path.relative_to(logs).parts)]
     candidates.extend(Path(path) for path in related_logs)
     sources = []
     seen = set()
     for path in candidates:
+        if logs / 'aisbench' in path.absolute().parents:
+            continue  # Native log links are live access points, not manager logs.
         if path.is_symlink():
             raise LogWriteError('日志封存拒绝符号链接来源')
         source = validate_output_path(path, native_roots)
@@ -426,18 +632,22 @@ class BatchLog:
         self._lock = threading.Lock()
         self._closed = False
         self._human = None
+        self._automation = None
         self._events = None
         self._console = None
         self._archive_result = None
+        self._view = _NativeConsoleView()
         self.human_path = self.directory / "batch.log"
+        self.automation_path = self.directory / "automation.log"
         self.event_path = self.directory / "events.jsonl"
         self.console_path = self.directory / "console.log"
         try:
             self._human = private_binary(self.human_path, native_roots)
+            self._automation = private_binary(self.automation_path, native_roots)
             self._events = private_binary(self.event_path, native_roots)
             self._console = private_binary(self.console_path, native_roots)
         except BaseException:
-            for handle in (self._human, self._events, self._console):
+            for handle in (self._human, self._automation, self._events, self._console):
                 if handle is not None:
                     handle.close()
             raise
@@ -476,15 +686,19 @@ class BatchLog:
                         + safe_message.replace('\n', '\\n') + '\n').encode('utf-8')
             try:
                 self._write_record(self._human, rendered)
+                self._write_record(self._automation, rendered)
                 self._write_record(self._events, (json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
-                self._write_record(self._console, rendered)
+                console = self._view.flush() + self._view.business(rendered.decode('utf-8'))
+                self._write_record(self._console, console.encode('utf-8'))
                 self._human.flush()
+                self._automation.flush()
                 self._events.flush()
                 self._console.flush()
                 # Progress is reproducible; identity, failure and transitions are
                 # the write-ahead evidence needed after an interrupted process.
                 if event != "worker_output":
                     os.fsync(self._human.fileno())
+                    os.fsync(self._automation.fileno())
                     os.fsync(self._events.fileno())
                     os.fsync(self._console.fileno())
             except (OSError, ValueError) as error:
@@ -497,21 +711,30 @@ class BatchLog:
         if written != len(encoded):
             raise LogWriteError('日志写入未完成')
 
-    def detail(self, task, channel, line, context=None):
-        """Append the sanitized full view, never a business event or summary."""
+    def detail(self, task, channel, line, context=None, refresh=False):
+        """Append readable native blocks without changing raw stream evidence."""
         with self._lock:
             if self._closed:
                 raise LogWriteError('日志已经关闭')
-            safe_task = REDACTOR.text(task).replace('\n', '\\n')
-            safe_channel = REDACTOR.text(channel).replace('\n', '\\n')
-            context_text = self._context_text(context)
-            lines = REDACTOR.text(line).split('\n')
-            rendered = ''.join(timestamp() + ' INFO [' + safe_task + '] [native:'
-                               + safe_channel + ']' + context_text + ' ' + text + '\n'
-                               for text in lines)
             try:
-                self._write_record(self._console, rendered.encode('utf-8'))
-                self._console.flush()
+                rendered = self._view.feed(task, channel, line, context, refresh)
+                if rendered:
+                    self._write_record(self._console, rendered.encode('utf-8'))
+                    self._console.flush()
+            except (OSError, ValueError) as error:
+                raise LogWriteError('原生详细视图写入失败') from error
+            return rendered
+
+    def flush_details(self, task=None, channel=None, final=False):
+        """Expire bounded displays while running; flush their last frame at EOF."""
+        with self._lock:
+            if self._closed:
+                raise LogWriteError('日志已经关闭')
+            try:
+                rendered = self._view.flush(task, channel, final)
+                if rendered:
+                    self._write_record(self._console, rendered.encode('utf-8'))
+                    self._console.flush()
             except (OSError, ValueError) as error:
                 raise LogWriteError('原生详细视图写入失败') from error
             return rendered
@@ -520,9 +743,15 @@ class BatchLog:
         with self._lock:
             if self._closed:
                 return self._archive_result
-            self._closed = True
             failure = None
-            for handle in (self._human, self._events, self._console):
+            try:
+                rendered = self._view.flush(final=True)
+                if rendered:
+                    self._write_record(self._console, rendered.encode('utf-8'))
+            except (OSError, ValueError) as error:
+                failure = error
+            self._closed = True
+            for handle in (self._human, self._automation, self._events, self._console):
                 if handle is not None:
                     try:
                         handle.flush()

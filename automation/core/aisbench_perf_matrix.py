@@ -256,15 +256,24 @@ def setup_logger(log_path: Path) -> logging.Logger:
     logger = logging.getLogger(f"aisbench_peak_search.{log_path}")
     logger.setLevel(logging.INFO)
     logger.handlers = []
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    # This logger belongs to our search controller, not the native AISBench
+    # process. Mark it at the source so the console never has to guess origin
+    # from an INFO line's text. Structured decisions keep their original data.
+    formatter = logging.Formatter("[AUTOMATION] %(asctime)s | %(levelname)s | %(message)s")
     class PersistentHandler(logging.FileHandler):
         def handleError(self, record):
             raise OSError("persistent peak log write failed")
     file_handler = PersistentHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    # The worker already forwards explicit decisions from the durable journal.
+    # Keep unbridged warnings/errors live, but never echo a bridged decision a
+    # second time. Standalone use retains the normal full console output.
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    if os.environ.get("AISBENCH_MANAGED_PEAK_EVENTS") == "1":
+        stream_handler.setLevel(logging.WARNING)
+        stream_handler.addFilter(lambda record: not getattr(record, "search_event", None))
     logger.addHandler(stream_handler)
     logger.addHandler(SearchDecisionHandler(log_path.with_name("peak_search_events.jsonl")))
     logger.propagate = False
@@ -1741,10 +1750,10 @@ def cli_main():
                                          at=datetime.now().astimezone().isoformat()))
             if os.name == "posix":
                 diagnostic.chmod(0o600)
-            print("peak execution failed (" + type(error).__name__ + "); private diagnostics=" + str(diagnostic),
+            print("[AUTOMATION] peak execution failed (" + type(error).__name__ + "); private diagnostics=" + str(diagnostic),
                   file=sys.stderr)
         except (OSError, ValueError):
-            print("peak execution failed; persistent diagnostics unavailable", file=sys.stderr)
+            print("[AUTOMATION] peak execution failed; persistent diagnostics unavailable", file=sys.stderr)
         if isinstance(error, KeyboardInterrupt):
             return 130
         return error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1

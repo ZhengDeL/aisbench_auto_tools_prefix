@@ -514,9 +514,14 @@ class Worker:
                 private_binary(logs / 'stderr.raw.log', NATIVE_ROOTS) as stderr, \
                 FileConsoleMirror(logs) as mirror:
             mirror.start()
+            # The peak controller keeps its file/journal; this worker bridges
+            # those explicit decisions once. Native subprocess output remains
+            # untouched and still flows through both raw capture channels.
+            peak_log_route = (['-e', 'AISBENCH_MANAGED_PEAK_EVENTS=1']
+                              if getattr(self, 'current_kind', '') == 'peak' else [])
             process = subprocess.Popen([*self.docker, 'exec', '-e', 'PYTHONUNBUFFERED=1', '-e', 'PYTHONDONTWRITEBYTECODE=1',
                 '-e', 'AISBENCH_NATIVE_ROOT=' + CONTAINER_NATIVE, '-e', 'PYTHONPATH=' + self.work_path,
-                self.container_id, *args], stdout=stdout, stderr=stderr)
+                *peak_log_route, self.container_id, *args], stdout=stdout, stderr=stderr)
             deadline = time.monotonic() + timeout
             next_progress = time.monotonic()
             reported_console_failures = set()

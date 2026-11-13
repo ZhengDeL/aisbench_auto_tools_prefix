@@ -209,8 +209,12 @@ outputs/default/<批次号>/
 ├── merged_metrics.csv               # 带任务身份的各任务指标行
 ├── .generations/<代号>/             # 一次完整发布的不可变快照
 ├── logs/
-│   ├── batch.log                    # 业务主日志：管理及任务结构化事件
-│   ├── console.log                  # 完整脱敏转录：业务与原生详情
+│   ├── automation.log               # 工具日志：流程、摸高决策、错误及结束原因
+│   ├── batch.log                    # 旧名称兼容入口，与automation.log内容一致
+│   ├── console.log                  # 可读实时视图：工具状态、原生分块及完整表格
+│   ├── aisbench/                    # 每个任务一份完整原生日志，可在运行中跟踪
+│   │   ├── <配置名>__<模型名>.log   # 各轮原始aisbench_all.log按执行顺序追加
+│   │   └── index.json               # 逐轮来源及汇总偏移，供内部核查
 │   ├── console_state.json           # 结束时的显示完整性及终端降级状态
 │   ├── events.jsonl                 # 批次结构化事件
 │   ├── archive_index.json           # 管理日志封存来源、分段顺序及原始/gzip校验值
@@ -281,21 +285,38 @@ scenario,current_time,input_len,output_len,total_req,max_cc,cc,rr,TTFT avg,TTFT 
 
 日志在加载配置和进行预检前建立，因此配置语法错误、预检失败也应有批次目录和原因。推荐依次查看：
 
-1. `batch_state.json`、`batch_results.json` 与 `logs/batch.log`：哪份配置、哪个阶段、为什么结束。
+日常使用从批次 `logs/` 目录进入，不必逐层查找 `tasks/`。`automation.log` 是工具日志，`console.log` 是可读实时视图，`aisbench/<配置名>__<模型名>.log` 是该任务所有轮次的完整原生汇总。同一任务的固定并发、前缀和摸高日志按执行顺序追加，不同任务分别保存。文件在运行中持续增长，结束后仍保留。逐轮源文件、来源清单和原始作用域继续保存，用于数据核查，日常查看不需要进入这些目录。
+
+1. `batch_state.json`、`batch_results.json` 与 `logs/automation.log`：哪份配置、哪个阶段、为什么结束。
 2. 对应任务 `__execution.log` 和 `__launcher.log`：场景、固定并发或摸高轮次及其失败原因。
 3. `logs/preflight/`、`.launcher/<运行号>/stdout.raw.log`、`stderr.raw.log`：配置加载和进程原始输出。
 4. 该轮 `evaluation.json`、`result_scopes.json`、原始 CSV/JSON/SQLite/NPY 和清单：核对请求数、指标、选中作用域及文件校验值。
 5. 摸高 `search_trace.*` 与 `peak_summary.json`：区分 SLO 不通过、无效测量、请求错误、预算和基础设施问题。
 
-`logs/batch.log` 是业务主日志。管理器只从本轮 worker 的 `events.jsonl` 接收结构化事件，校验运行身份、连续序号和完整记录后统一写入；原生 stdout/stderr 不参与业务级别判定。主日志使用带时区的时间、级别、任务和事件标识，场景及轮次事件另带对应身份。轮次事件保留配置并发、实际指标和基础/有效阈值，决策事件记录下一动作。`<任务输出根>/peak_<场景和运行标识>/peak_search_events.jsonl` 保存搜索引擎实际作出的中点、扩窗、降档、复测和终止决策，不根据输出文本猜测动作。
+`logs/automation.log` 是工具主日志，`logs/batch.log` 保留相同内容以兼容旧路径。管理器只从本轮 worker 的 `events.jsonl` 接收结构化事件，校验运行身份、连续序号和完整记录后统一写入；原生 stdout/stderr 不参与业务级别判定。主日志使用带时区的时间、级别、任务和事件标识，场景及轮次事件另带对应身份。轮次事件保留配置并发、实际指标和基础/有效阈值，决策事件记录下一动作。`<任务输出根>/peak_<场景和运行标识>/peak_search_events.jsonl` 保存搜索引擎实际作出的中点、扩窗、降档、复测和终止决策，不根据输出文本猜测动作。
 
-`logs/console.log` 是完整脱敏转录，包含原生详情，并标注任务、通道及当时已知的场景/轮次身份；它用于诊断，不作为业务主日志。各任务 `__execution.log` 及各 scope 的原始 stdout/stderr 继续独立保存。stderr 表示传输通道，AISBench 正常 INFO 也可能写在 stderr。
+`logs/console.log` 是可读实时视图。工具产生的状态消息以 `[AUTOMATION]` 标识；原生输出在任务或场景切换时显示一次来源标题，正文保留 AISBench 自己的时间、级别和表格，不给每行叠加长前缀，也不因 stdout/stderr 切换反复打印标题。多个任务的输出都显示，任务间可以切换，但一张已识别的完整结果表不会被其他输出打断。表格只在短暂组装完成后整体提交，不等场景结束才回放；未完成或未知格式的内容按有界策略及时输出。
+
+明确识别的原生进度刷新每秒最多显示一次，保留开始与结束状态；普通日志、警告、错误和未知文本不节流。显示视图会整理双流交错和进度刷新，因此不用于逐帧还原。原始 stdout/stderr 及 `stream_chunks.jsonl` 继续全量保存，CSV 提取和结果判定不从显示视图读取。stderr 是通道名称，AISBench 正常 INFO 也可能写在 stderr。
+
+按用途选择日志：
+
+| 文件 | 用途 |
+|---|---|
+| `logs/automation.log` | 自动化工具的配置、调度、场景、摸高决策及结束原因；旧路径batch.log保留 |
+| `logs/console.log` | 便于实时阅读的全部任务输出，表格按块显示、进度刷新合并 |
+| `logs/aisbench/<配置名>__<模型名>.log` | 该任务所有轮次原生日志的完整顺序汇总，原始正文不改写 |
+| `<轮次>/native_runtime/aisbench_all.log` | 这一轮上游执行的合并日志；每轮独立保存 |
+| `<轮次>/scope_*/stdout.raw.log`、`stderr.raw.log` | 该作用域两个原始输出通道，按原字节保存 |
+| `<任务>/<原生时间戳>/aisbench.log` | 上游保存的原生日志副本，不代表整个批次的全部日志 |
+
+`<轮次>` 可位于固定测试的 `scenario_results/<运行号>/fixed_<编号>/`，或摸高测试的试验目录，以对应 `evaluation.json` 的作用域路径为准。原生时间戳使用镜像内时区，可能与批次目录的宿主机时间不同。只有实际进入测量后才会生成原生日志；`logs/preflight/` 仅存预检诊断。
 
 批次级显示选项 `--console auto|summary|full` 与场景无关：
 
 | 模式 | 当前终端或重定向输出 | 持久文件 |
 |---|---|---|
-| `full`（默认） | 显示完整输出，包括 AISBench 原生进度和详细日志；文件重定向和管道同样保留 | 主日志、完整转录、任务及原生日志均保留 |
+| `full`（默认） | 显示全部任务原生详情，来源切换有标题、表格完整、进度刷新合并；文件重定向和管道同样保留 | 工具主日志、可读视图、任务及全量原生日志均保留 |
 | `summary` | 用户主动选择时，只显示管理、场景、轮次和决策摘要 | 原生详情仍实时独立写入 |
 | `auto` | 显式选择时，标准输出连接真实 TTY 使用 full；文件或管道使用 summary | 各层文件照常保留 |
 
@@ -312,11 +333,11 @@ bash run_benchmark.sh ./service.env 2>&1 | tee benchmark.log
 bash run_benchmark.sh --console summary ./service.env >benchmark.summary.log 2>&1
 ```
 
-`benchmark.log` 和 `benchmark.summary.log` 是上述命令创建的外部文件，文件名由调用者决定。批次目录内的 `logs/batch.log` 始终只含业务摘要，`logs/console.log` 始终保存完整输出。选择显示模式不会改变这两份内部日志，也不会关闭任务和轮次的原始日志。
+`benchmark.log` 和 `benchmark.summary.log` 是上述命令创建的外部文件，文件名由调用者决定。批次目录内的 `logs/automation.log` 只含工具摘要，`logs/console.log` 保存可读视图。选择显示模式不会改变这两份内部日志，也不会关闭任务和轮次的全量原始日志。
 
 `auto` 保留原有的 TTY 判断规则，但不再是默认值。显式使用 `--console auto` 配合重定向、`nohup` 或 `tee` 时，输出仍为摘要；单独使用 `&` 不改变 TTY 属性。不要用 `2>&1` 后的通道名称判断错误。
 
-请求模式及实际显示模式分别记录在 `batch_state.json` 的 `console_requested` 和 `console_mode`。`logs/console_state.json` 在批次结束时写入，记录显示是否完整、来源、字节计数及降级原因；运行中尚未生成该文件不表示原始日志缺失。原始记录按原字节保存，CR进度刷新和显示解码不回写原始文件。可选终端显示由异步观察器读取已落盘文件，慢终端和断开不会卡住监督。
+请求模式及实际显示模式分别记录在 `batch_state.json` 的 `console_requested` 和 `console_mode`；`console_layout` 和 `progress_refresh` 记录显示策略。`logs/console_state.json` 在批次结束时记录可读视图是否完整转发、来源、字节计数及降级原因，这不代表逐帧进度未合并。运行中尚未生成该文件不表示原始日志缺失。原始记录按原字节保存，显示整理不回写原始文件。可选终端显示由异步观察器读取已落盘文件，慢终端和断开不会卡住监督。
 
 固定场景的 `passed` 表示执行和适用数据完整性通过，不代表满足摸高SLO。任务结束同时列出每个非成功场景的状态、原因和证据；`peak_unstable` 表示边界未确认，保留独立确认的稳定下界，不能写成已确认最高值。任务可因该状态返回非零，主日志会区分未确认边界、无满足点、预算和实际请求/执行错误。
 

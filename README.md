@@ -87,7 +87,9 @@ outputs/default/<批次号>/
 ├── batch_results.json
 ├── batch_results.csv
 ├── merged_metrics.csv
-├── logs/batch.log
+├── logs/automation.log
+├── logs/console.log
+├── logs/aisbench/               # 每个任务一份完整原生日志汇总
 └── tasks/
     ├── dsv4__<模型名>/
     │   ├── dsv4__<模型名>__all_results.csv
@@ -106,7 +108,7 @@ SLO 容差默认关闭（`PEAK_SLO_TOLERANCE=0.0`），需要时由用户显式�
 
 ## 排查与维护
 
-业务主日志是 `logs/batch.log`，包含批次、任务、场景、轮次指标、搜索动作及结束原因；原生详情单独保存在 `logs/console.log` 和各轮次原始文件中。主日志从结构化事件生成，原生 stderr 中的 INFO 和进度条不会被当作错误或混入主日志。
+日常只需查看批次 `logs/` 下的三个入口：`automation.log` 看工具流程、摸高决策和错误；`console.log` 看实时显示；`aisbench/<配置名>__<模型名>.log` 看该任务全部轮次的完整原生日志。固定并发、前缀测试和摸高按执行顺序追加，不需要逐轮找文件。原生汇总在测试期间即可跟踪，正文不加工具前缀，不合并或删减进度帧。逐轮源文件和来源清单继续保留用于核查。`batch.log` 保留为旧工具日志的兼容入口。
 
 默认显示完整输出，包括 AISBench 原生进度和详细日志。终端、文件重定向和 `tee` 使用相同规则。后台运行后，可以直接跟踪 `benchmark.log`：
 
@@ -122,7 +124,9 @@ bash run_benchmark.sh ./service.env 2>&1 | tee benchmark.log
 bash run_benchmark.sh --console summary ./service.env >benchmark.summary.log 2>&1
 ```
 
-这里的 `benchmark.log` 是调用者重定向生成的文件，名称可自定。批次目录内的 `logs/batch.log` 始终只保存业务摘要，`logs/console.log` 始终保存完整输出。`--console summary` 只改变终端或重定向输出，不会关闭原生日志保存。显式使用 `--console auto` 时，仍按 TTY 选择：终端显示完整输出，文件或管道显示摘要。
+这里的 `benchmark.log` 是调用者重定向生成的文件，名称可自定。批次目录内的 `logs/automation.log` 只保存工具流程和结果摘要，`logs/console.log` 保存可读实时视图。工具状态以 `[AUTOMATION]` 标识；原生输出在任务或场景切换时显示来源，不逐行加长前缀，也不因 stdout/stderr 切换反复打印标题。AISBench 表格完整显示，其他任务或 stderr 提示不会穿插到表格内部。
+
+进度刷新在显示视图中合并，保留开始、最新和结束状态；普通日志、警告和错误不合并。逐字节全量输出仍保存在每轮 `scope_*/stdout.raw.log`、`stderr.raw.log`，显示整理不修改这些文件。`--console summary` 只改变终端或重定向输出，不会关闭原生日志保存。显式使用 `--console auto` 时，仍按 TTY 选择：终端显示详情，文件或管道显示摘要。
 
 显示模式记录在 `batch_state.json`；结束时生成的 `logs/console_state.json` 记录显示完整性及降级原因。每个配置仍有独立任务日志，每次真实测量仍有独立 `scope_*/stdout.raw.log`、`stderr.raw.log`，原始字节不改写。显示通道与监督、持久写盘分离，慢终端或断开时记录显示降级。具体路径与终态判读见 [日志排查与保留](automation/README.md#日志排查与保留)。
 
