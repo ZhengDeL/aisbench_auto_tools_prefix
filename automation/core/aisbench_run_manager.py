@@ -82,14 +82,15 @@ def docker_executable(environment: dict[str, str]) -> str:
     raise RunError("找不到 docker 命令，请检查 PATH")
 
 
-def emit(alias: str, message: str, event: str = "manager_progress", level: str = "INFO", **fields: Any) -> None:
+def emit(alias: str, message: str, event: str = "manager_progress", level: str = "INFO",
+         _api_event: bool = True, **fields: Any) -> None:
     """Persist business events first; optional display never owns this lock."""
     global _LOG_ERROR
     with _PRINT_LOCK:
         message = REDACTOR.text(message)
         if _BATCH_LOG is not None and not _LOG_ERROR:
             try:
-                _BATCH_LOG.emit(event, message, task=alias, level=level, **fields)
+                _BATCH_LOG.emit(event, message, task=alias, level=level, route_to_api=_api_event, **fields)
             except (OSError, ValueError):
                 _LOG_ERROR = "BATCH_LOG_WRITE_FAILED"
     if _CONSOLE is not None:
@@ -101,6 +102,11 @@ def emit(alias: str, message: str, event: str = "manager_progress", level: str =
             print(f"[{timestamp()}] [{alias}] {message}", flush=True)
         except (BrokenPipeError, OSError, UnicodeError):
             pass
+
+
+def emit_global(alias: str, message: str, event: str = 'manager_progress', level: str = 'INFO', **fields: Any) -> None:
+    """Batch-wide status belongs to the terminal/journal, never another API."""
+    emit(alias, message, event, level, _api_event=False, **fields)
 
 
 def console_arguments(arguments: list[str]) -> tuple[list[str], str]:
@@ -789,7 +795,7 @@ class ResourceLocks:
                 raise RunError(message)
             path.unlink()
             self._sync_directory()
-            emit("manager", "旧批次管理进程已中断；根据可信完成记录或原固定ID停止证据解除对应隔离")
+            emit_global("manager", "旧批次管理进程已中断；根据可信完成记录或原固定ID停止证据解除对应隔离")
 
     def _sync_directory(self) -> None:
         if os.name == "posix":
@@ -896,7 +902,7 @@ class ResourceLocks:
                 path.unlink()
             except FileNotFoundError:
                 pass
-            emit("manager", "已确认此前固定ID工具容器停止或不存在，解除对应资源隔离")
+            emit_global("manager", "已确认此前固定ID工具容器停止或不存在，解除对应资源隔离")
 
     def _write_quarantine(self, job: Job) -> None:
         runtime = read_json(job.runtime_path) if job.runtime_path else {}
@@ -1348,145 +1354,219 @@ def _native_round(source: Path, output: Path, job: Job):
     return (scene, int(trial.group(1))), parts[-4], round_name
 
 
-def _append_native_bytes(record, summary, output):
-    """Append exactly the unread raw bytes; reject truncation or target changes."""
-    source, target = Path(record['source']), Path(summary['path'])
+def _append_api_bytes(api, data):
+    """The collector is the sole writer; refuse replaced or externally edited logs."""
+    target = Path(api['path'])
+    info = target.stat()
+    if (_native_source_identity(target, target.parent) != api['_identity']
+            or (info.st_size, info.st_mtime_ns) != (api['bytes'], api['_mtime_ns'])):
+        raise LogWriteError('API 日志被替换或发生外部写入: ' + str(target))
+    flags = (os.O_WRONLY | os.O_APPEND | getattr(os, 'O_NOFOLLOW', 0)
+             | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0))
+    with os.fdopen(os.open(str(target), flags), 'ab', buffering=0) as destination:
+        opened = os.fstat(destination.fileno())
+        if ((opened.st_dev, opened.st_ino) != api['_identity'] or opened.st_size != api['bytes']):
+            raise LogWriteError('API 日志身份或长度不一致')
+        if destination.write(data) != len(data):
+            raise LogWriteError('API 日志写入未完成')
+        os.fsync(destination.fileno())
+        after = os.fstat(destination.fileno())
+    api['bytes'] += len(data)
+    api['_mtime_ns'] = after.st_mtime_ns
+    if _native_source_identity(target, target.parent) != api['_identity'] or after.st_size != api['bytes']:
+        raise LogWriteError('API 日志在追加期间发生外部修改')
+
+
+def _append_api_tool(api, data):
+    if not data:
+        return
+    segment = dict(kind='tool', offset=api['bytes'], size=len(data),
+                   sha256=hashlib.sha256(data).hexdigest(), complete=True)
+    _append_api_bytes(api, data)
+    api['segments'].append(segment)
+
+
+def _api_note(message, leading_newline=False):
+    """Only generated tool text is redacted; native bytes never pass here."""
+    clean = REDACTOR.text(message).replace('\r', '\\r').replace('\n', '\\n')
+    return (('\n' if leading_newline else '') + '[AUTOMATION] ' + clean + '\n').encode('utf-8')
+
+
+def _flush_api_events(api, before=None):
+    if _BATCH_LOG is None:
+        return
+    records = _BATCH_LOG.api_events(api['task'], api['run_id'], before)
+    if records:
+        _append_api_tool(api, b''.join(record['text'] for record in records))
+        _BATCH_LOG.acknowledge_api_events(api['task'], (record['seq'] for record in records))
+
+
+def _append_native_bytes(record, api, output):
+    """Copy raw bytes without decoding; one native segment spans the entire source."""
+    source = Path(record['source'])
     if _native_source_identity(source, output) != record['_source']:
         raise LogWriteError('原生日志来源已经替换: ' + str(source))
-    if _native_source_identity(target, target.parent) != summary['_identity'] or target.stat().st_size != summary['bytes']:
-        raise LogWriteError('原生日志汇总被替换或发生外部写入: ' + str(target))
-    read_flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0)
-    with os.fdopen(os.open(str(source), read_flags), 'rb') as original:
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0)
+    with os.fdopen(os.open(str(source), flags), 'rb') as original:
         info = os.fstat(original.fileno())
         if (not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != record['_source']
-                or info.st_size < record['offset']):
+                or info.st_size < record['size']):
             raise LogWriteError('原生日志来源被替换或截断: ' + str(source))
-        remaining = info.st_size - record['offset']
-        if remaining:
-            flags = (os.O_WRONLY | os.O_APPEND | getattr(os, 'O_NOFOLLOW', 0)
-                     | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0))
-            with os.fdopen(os.open(str(target), flags), 'ab', buffering=0) as destination:
-                info = os.fstat(destination.fileno())
-                if (not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != summary['_identity']
-                        or info.st_size != summary['bytes']):
-                    raise LogWriteError('原生日志汇总身份或长度不一致')
-                original.seek(record['offset'])
-                while remaining:
-                    data = original.read(min(65536, remaining))
-                    if not data or destination.write(data) != len(data):
-                        raise LogWriteError('原生日志增量汇总未完成')
-                    record['offset'] += len(data)
-                    summary['bytes'] += len(data)
-                    remaining -= len(data)
-                os.fsync(destination.fileno())
-    if _native_source_identity(target, target.parent) != summary['_identity'] or target.stat().st_size != summary['bytes']:
-        raise LogWriteError('原生日志汇总在追加期间发生外部修改')
-    record['bytes'] = source.stat().st_size
+        if record.get('complete') and (info.st_size, info.st_mtime_ns) != record['_closed_stat']:
+            raise LogWriteError('已结束的原生日志继续增长或被修改')
+        remaining = info.st_size - record['size']
+        original.seek(record['size'])
+        while remaining:
+            data = original.read(min(65536, remaining))
+            if not data:
+                raise LogWriteError('原生日志增量收集未完成')
+            _append_api_bytes(api, data)
+            record['_digest'].update(data)
+            record['size'] += len(data)
+            remaining -= len(data)
     evaluation = read_json(source.parent.parent / 'evaluation.json')
-    record.update(started_at=evaluation.get('started_at'), execution_state=evaluation.get('state', 'unknown'),
-                  complete=evaluation.get('state') not in (None, 'running')
-                  and type(evaluation.get('return_code')) is int and record['offset'] == record['bytes'])
+    record.update(source_bytes=source.stat().st_size, sha256=record['_digest'].hexdigest(),
+                  started_at=evaluation.get('started_at'), execution_state=evaluation.get('state', 'unknown'))
+    complete = (evaluation.get('state') not in (None, 'running')
+                and type(evaluation.get('return_code')) is int and record['size'] == record['source_bytes'])
+    if complete and not record['complete']:
+        record['complete'] = True
+        current = source.stat()
+        record['_closed_stat'] = (current.st_size, current.st_mtime_ns)
+        _append_api_tool(api, _api_note('原生输出结束：场景=' + record['scenario']
+                                      + '；轮次=' + record['round'], leading_newline=True))
 
 
 def publish_native_logs(batch_path: Path, jobs: list[Job], final: bool = False) -> None:
-    """One raw native summary per task; keep all rounds in execution order.
+    """Publish one log per API, with tool notes only outside native byte ranges.
 
-    Only new source bytes are read. These private files are deliberately not
-    redacted, reformatted or compressed: their contents equal the ordered native
-    sources. Readable terminal layout is a separate concern in BatchLog.
+    Native ranges stay contiguous across polls and retain CR, ANSI and invalid
+    UTF-8 exactly. Pending trusted events are drained before the next round or
+    after the last round; they never share a writer with the native subprocess.
     """
     batch = Path(batch_path).absolute()
-    state = _NATIVE_LOG_PUBLICATIONS.setdefault(str(batch), dict(last_scan=float('-inf'), entries={}, summaries={}, index=None, directory=None))
+    state = _NATIVE_LOG_PUBLICATIONS.setdefault(str(batch), dict(
+        last_scan=float('-inf'), entries={}, summaries={}, index=None, directory=None, diagnostics=None))
     now = time.monotonic()
     if not final and now - state['last_scan'] < 0.5:
         return
-    directory = batch / 'logs' / 'aisbench'
-    validate_output_path(directory, _NATIVE_ROOTS)
-    if directory.parent.is_symlink():
-        raise LogWriteError('原生日志汇总的父目录不能是链接')
-    if state['directory'] is None:
-        directory.mkdir(mode=0o700)
-        info = directory.lstat()
-        state['directory'] = (info.st_dev, info.st_ino)
-    info = directory.lstat()
-    if directory.is_symlink() or (info.st_dev, info.st_ino) != state['directory']:
-        raise LogWriteError('原生日志汇总目录被替换')
-    index = directory / 'index.json'
+    directory, diagnostics = batch / 'logs', batch / 'logs' / '.diagnostics'
+    for path, key in ((directory, 'directory'), (diagnostics, 'diagnostics')):
+        validate_output_path(path, _NATIVE_ROOTS)
+        if not path.exists():
+            path.mkdir(mode=0o700)
+        info = path.lstat()
+        if path.is_symlink() or not stat.S_ISDIR(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+            raise LogWriteError('API 日志目录不能是链接或非目录')
+        identity = (info.st_dev, info.st_ino)
+        if state[key] is not None and state[key] != identity:
+            raise LogWriteError('API 日志目录被替换')
+        state[key] = identity
+    index = diagnostics / 'api_logs.json'
     if os.path.lexists(index):
         info = index.lstat()
-        if index.is_symlink() or (info.st_dev, info.st_ino) != state['index']:
-            raise LogWriteError('原生日志索引不是本批次创建的文件')
+        if index.is_symlink() or (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != state['index']:
+            raise LogWriteError('API 日志索引不是本批次创建的文件')
     elif state['index'] is not None:
-        raise LogWriteError('本批次原生日志索引已经消失')
+        raise LogWriteError('本批次 API 日志索引已经消失')
     for job in jobs:
-        if not job.run_id or not job.metadata.get('host_output_dir'):
+        # Before failed preflight has identified a model, the configuration name
+        # is still enough to leave an API-specific explanation rather than no log.
+        if not job.output_label and not final:
             continue
-        output = Path(job.metadata['host_output_dir']).absolute()
-        task_key = (job.alias, job.run_id)
-        summary = state['summaries'].get(task_key)
-        if summary is None:
-            label = job.output_label or (job.alias + '__' + job.metadata.get('model_name', 'model'))
-            safe = re.sub(r'[^A-Za-z0-9_.-]+', '-', label).strip('-.')[:180] or 'native'
+        api = state['summaries'].get(job.alias)
+        output_value = job.metadata.get('host_output_dir', '')
+        output = Path(output_value).absolute() if output_value else None
+        if api is None:
+            label = job.output_label or job.alias
+            safe = re.sub(r'[^A-Za-z0-9_.-]+', '-', label).strip('-.')[:180] or 'api'
             if safe != label:
                 safe += '__' + hashlib.sha256(label.encode()).hexdigest()[:10]
             target = directory / (safe + '.log')
             with private_binary(target, _NATIVE_ROOTS):
-                pass  # Exclusive creation refuses any unknown file or link.
-            summary = dict(task=job.alias, model=job.metadata.get('model_name', ''), run_id=job.run_id,
-                           path=str(target), bytes=0, complete=False, _identity=_native_source_identity(target, directory),
-                           _last_order=None, _last_source=None, _output=str(output))
-            state['summaries'][task_key] = summary
-        if summary['_output'] != str(output) or summary['model'] != job.metadata.get('model_name', ''):
-            raise LogWriteError('原生日志汇总的任务输出目录或模型身份发生变化')
-        fixed = output / 'scenario_results' / job.run_id
-        candidates = list(fixed.glob('fixed_*/native_runtime/aisbench_all.log'))
-        for session in output.glob('peak_*_' + job.run_id + '*'):
-            if re.fullmatch(r'peak_.+_' + re.escape(job.run_id) + r'(?:_[0-9]+)?', session.name):
-                candidates.extend(session.glob('*/run_*/native_runtime/aisbench_all.log'))
+                pass
+            info = target.stat()
+            api = dict(task=job.alias, model=job.metadata.get('model_name', ''), run_id=job.run_id,
+                       path=str(target), bytes=0, complete=False, segments=[],
+                       _identity=_native_source_identity(target, directory), _mtime_ns=info.st_mtime_ns,
+                       _last_order=None, _last_source=None, _output=str(output) if output else '')
+            state['summaries'][job.alias] = api
+            _append_api_tool(api, _api_note('任务=' + job.alias + '；模型='
+                                          + (api['model'] or '尚未确认') + '；批次=' + batch.name))
+        if (api['_output'] != (str(output) if output else '') or api['model'] != job.metadata.get('model_name', '')
+                or api['run_id'] not in ('', job.run_id)):
+            raise LogWriteError('API 日志的任务、输出目录、模型或运行身份发生变化')
+        api['run_id'] = job.run_id
+        candidates = []
+        if output is not None and job.run_id:
+            candidates.extend((output / 'scenario_results' / job.run_id).glob('fixed_*/native_runtime/aisbench_all.log'))
+            for session in output.glob('peak_*_' + job.run_id + '*'):
+                if re.fullmatch(r'peak_.+_' + re.escape(job.run_id) + r'(?:_[0-9]+)?', session.name):
+                    candidates.extend(session.glob('*/run_*/native_runtime/aisbench_all.log'))
         ordered = [(_native_round(path, output, job), path) for path in candidates]
         for (order, scenario, round_name), source in sorted(ordered):
-            identity = _native_source_identity(source, output)
-            key = str(source)
+            identity, key = _native_source_identity(source, output), str(source)
             record = state['entries'].get(key)
-            if record is not None and record['summary_path'] != summary['path']:
-                raise LogWriteError('同一原生日志来源不能混入不同任务的汇总')
+            if record is not None and record['_task'] != job.alias:
+                raise LogWriteError('同一原生日志来源不能混入不同 API')
             if record is None:
-                if summary['_last_order'] is not None and order <= summary['_last_order']:
-                    raise LogWriteError('较早或重复轮次的原生日志被延迟发现，拒绝打乱汇总顺序')
-                record = dict(task=job.alias, model=summary['model'], run_id=job.run_id, scenario=scenario,
-                              round=round_name, source=key, summary_path=summary['path'], offset=0,
-                              _source=identity, _order=order)
+                if api['_last_order'] is not None and order <= api['_last_order']:
+                    raise LogWriteError('较早或重复轮次被延迟发现，拒绝打乱原生日志顺序')
+                if api['_last_source'] is not None and not state['entries'][api['_last_source']]['complete']:
+                    raise LogWriteError('新轮次已出现，但前一轮原生日志尚未完整收集')
+                evaluation = read_json(source.parent.parent / 'evaluation.json')
+                started = evaluation.get('started_at')
+                # Native execution records epoch seconds before launching the
+                # child. Missing times cannot justify moving later events ahead.
+                if type(started) in (int, float):
+                    _flush_api_events(api, before=started)
+                _append_api_tool(api, _api_note('原生输出开始：场景=' + str(scenario) + '；轮次=' + round_name))
+                record = dict(kind='native', offset=api['bytes'], size=0, sha256=hashlib.sha256(b'').hexdigest(),
+                              complete=False, source=key, source_offset=0, source_bytes=0,
+                              scenario=str(scenario), round=round_name, _source=identity, _order=order,
+                              _task=job.alias, _digest=hashlib.sha256())
                 state['entries'][key] = record
-            if summary['_last_order'] is not None and order < summary['_last_order']:
-                if identity != record['_source'] or source.stat().st_size != record['offset']:
+                api['segments'].append(record)
+            if api['_last_order'] is not None and order < api['_last_order']:
+                if identity != record['_source'] or source.stat().st_size != record['size']:
                     raise LogWriteError('已切换轮次后的旧原生日志继续增长或被替换')
                 continue
-            if summary['_last_source'] not in (None, key):
-                previous = state['entries'][summary['_last_source']]
-                if not previous['complete'] or Path(previous['source']).stat().st_size != previous['offset']:
-                    raise LogWriteError('新轮次已出现，但前一轮原生日志尚未完整收集')
-            record.setdefault('summary_offset', summary['bytes'])
-            _append_native_bytes(record, summary, output)
-            summary.update(_last_order=order, _last_source=key)
-        records = [row for row in state['entries'].values() if row['summary_path'] == summary['path']]
-        for row in records:
-            source = Path(row['source'])
-            if _native_source_identity(source, output) != row['_source'] or source.stat().st_size < row['offset']:
-                raise LogWriteError('已收集的原生日志被替换或截断')
-            if row['_order'] != summary['_last_order'] and source.stat().st_size != row['offset']:
-                raise LogWriteError('已结束的旧原生日志继续增长')
-        summary['complete'] = final and bool(records) and all(row.get('complete') for row in records)
-        if final and job.state == 'success' and job.metadata.get('planned_tests', 0) > 0:
-            if not summary['complete'] or not summary['bytes']:
-                raise LogWriteError('任务报告成功，但原生完整日志汇总为空或未完成: ' + job.alias)
-    public = lambda row: {key: value for key, value in row.items() if not key.startswith('_')}
-    atomic_json(index, dict(schema_version=2, batch_id=batch.name, state='complete' if final else 'running', final=final,
-                           entries=[public(row) for row in sorted(state['entries'].values(),
-                                    key=lambda row: (row['summary_path'], row['summary_offset'], row['_order']))],
-                           summaries=[public(row) for _, row in sorted(state['summaries'].items())]))
+            _append_native_bytes(record, api, output)
+            api.update(_last_order=order, _last_source=key)
+        native = [segment for segment in api['segments'] if segment['kind'] == 'native']
+        for record in native:
+            source = Path(record['source'])
+            info = source.stat()
+            if (_native_source_identity(source, output) != record['_source'] or info.st_size < record['size']
+                    or (record.get('complete') and (info.st_size, info.st_mtime_ns) != record['_closed_stat'])):
+                raise LogWriteError('已收集的原生日志被替换、截断或在结束后发生修改')
+        if final:
+            if native and not all(record['complete'] for record in native):
+                raise LogWriteError('API 原生日志尚未结束，拒绝在原文中追加任务结尾: ' + job.alias)
+            _flush_api_events(api)
+            if not api.get('_final_note'):
+                message = '任务结束：状态=' + job.state + '；退出码=' + str(job.exit_code)
+                if job.state == 'not_started':
+                    message += '；未开始测量'
+                _append_api_tool(api, _api_note(message))
+                api['_final_note'] = True
+            api['complete'] = True
+            if job.state == 'success' and job.metadata.get('planned_tests', 0) > 0:
+                if not native or not sum(record['size'] for record in native):
+                    raise LogWriteError('任务报告成功，但未取得非空完整原生日志: ' + job.alias)
+        # An idle/repeated final scan still checks ownership. No fresh source
+        # bytes is not permission to trust an externally replaced API file.
+        _append_api_bytes(api, b'')
+    def public(row):
+        result = {key: value for key, value in row.items() if not key.startswith('_')}
+        if 'segments' in result:
+            result['segments'] = [public(segment) for segment in result['segments']]
+        return result
+    atomic_json(index, dict(schema_version=3, batch_id=batch.name, state='complete' if final else 'running', final=final,
+                           apis=[public(row) for _, row in sorted(state['summaries'].items())]))
     index.chmod(0o600)
     info = index.lstat()
-    state.update(index=(info.st_dev, info.st_ino), last_scan=now)
+    state.update(index=(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns), last_scan=now)
 
 
 def write_batch(path: Path | None, batch_id: str, jobs: list[Job],
@@ -1544,7 +1624,7 @@ def abort_jobs(jobs: list[Job], cancelled: bool, path: Path | None, batch_id: st
         except Exception:
             # An output failure must never prevent stopping owned workloads.
             if not report_failed:
-                emit("manager", "停止期间无法更新批次文件，继续停止本批次压测")
+                emit_global("manager", "停止期间无法更新批次文件，继续停止本批次压测")
                 report_failed = True
 
     report_cleanup()
@@ -1592,17 +1672,21 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
     aliases = [task_alias(config) for config in configs]
     if len(set(aliases)) != len(aliases):
         raise RunError("配置的任务名冲突，请使用不同配置文件名")
+    # Register all requested APIs before sourcing any file. A failed first
+    # preflight must still leave an explanation for the other unstarted tasks.
+    jobs.extend(Job(alias, config, {}, batch_id=batch_id) for alias, config in zip(aliases, configs))
     publication_errors: list[str] = []
     with tempfile.TemporaryDirectory(prefix=".private-manager-", dir=batch_path) as temporary:
         private = Path(temporary)
         for index, alias in enumerate(aliases):
             check_batch_logging()
+            job = jobs[index]
             config = configs[index]
             snapshot = private / (str(index) + "-config.env")
             config_bytes = config.read_bytes()
             snapshot.write_bytes(config_bytes)
             emit(alias, f"加载配置并检查场景: {config}", "config_loading", config=str(config), input_index=index + 1)
-            diagnostic = batch_path / "logs" / "preflight" / f"{index + 1:04d}"
+            diagnostic = batch_path / "logs" / ".diagnostics" / "preflight" / f"{index + 1:04d}"
             environment = isolated_environment(snapshot, private, diagnostic)
             sources = {key: "config_file" if key in environment else "code_default" for key in PUBLIC_ENV_NAMES}
             if not explicit:
@@ -1620,8 +1704,7 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
             environment["CONTAINER_NAME"] = environment.get("CONTAINER_NAME") or "ais_bench-" + alias
             environment["HOST_OUTPUT_DIR"] = (environment.get("HOST_OUTPUT_DIR")
                                               or str(batch_path / "tasks" / alias))
-            job = Job(alias, config, environment)
-            job.batch_id = batch_id
+            job.environment = environment
             job.parameter_sources = sources
             job.diagnostic_paths = {"config_stdout": str(diagnostic) + ".stdout.raw.log",
                                     "config_stderr": str(diagnostic) + ".stderr.raw.log"}
@@ -1665,13 +1748,12 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
                                  HOST_OUTPUT_DIR=job.metadata["host_output_dir"],
                                  MODEL_HOST_PATH=job.metadata["model_host_path"],
                                  TOOLS_HOST_DIR=job.metadata["tools_host_dir"])
-            jobs.append(job)
             emit(alias, "配置和场景预检通过，尚未启动压测。", "config_validated", parameter_sources=sources)
         if len({job.output_label for job in jobs}) != len(jobs):
             raise RunError("任务与模型生成的输出标记重复，请调整任务文件名")
         validate_job_conflicts(jobs)
         for job in jobs:
-            diagnostic = batch_path / "logs" / "preflight" / (job.output_label + ".docker-info")
+            diagnostic = batch_path / "logs" / ".diagnostics" / "preflight" / (job.output_label + ".docker-info")
             result = command([docker_executable(job.environment), "info", "--format", "{{.ID}}"], job.environment, 30,
                              diagnostics=diagnostic)
             job.diagnostic_paths.update(docker_stdout=str(diagnostic) + ".stdout.log",
@@ -1687,7 +1769,7 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
             if _STOP_REQUESTED:
                 return 128 + _STOP_REQUESTED
             for job in jobs:
-                diagnostic = batch_path / "logs" / "preflight" / (job.output_label + ".image-inspect")
+                diagnostic = batch_path / "logs" / ".diagnostics" / "preflight" / (job.output_label + ".image-inspect")
                 job.diagnostic_paths.update(image_stdout=str(diagnostic) + ".stdout.log",
                                             image_stderr=str(diagnostic) + ".stderr.log")
                 validate_container_preflight(job, diagnostic)
@@ -1698,7 +1780,7 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
                     task_path = batch_path / "tasks" / job.output_label
                     task_path.mkdir(parents=True, exist_ok=True)
                     save_effective_config(task_path, job.metadata, job.environment, job.config_sha256)
-                emit("parallel", f"共 {len(jobs)} 组独立服务并行压测，共享宿主机客户端资源")
+                emit_global("parallel", f"共 {len(jobs)} 组独立服务并行压测，共享宿主机客户端资源")
             try:
                 batch_state.update(state="running", updated_at=timestamp())
                 atomic_json(batch_path / "batch_state.json", batch_state)
@@ -1754,7 +1836,7 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
                         remaining.clear()
                         break
                     if _STOP_REQUESTED:
-                        emit("manager", "收到停止信号，正在停止本批次任务")
+                        emit_global("manager", "收到停止信号，正在停止本批次任务")
                         abort_jobs(remaining, True, batch_path, batch_id, jobs)
                         remaining.clear()
                         break
@@ -1869,11 +1951,11 @@ def _supervise(script: Path, arguments: list[str], batch_path: Path, batch_id: s
                         job.state = "failed"
                 publication_errors = write_batch(batch_path, batch_id, jobs, final=True)
             if batch_path:
-                emit("parallel", f"批次结果: {batch_path / 'batch_results.json'}")
+                emit_global("parallel", f"批次结果: {batch_path / 'batch_results.json'}")
             if _STOP_REQUESTED:
                 return 128 + _STOP_REQUESTED
             for error in publication_errors:
-                emit("parallel", error)
+                emit_global("parallel", error)
             return 0 if all(job.state == "success" and not job.logging_error for job in jobs) and not publication_errors and not _LOG_ERROR else 1
 
 
@@ -1925,7 +2007,7 @@ def supervise(script: Path, arguments: list[str]) -> int:
     except (OSError, ValueError) as error:
         _emergency_log(batch_id, error)
         return 1
-    console_source = _BATCH_LOG.console_path if _CONSOLE_MODE == "full" else _BATCH_LOG.human_path
+    console_source = _BATCH_LOG.console_path if _CONSOLE_MODE == "full" else _BATCH_LOG.summary_path
     _CONSOLE = AsyncConsoleMirror(console_source).start()
     jobs: list[Job] = []
     state = {"schema_version": 1, "batch_id": batch_id, "state": "preflight",
@@ -1934,10 +2016,9 @@ def supervise(script: Path, arguments: list[str]) -> int:
              "reason_code": "", "logging_error": "", "log_dir": str(_BATCH_LOG.directory),
              "console_mode": _CONSOLE_MODE, "console_requested": requested_console,
              "console_layout": "native_blocks", "progress_refresh": "coalesced_1hz",
-             "main_log": str(_BATCH_LOG.automation_path), "detail_log": str(_BATCH_LOG.console_path),
-             "compatibility_log": str(_BATCH_LOG.human_path),
-             "native_log_dir": str(_BATCH_LOG.directory / 'aisbench'),
-             "native_log_index": str(_BATCH_LOG.directory / 'aisbench' / 'index.json'),
+             "api_log_dir": str(_BATCH_LOG.directory),
+             "api_log_index": str(_BATCH_LOG.diagnostics / 'api_logs.json'),
+             "console_source": str(console_source),
              "configuration_count": 0 if option_error is not None else (len(arguments) or 1),
              "configurations": [] if option_error is not None else (arguments or [str(script.parent / "config.env")])}
     code = 1
@@ -1945,12 +2026,10 @@ def supervise(script: Path, arguments: list[str]) -> int:
         atomic_json(batch_path / "batch_state.json", state)
         if option_error is not None:
             raise option_error
-        emit("manager", f"批次 {batch_id} 开始；先验证全部配置，日志目录: {_BATCH_LOG.directory}", "batch_started",
+        emit_global("manager", f"批次 {batch_id} 开始；先验证全部配置，日志目录: {_BATCH_LOG.directory}", "batch_started",
              configuration_count=len(arguments) or 1, mode="explicit" if arguments else "default_with_export_overrides")
-        emit("manager", f"工具日志：{_BATCH_LOG.automation_path}；实时显示日志：{_BATCH_LOG.console_path}；"
-             f"原生日志目录：{_BATCH_LOG.directory / 'aisbench'}；当前显示={_CONSOLE_MODE}。", "log_locations",
-             console_mode=_CONSOLE_MODE, main_log=str(_BATCH_LOG.automation_path), detail_log=str(_BATCH_LOG.console_path),
-             native_log_dir=str(_BATCH_LOG.directory / 'aisbench'))
+        emit_global("manager", f"每个 API 一份完整日志，保存在 {_BATCH_LOG.directory}；当前显示={_CONSOLE_MODE}。",
+                    "log_locations", console_mode=_CONSOLE_MODE, api_log_dir=str(_BATCH_LOG.directory))
         check_batch_logging()
         code = _supervise(script, arguments, batch_path, batch_id, jobs, state)
         state["state"] = "cancelled" if _STOP_REQUESTED else ("success" if code == 0 else "failed")
@@ -1963,7 +2042,26 @@ def supervise(script: Path, arguments: list[str]) -> int:
         # output, complete environment values or a traceback containing a URL.
         safe_error = str(error) if isinstance(error, (RunError, OSError, ValueError)) else type(error).__name__
         state["error_message"] = REDACTOR.text(safe_error)
-        emit("manager", f"批次失败：{safe_error}", "batch_failed", "ERROR", error_type=type(error).__name__)
+        emit_global("manager", f"批次失败：{safe_error}", "batch_failed", "ERROR", error_type=type(error).__name__)
+        if not jobs:
+            # Strict path resolution can fail before normal job registration.
+            # Leave a visible per-configuration failure log without sourcing an
+            # invalid file, weakening validation, or starting any workload.
+            used_aliases = set()
+            for value in arguments or [str(script.parent / 'config.env')]:
+                config = Path(value)
+                try:
+                    base_alias = task_alias(config)
+                except RunError:
+                    base_alias = 'config-' + safe_slug(config.stem, 48)
+                alias, suffix = base_alias, 1
+                while alias in used_aliases:
+                    suffix += 1
+                    alias = base_alias + '-' + str(suffix)
+                used_aliases.add(alias)
+                jobs.append(Job(alias, config, {}, batch_id=batch_id, state='not_started'))
+        for job in jobs:
+            emit(job.alias, f"本批次终止：{safe_error}", "api_batch_failed", "ERROR", error_type=type(error).__name__)
     finally:
         for job in jobs:
             if job.process is None and job.state == "pending":
@@ -1974,17 +2072,17 @@ def supervise(script: Path, arguments: list[str]) -> int:
             if final_errors:
                 code = code or 1
                 state.update(state="failed", reason_code="BATCH_ARTIFACT_INVALID")
-                emit("manager", "结果发布或原始证据核验失败；请查看各任务result_index.json中的错误分类与证据路径。",
+                emit_global("manager", "结果发布或原始证据核验失败；请查看各任务result_index.json中的错误分类与证据路径。",
                      "batch_artifact_invalid", "ERROR", artifact_error_count=len(final_errors))
         except Exception as error:
             code = code or 1
             state.update(state="failed", reason_code="BATCH_ARTIFACT_WRITE_FAILED")
-            emit("manager", "批次结果索引写入失败；已有私有日志保留，不能认定测试成功。", "batch_artifact_failed", "ERROR", error_type=type(error).__name__)
+            emit_global("manager", "批次结果索引写入失败；已有私有日志保留，不能认定测试成功。", "batch_artifact_failed", "ERROR", error_type=type(error).__name__)
         if _LOG_ERROR:
             code = code or 1
             state.update(state="failed", logging_error=_LOG_ERROR, reason_code=_LOG_ERROR)
         state.update(exit_code=code, workload_finished_at=timestamp())
-        emit("manager", f"任务执行阶段结束：{state['state']}，开始封存日志；最终批次状态见 {batch_path / 'batch_state.json'}",
+        emit_global("manager", f"任务执行阶段结束：{state['state']}，开始封存日志；最终批次状态见 {batch_path / 'batch_state.json'}",
              "batch_workload_finished", workload_state=state["state"], exit_code=code,
              reason_code=state["reason_code"], log_archive_pending=True)
         if _LOG_ERROR:
@@ -2010,7 +2108,7 @@ def supervise(script: Path, arguments: list[str]) -> int:
             state["console_forwarding"] = _CONSOLE.close()
             state["console_forwarding"].update(layout="native_blocks", progress_refresh="coalesced_1hz",
                                                raw_streams_preserved=True)
-            atomic_json(_BATCH_LOG.directory / "console_state.json", state["console_forwarding"])
+            atomic_json(_BATCH_LOG.diagnostics / "console_state.json", state["console_forwarding"])
             state['log_archive'] = _BATCH_LOG.close(related_logs)
         except (OSError, ValueError) as error:
             code = code or 1
@@ -2027,15 +2125,12 @@ def supervise(script: Path, arguments: list[str]) -> int:
         archive = state.get('log_archive') or {}
         native_summaries = _NATIVE_LOG_PUBLICATIONS.get(str(batch_path), {}).get('summaries', {})
         native_locations = '\n'.join(
-            '[AUTOMATION] 原生完整日志 (' + item['task'] + ' / ' + item['model'] + ')：' + item['path']
+            '[AUTOMATION] API 日志 (' + item['task'] + ' / ' + (item['model'] or '模型未确认') + ')：' + item['path']
             for _, item in sorted(native_summaries.items()))
         final_console_message(
             f"[AUTOMATION] {timestamp()} [batch_finished] 批次结束：{state['state']}，退出码={code}\n"
             f"[AUTOMATION] 结果目录：{batch_path}\n"
-            f"[AUTOMATION] 实时显示日志：{_BATCH_LOG.console_path}\n"
-            f"[AUTOMATION] 工具日志：{_BATCH_LOG.automation_path}\n"
-            + (native_locations + '\n' if native_locations else f"[AUTOMATION] 原生日志目录：{_BATCH_LOG.directory / 'aisbench'}\n")
-            + f"[AUTOMATION] 日志索引：{archive.get('index', '未完成，请检查错误和原始日志')}")
+            + (native_locations if native_locations else f"[AUTOMATION] 日志目录：{_BATCH_LOG.directory}"))
         _BATCH_LOG = None
         _CONSOLE = None
     return code
@@ -2044,7 +2139,7 @@ def supervise(script: Path, arguments: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments:
-        emit("manager", "缺少 run_benchmark.sh 路径")
+        emit_global("manager", "缺少 run_benchmark.sh 路径")
         return 1
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, _signal_request)
@@ -2052,7 +2147,7 @@ def main(argv: list[str] | None = None) -> int:
         script = Path(arguments.pop(0)).resolve()
         return supervise(script, arguments)
     except (RunError, OSError) as error:
-        emit("manager", f"ERROR: {error}")
+        emit_global("manager", f"ERROR: {error}")
         return (128 + _STOP_REQUESTED) if _STOP_REQUESTED else 1
 
 

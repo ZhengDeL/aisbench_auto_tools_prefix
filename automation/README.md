@@ -209,17 +209,10 @@ outputs/default/<批次号>/
 ├── merged_metrics.csv               # 带任务身份的各任务指标行
 ├── .generations/<代号>/             # 一次完整发布的不可变快照
 ├── logs/
-│   ├── automation.log               # 工具日志：流程、摸高决策、错误及结束原因
-│   ├── batch.log                    # 旧名称兼容入口，与automation.log内容一致
-│   ├── console.log                  # 可读实时视图：工具状态、原生分块及完整表格
-│   ├── aisbench/                    # 每个任务一份完整原生日志，可在运行中跟踪
-│   │   ├── <配置名>__<模型名>.log   # 各轮原始aisbench_all.log按执行顺序追加
-│   │   └── index.json               # 逐轮来源及汇总偏移，供内部核查
-│   ├── console_state.json           # 结束时的显示完整性及终端降级状态
-│   ├── events.jsonl                 # 批次结构化事件
-│   ├── archive_index.json           # 管理日志封存来源、分段顺序及原始/gzip校验值
-│   ├── archive/<封存号>/            # gzip字节段，原始日志继续保留
-│   └── preflight/                   # 配置加载、预检和 Docker 诊断
+│   ├── <配置A>__<模型名>.log        # API A：所有场景/并发的完整AISBench输出
+│   ├── <配置B>__<模型名>.log        # API B：独立保存，不混入API A
+│   └── .diagnostics/               # 内部来源、传输及预检诊断，日常无需进入
+│       └── api_logs.json           # 原生/工具片段的来源、范围及校验值
 └── tasks/<配置名>__<模型名>/
     ├── config.redacted.json
     ├── result_index.json
@@ -283,83 +276,53 @@ scenario,current_time,input_len,output_len,total_req,max_cc,cc,rr,TTFT avg,TTFT 
 
 ## 日志排查与保留
 
-日志在加载配置和进行预检前建立，因此配置语法错误、预检失败也应有批次目录和原因。推荐依次查看：
+**每个 API 一份 `.log`，同一 API 的所有组合写在一起。** 日常只需打开批次 `logs/<配置名>__<模型名>.log`。例如一次运行 `dsv4.env`、`glm.env`，对应日志放在同一层：
 
-日常使用从批次 `logs/` 目录进入，不必逐层查找 `tasks/`。`automation.log` 是工具日志，`console.log` 是可读实时视图，`aisbench/<配置名>__<模型名>.log` 是该任务所有轮次的完整原生汇总。同一任务的固定并发、前缀和摸高日志按执行顺序追加，不同任务分别保存。文件在运行中持续增长，结束后仍保留。逐轮源文件、来源清单和原始作用域继续保存，用于数据核查，日常查看不需要进入这些目录。
-
-1. `batch_state.json`、`batch_results.json` 与 `logs/automation.log`：哪份配置、哪个阶段、为什么结束。
-2. 对应任务 `__execution.log` 和 `__launcher.log`：场景、固定并发或摸高轮次及其失败原因。
-3. `logs/preflight/`、`.launcher/<运行号>/stdout.raw.log`、`stderr.raw.log`：配置加载和进程原始输出。
-4. 该轮 `evaluation.json`、`result_scopes.json`、原始 CSV/JSON/SQLite/NPY 和清单：核对请求数、指标、选中作用域及文件校验值。
-5. 摸高 `search_trace.*` 与 `peak_summary.json`：区分 SLO 不通过、无效测量、请求错误、预算和基础设施问题。
-
-`logs/automation.log` 是工具主日志，`logs/batch.log` 保留相同内容以兼容旧路径。管理器只从本轮 worker 的 `events.jsonl` 接收结构化事件，校验运行身份、连续序号和完整记录后统一写入；原生 stdout/stderr 不参与业务级别判定。主日志使用带时区的时间、级别、任务和事件标识，场景及轮次事件另带对应身份。轮次事件保留配置并发、实际指标和基础/有效阈值，决策事件记录下一动作。`<任务输出根>/peak_<场景和运行标识>/peak_search_events.jsonl` 保存搜索引擎实际作出的中点、扩窗、降档、复测和终止决策，不根据输出文本猜测动作。
-
-`logs/console.log` 是可读实时视图。工具产生的状态消息以 `[AUTOMATION]` 标识；原生输出在任务或场景切换时显示一次来源标题，正文保留 AISBench 自己的时间、级别和表格，不给每行叠加长前缀，也不因 stdout/stderr 切换反复打印标题。多个任务的输出都显示，任务间可以切换，但一张已识别的完整结果表不会被其他输出打断。表格只在短暂组装完成后整体提交，不等场景结束才回放；未完成或未知格式的内容按有界策略及时输出。
-
-明确识别的原生进度刷新每秒最多显示一次，保留开始与结束状态；普通日志、警告、错误和未知文本不节流。显示视图会整理双流交错和进度刷新，因此不用于逐帧还原。原始 stdout/stderr 及 `stream_chunks.jsonl` 继续全量保存，CSV 提取和结果判定不从显示视图读取。stderr 是通道名称，AISBench 正常 INFO 也可能写在 stderr。
-
-按用途选择日志：
-
-| 文件 | 用途 |
-|---|---|
-| `logs/automation.log` | 自动化工具的配置、调度、场景、摸高决策及结束原因；旧路径batch.log保留 |
-| `logs/console.log` | 便于实时阅读的全部任务输出，表格按块显示、进度刷新合并 |
-| `logs/aisbench/<配置名>__<模型名>.log` | 该任务所有轮次原生日志的完整顺序汇总，原始正文不改写 |
-| `<轮次>/native_runtime/aisbench_all.log` | 这一轮上游执行的合并日志；每轮独立保存 |
-| `<轮次>/scope_*/stdout.raw.log`、`stderr.raw.log` | 该作用域两个原始输出通道，按原字节保存 |
-| `<任务>/<原生时间戳>/aisbench.log` | 上游保存的原生日志副本，不代表整个批次的全部日志 |
-
-`<轮次>` 可位于固定测试的 `scenario_results/<运行号>/fixed_<编号>/`，或摸高测试的试验目录，以对应 `evaluation.json` 的作用域路径为准。原生时间戳使用镜像内时区，可能与批次目录的宿主机时间不同。只有实际进入测量后才会生成原生日志；`logs/preflight/` 仅存预检诊断。
-
-批次级显示选项 `--console auto|summary|full` 与场景无关：
-
-| 模式 | 当前终端或重定向输出 | 持久文件 |
-|---|---|---|
-| `full`（默认） | 显示全部任务原生详情，来源切换有标题、表格完整、进度刷新合并；文件重定向和管道同样保留 | 工具主日志、可读视图、任务及全量原生日志均保留 |
-| `summary` | 用户主动选择时，只显示管理、场景、轮次和决策摘要 | 原生详情仍实时独立写入 |
-| `auto` | 显式选择时，标准输出连接真实 TTY 使用 full；文件或管道使用 summary | 各层文件照常保留 |
-
-```bash
-# 后台运行，benchmark.log 包含 AISBench 详细输出。
-nohup bash run_benchmark.sh ./service.env >benchmark.log 2>&1 &
-tail -n 50 -f benchmark.log
-
-# 在终端查看并保存完整输出，保留压测失败的非零退出码。
-set -o pipefail
-bash run_benchmark.sh ./service.env 2>&1 | tee benchmark.log
-
-# 只看业务摘要时主动指定。
-bash run_benchmark.sh --console summary ./service.env >benchmark.summary.log 2>&1
+```text
+outputs/default/<批次号>/logs/
+├── dsv4__<DeepSeek模型名>.log
+├── glm__<GLM模型名>.log
+└── .diagnostics/                 # 内部核查材料
 ```
 
-`benchmark.log` 和 `benchmark.summary.log` 是上述命令创建的外部文件，文件名由调用者决定。批次目录内的 `logs/automation.log` 只含工具摘要，`logs/console.log` 保存可读视图。选择显示模式不会改变这两份内部日志，也不会关闭任务和轮次的全量原始日志。
+每份日志覆盖该 API 从启动到结束的流程、所有固定并发、前缀及摸高轮次。原生 AISBench 输出作为完整连续片段追加，流程说明只放在轮次前后，使用 `[AUTOMATION]` 标识。不同 API 的内容分别保存，不按模型名将不同接口混在一起。
 
-`auto` 保留原有的 TTY 判断规则，但不再是默认值。显式使用 `--console auto` 配合重定向、`nohup` 或 `tee` 时，输出仍为摘要；单独使用 `&` 不改变 TTY 属性。不要用 `2>&1` 后的通道名称判断错误。
+原生片段保留原始字节：不逐行加前缀，不删进度，不改换行、表格、数值、警告或错误，也不经过显示层的脱敏和排版。原始源文件及各作用域 stdout/stderr 继续保存。`logs/.diagnostics/api_logs.json` 记录各片段的来源和字节范围，用于逐段核对。整份 API 日志还包含工具说明，因此整文件校验值不等于纯原生源文件的拼接值；验收按原生片段逐字节对照，不能只比较日志大小或退出码。
 
-请求模式及实际显示模式分别记录在 `batch_state.json` 的 `console_requested` 和 `console_mode`；`console_layout` 和 `progress_refresh` 记录显示策略。`logs/console_state.json` 在批次结束时记录可读视图是否完整转发、来源、字节计数及降级原因，这不代表逐帧进度未合并。运行中尚未生成该文件不表示原始日志缺失。原始记录按原字节保存，显示整理不回写原始文件。可选终端显示由异步观察器读取已落盘文件，慢终端和断开不会卡住监督。
+脚本自动写入日志，启动与结束时打印实际路径，无需再用 `tee` 生成另一份 `benchmark.log`。例如：
 
-固定场景的 `passed` 表示执行和适用数据完整性通过，不代表满足摸高SLO。任务结束同时列出每个非成功场景的状态、原因和证据；`peak_unstable` 表示边界未确认，保留独立确认的稳定下界，不能写成已确认最高值。任务可因该状态返回非零，主日志会区分未确认边界、无满足点、预算和实际请求/执行错误。
+```bash
+bash run_benchmark.sh ./dsv4.env ./glm.env
 
-每次 Docker 调用的原始流保存在 `process_logs/call_<标识>/`，原生各作用域的真实原始流仍在对应轮次下的 `scope_*/stdout.raw.log`、`scope_*/stderr.raw.log`。先按 `evaluation.json`、`result_scopes.json` 或试验报告记录的路径定位作用域，不把批次管理日志、终端转发副本和某次模型请求的原始结果混为同一个来源。
+# 在另一个终端查看；替换为启动时打印的实际路径。
+tail -n 100 -f 'outputs/default/<批次号>/logs/dsv4__<模型名>.log'
+```
 
-日志和原始证据属于私有运行材料：可能含真实 IP、模型路径、请求内容或输出的凭据。脱敏配置及人类日志也不等于可以直接公开；分享前单独审查。源码仓示例只用 `192.168.1.x` 地址，不提交真实配置和输出。
+默认终端显示所有 API 的详细输出。切换 API 时标明来源，已识别的完整结果表整块显示，不让其他 API 或 stderr 提示插入表格内部。终端是可读显示，不作为原始字节的验收来源；每个 API 的日志始终保存完整原生内容。
 
-任务日志读写或原始流保存失败会传给监督器并停止受影响负载，公共批次日志失败停止整个批次；不能一边丢日志一边报告成功。正常日志位置无法创建时，会尝试建立应急日志并打印位置；全部持久位置都不可用时，不启动压测。关键身份及状态事件落盘，关闭也检查写入错误。强杀或掉电仍可能丢失尚未刷盘的尾部，遗留 `running` 状态不等于成功；管理器失踪后的活动记录恢复规则及旧不可变快照的边界见 [服务隔离、容器与取消](#服务隔离容器与取消)。
+| 显示选项 | 当前终端 | 每个API的日志 |
+|---|---|---|
+| `--console full`（默认） | 全部任务详情，来源明确、结果表连续 | 完整保存 |
+| `--console summary` | 只显示流程、轮次、决策和结束原因 | 完整保存 |
+| `--console auto` | TTY使用full，文件或管道使用summary | 完整保存 |
 
-容器退出时，先从 `runtime.json` 取故障时的**完整 ID**，再只读核查，例如：
+例如 `bash run_benchmark.sh --console summary ./dsv4.env` 只减少终端输出，不关闭原生日志。用户自行重定向或使用 `tee` 时，外部文件是额外的终端副本，不是脚本要求再查看的一套日志。
+
+出现问题时，先看该 API 日志的轮次前后说明：场景、配置并发、实测指标、阈值、后续动作及结束原因。固定测试 `passed` 仅表示执行及适用的完整性检查通过，不代表满足摸高SLO；`peak_unstable` 表示边界尚未确认，不能把保留的稳定下界写成最高并发。请求失败、无有效数据、预算耗尽和基础设施错误分别记录。
+
+需要核对数值时，再按任务 `result_index.json` 定位该轮 `evaluation.json`、`result_scopes.json`、原始CSV/JSON/SQLite/NPY及校验清单。`.diagnostics/` 下的结构化事件、显示传输、预检和封存清单供维护者排查，不再生成 `automation.log`、`batch.log`、`console.log` 三个日常入口。内部诊断不能代替 API 的完整日志，也不用于重新计算性能数值。
+
+日志写入、原始流保存或片段汇总失败会传给监督器，停止受影响任务并报告失败，不能缺日志仍报成功。终端显示与持久写盘分离，终端阻塞或断开时记录显示降级；已经写入的 API 日志仍可读取。`batch_state.json` 保存最终退出码及完整性状态。预检失败尚未产生原生输出时，日志明确记录“未开始测量”及失败原因，不伪造空的成功结果；模型名尚未确认时，以配置名保存这份失败日志。
+
+原始文件、内部诊断及封存材料均保留，已有批次不删除、不截断。原生镜像内时间与宿主机批次时间可能不同。日志可能含真实地址、请求或凭据，分享前需审查；公开仓库不提交真实配置和输出。
+
+容器故障时，从任务 `runtime.json` 取当时的完整ID，再只读检查：
 
 ```bash
 docker inspect '<原完整容器ID>' --format 'ID={{.Id}} OOM={{.State.OOMKilled}} Exit={{.State.ExitCode}} Started={{.State.StartedAt}} Finished={{.State.FinishedAt}} Restarts={{.RestartCount}}'
 ```
 
-退出码 137 本身不能证明 OOM；还需对应容器状态及宿主机证据。当前同名容器显示 `Up`，也不能证明故障时是同一容器。保留原 ID、时间线和原始错误，不把一次 `docker exec` 错误中的容器 ID 无证据归给更早的失败轮次。
-
-执行阶段结束、日志流关闭后，现有日志模块把批次/预检及任务管理日志按最多 16 MiB 的**原始字节段**额外封存为 gzip，不按行或字符切分。`logs/archive_index.json` 记录每个原文件的字节数/SHA256、各段顺序/偏移、原始段及 gzip 的字节数/SHA256；按顺序解压拼接可还原坏编码、NUL、CR 和没有换行的长输出。索引仅在完整封存后提交；进行中或失败的目录保留 `archive_state.json`。发生写入错误或源日志仍在变化时不报告完整封存，批次以非零结束，原始文件保留。
-
-`batch_workload_finished` 表示执行阶段已结束、日志等待封存；最终结论以 `batch_state.json` 的终态、退出码和 `log_archive` 为准，终端会在封存后再次打印批次结论。封存范围是管理日志；各测量作用域里的模型原始产物继续按其独立清单归档，不混入日志索引。
-
-运行中不自动删除、截断原始日志或清理其他批次。由于原始文件保留，额外 gzip 需要额外磁盘空间；封存不会减少当前 raw 占用。容量应在启动前规划并监控，长场景、复测和重复测试会增加体积。批次结束并核验后，可按完整批次目录归档，连同自定义任务目录、索引指向的文件、日志封存、原始校验清单和 `.generations` 一起保留。确认没有运行负载、没有待处理隔离状态且留存策略允许后，再人工清理；不要只删最大原始文件造成索引失效。
+退出码137本身不能证明OOM，同名容器当前Up也不能证明故障时是同一容器。不要删锁或换名字绕过隔离；按[服务隔离、容器与取消](#服务隔离容器与取消)核对原运行及未结束的请求。
 
 ## 验证与发布
 

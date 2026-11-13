@@ -1,7 +1,8 @@
-"""Private local diagnostics, safe human messages and durable batch events.
+"""Durable events and optional terminal views for the benchmark manager.
 
-Only the manager writes a BatchLog. Raw subprocess files are separate, private
-evidence; they are never copied into the human log or a published source tree.
+The manager alone appends API logs. Native byte ranges bypass this renderer;
+trusted tool events wait at round boundaries so they cannot split native output.
+Terminal spools and structured diagnostics are internal transport/evidence.
 """
 from __future__ import annotations
 
@@ -332,15 +333,15 @@ def archive_management_logs(batch_path, native_roots, related_logs=(), segment_b
         raise ValueError('日志分段大小必须为正整数')
     batch = validate_output_path(batch_path, native_roots)
     logs = validate_output_path(batch / 'logs', native_roots)
+    diagnostics = validate_output_path(logs / '.diagnostics', native_roots)
+    diagnostics.mkdir(exist_ok=True, mode=0o700)
     candidates = [path for path in logs.rglob('*')
-                  if path.is_file() and path.suffix in {'.log', '.jsonl'}
-                  and not {'archive', 'aisbench'}.intersection(path.relative_to(logs).parts)]
+                  if path.is_file() and path.suffix in {'.log', '.json', '.jsonl', '.spool'}
+                  and 'archive' not in path.relative_to(logs).parts]
     candidates.extend(Path(path) for path in related_logs)
     sources = []
     seen = set()
     for path in candidates:
-        if logs / 'aisbench' in path.absolute().parents:
-            continue  # Native log links are live access points, not manager logs.
         if path.is_symlink():
             raise LogWriteError('日志封存拒绝符号链接来源')
         source = validate_output_path(path, native_roots)
@@ -349,7 +350,7 @@ def archive_management_logs(batch_path, native_roots, related_logs=(), segment_b
         if str(source) not in seen:
             sources.append(source)
             seen.add(str(source))
-    archive_root = validate_output_path(logs / 'archive', native_roots)
+    archive_root = validate_output_path(diagnostics / 'archive', native_roots)
     archive_root.mkdir(exist_ok=True, mode=0o700)
     identifier = uuid.uuid4().hex
     generation = validate_output_path(archive_root / identifier, native_roots)
@@ -413,8 +414,8 @@ def archive_management_logs(batch_path, native_roots, related_logs=(), segment_b
         state.update(state='complete', finished_at=timestamp(), file_count=len(records))
         _archive_json(state_path, state, native_roots)
         index = dict(state, sources=records)
-        _archive_json(logs / 'archive_index.json', index, native_roots)
-        return dict(index=str(logs / 'archive_index.json'), generation=identifier,
+        _archive_json(diagnostics / 'archive_index.json', index, native_roots)
+        return dict(index=str(diagnostics / 'archive_index.json'), generation=identifier,
                     file_count=len(records), raw_bytes=sum(record['raw_bytes'] for record in records), raw_retained=True)
     except Exception as error:
         state.update(state='failed', finished_at=timestamp(), error_type=type(error).__name__)
@@ -626,28 +627,31 @@ class BatchLog:
         validate_output_path(self.batch_path, native_roots)
         self.directory = self.batch_path / "logs"
         self.directory.mkdir(mode=0o700)
-        (self.directory / "preflight").mkdir(mode=0o700)
+        self.diagnostics = self.directory / '.diagnostics'
+        self.diagnostics.mkdir(mode=0o700)
+        (self.diagnostics / "preflight").mkdir(mode=0o700)
+        self._directory_identities = {path: (path.stat().st_dev, path.stat().st_ino)
+                                      for path in (self.directory, self.diagnostics)}
         self.batch_id = batch_id
         self.sequence = 0
         self._lock = threading.Lock()
         self._closed = False
         self._human = None
-        self._automation = None
         self._events = None
         self._console = None
         self._archive_result = None
         self._view = _NativeConsoleView()
-        self.human_path = self.directory / "batch.log"
-        self.automation_path = self.directory / "automation.log"
-        self.event_path = self.directory / "events.jsonl"
-        self.console_path = self.directory / "console.log"
+        self._api_events = {}
+        self.summary_path = self.diagnostics / 'summary.spool'
+        self.human_path = self.summary_path  # Internal observer compatibility; no duplicate file.
+        self.event_path = self.diagnostics / "events.jsonl"
+        self.console_path = self.diagnostics / "terminal.spool"
         try:
-            self._human = private_binary(self.human_path, native_roots)
-            self._automation = private_binary(self.automation_path, native_roots)
+            self._human = private_binary(self.summary_path, native_roots)
             self._events = private_binary(self.event_path, native_roots)
             self._console = private_binary(self.console_path, native_roots)
         except BaseException:
-            for handle in (self._human, self._automation, self._events, self._console):
+            for handle in (self._human, self._events, self._console):
                 if handle is not None:
                     handle.close()
             raise
@@ -665,7 +669,8 @@ class BatchLog:
                 pieces.append('[' + label + '=' + clean + ']')
         return (' ' + ' '.join(pieces)) if pieces else ''
 
-    def emit(self, event: str, message: str, *, level: str = "INFO", task: str = "manager", **fields: object):
+    def emit(self, event: str, message: str, *, level: str = "INFO", task: str = "manager",
+             route_to_api: bool = True, **fields: object):
         with self._lock:
             if self._closed:
                 raise LogWriteError("日志已经关闭")
@@ -685,25 +690,46 @@ class BatchLog:
                         + self._context_text(fields) + ' '
                         + safe_message.replace('\n', '\\n') + '\n').encode('utf-8')
             try:
-                self._write_record(self._human, rendered)
-                self._write_record(self._automation, rendered)
+                tool_text = self._view.business(rendered.decode('utf-8')).encode('utf-8')
+                self._write_record(self._human, tool_text)
                 self._write_record(self._events, (json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
-                console = self._view.flush() + self._view.business(rendered.decode('utf-8'))
+                console = self._view.flush() + tool_text.decode('utf-8')
                 self._write_record(self._console, console.encode('utf-8'))
                 self._human.flush()
-                self._automation.flush()
                 self._events.flush()
                 self._console.flush()
                 # Progress is reproducible; identity, failure and transitions are
                 # the write-ahead evidence needed after an interrupted process.
                 if event != "worker_output":
                     os.fsync(self._human.fileno())
-                    os.fsync(self._automation.fileno())
                     os.fsync(self._events.fileno())
                     os.fsync(self._console.fileno())
             except (OSError, ValueError) as error:
                 raise LogWriteError("批次日志写入失败") from error
+            if route_to_api:
+                source_time = fields.get('source_time') or now
+                try:
+                    at = datetime.fromisoformat(str(source_time).replace('Z', '+00:00')).timestamp()
+                except (ValueError, TypeError, OverflowError):
+                    at = datetime.fromisoformat(now).timestamp()
+                self._api_events.setdefault(str(task), []).append(dict(
+                    seq=self.sequence, run_id=str(fields.get('run_id') or ''), at=at, text=tool_text))
             return payload
+
+    def api_events(self, task, run_id='', before=None):
+        """Snapshot trusted pending events; acknowledgement follows durable append."""
+        with self._lock:
+            records = self._api_events.get(str(task), ())
+            return sorted((record for record in records
+                           if (not record['run_id'] or record['run_id'] == run_id)
+                           and (before is None or record['at'] <= before)),
+                          key=lambda record: (record['at'], record['seq']))
+
+    def acknowledge_api_events(self, task, sequences):
+        with self._lock:
+            acknowledged = set(sequences)
+            self._api_events[str(task)] = [record for record in self._api_events.get(str(task), ())
+                                           if record['seq'] not in acknowledged]
 
     @staticmethod
     def _write_record(stream, encoded):
@@ -743,6 +769,10 @@ class BatchLog:
         with self._lock:
             if self._closed:
                 return self._archive_result
+            for path, identity in self._directory_identities.items():
+                info = path.lstat()
+                if path.is_symlink() or (info.st_dev, info.st_ino) != identity:
+                    raise LogWriteError('日志目录在封存前被替换')
             failure = None
             try:
                 rendered = self._view.flush(final=True)
@@ -751,7 +781,7 @@ class BatchLog:
             except (OSError, ValueError) as error:
                 failure = error
             self._closed = True
-            for handle in (self._human, self._automation, self._events, self._console):
+            for handle in (self._human, self._events, self._console):
                 if handle is not None:
                     try:
                         handle.flush()

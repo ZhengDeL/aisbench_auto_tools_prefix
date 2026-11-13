@@ -87,9 +87,9 @@ outputs/default/<批次号>/
 ├── batch_results.json
 ├── batch_results.csv
 ├── merged_metrics.csv
-├── logs/automation.log
-├── logs/console.log
-├── logs/aisbench/               # 每个任务一份完整原生日志汇总
+├── logs/                       # 日常只看对应API的这一份日志
+│   ├── dsv4__<模型名>.log
+│   └── qwen__<模型名>.log
 └── tasks/
     ├── dsv4__<模型名>/
     │   ├── dsv4__<模型名>__all_results.csv
@@ -108,27 +108,23 @@ SLO 容差默认关闭（`PEAK_SLO_TOLERANCE=0.0`），需要时由用户显式�
 
 ## 排查与维护
 
-日常只需查看批次 `logs/` 下的三个入口：`automation.log` 看工具流程、摸高决策和错误；`console.log` 看实时显示；`aisbench/<配置名>__<模型名>.log` 看该任务全部轮次的完整原生日志。固定并发、前缀测试和摸高按执行顺序追加，不需要逐轮找文件。原生汇总在测试期间即可跟踪，正文不加工具前缀，不合并或删减进度帧。逐轮源文件和来源清单继续保留用于核查。`batch.log` 保留为旧工具日志的兼容入口。
+**每个 API 只看一份日志：`logs/<配置名>__<模型名>.log`。** 同一个 API 的多个场景、固定并发、前缀测试及摸高轮次按执行顺序追加到这份文件，不必逐轮找文件。不同 API 分别保存，启动和结束时打印各自的实际路径。
 
-默认显示完整输出，包括 AISBench 原生进度和详细日志。终端、文件重定向和 `tee` 使用相同规则。后台运行后，可以直接跟踪 `benchmark.log`：
+每轮 AISBench 原生日志按原始字节完整保存，内容、进度、换行、表格、警告和错误均不改写。工具的流程说明只放在轮次前后，不插入原生正文。运行时即可跟踪这份日志：
 
 ```bash
-nohup bash run_benchmark.sh ./service.env >benchmark.log 2>&1 &
-tail -n 50 -f benchmark.log
+bash run_benchmark.sh ./service.env
 
-# 在终端查看并保存完整输出；保留压测失败的非零退出码。
-set -o pipefail
-bash run_benchmark.sh ./service.env 2>&1 | tee benchmark.log
+# 在另一个终端查看；替换为启动时打印的实际文件路径。
+tail -n 50 -f 'outputs/default/<批次号>/logs/service__<模型名>.log'
 
 # 只需要业务摘要时，主动指定 summary。
-bash run_benchmark.sh --console summary ./service.env >benchmark.summary.log 2>&1
+bash run_benchmark.sh --console summary ./service.env
 ```
 
-这里的 `benchmark.log` 是调用者重定向生成的文件，名称可自定。批次目录内的 `logs/automation.log` 只保存工具流程和结果摘要，`logs/console.log` 保存可读实时视图。工具状态以 `[AUTOMATION]` 标识；原生输出在任务或场景切换时显示来源，不逐行加长前缀，也不因 stdout/stderr 切换反复打印标题。AISBench 表格完整显示，其他任务或 stderr 提示不会穿插到表格内部。
+脚本自动保存日志，无需再用 `tee` 创建另一份 `benchmark.log`。默认终端显示全部任务详情，切换 API 时标明来源，结果表整块显示；`--console summary` 只减少终端显示，不影响每个 API 的完整日志。显式 `--console auto` 仍按 TTY 选择显示模式。
 
-进度刷新在显示视图中合并，保留开始、最新和结束状态；普通日志、警告和错误不合并。逐字节全量输出仍保存在每轮 `scope_*/stdout.raw.log`、`stderr.raw.log`，显示整理不修改这些文件。`--console summary` 只改变终端或重定向输出，不会关闭原生日志保存。显式使用 `--console auto` 时，仍按 TTY 选择：终端显示详情，文件或管道显示摘要。
-
-显示模式记录在 `batch_state.json`；结束时生成的 `logs/console_state.json` 记录显示完整性及降级原因。每个配置仍有独立任务日志，每次真实测量仍有独立 `scope_*/stdout.raw.log`、`stderr.raw.log`，原始字节不改写。显示通道与监督、持久写盘分离，慢终端或断开时记录显示降级。具体路径与终态判读见 [日志排查与保留](automation/README.md#日志排查与保留)。
+内部来源清单、显示传输文件及预检诊断放在 `logs/.diagnostics/`，原始测量文件继续留在任务目录，供故障和数值核查。它们不是另一套日常日志入口；已有批次和原生源文件不会被删除。具体规则见 [日志排查与保留](automation/README.md#日志排查与保留)。
 
 管理器被强杀后，容器中的请求可能仍在执行。不要删锁、改容器名或换输出路径绕过隔离，应按 [恢复规则](automation/README.md#服务隔离容器与取消) 核对原任务和完整容器 ID。日志、配置和原始结果可能含真实地址、请求内容或凭据，分享前需单独审查。
 

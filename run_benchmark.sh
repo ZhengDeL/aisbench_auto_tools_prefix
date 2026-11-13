@@ -19,8 +19,6 @@ print_usage() {
   bash run_benchmark.sh ./a.env ./b.env         # 并行运行多份配置，文件名自定
   bash run_benchmark.sh --console summary      # 只显示业务摘要，原生详情独立保存
   bash run_benchmark.sh --console full ./a.env  # 显式显示完整详情（默认）
-  nohup bash run_benchmark.sh ./a.env >benchmark.log 2>&1 &  # 后台保存完整输出
-  tail -f benchmark.log                        # 跟踪后台压测和 AISBench 详情
   bash run_benchmark.sh --help                  # 查看本说明
 
 无需单独 source。每份配置对应一个专用压测容器和独立输出目录；
@@ -28,10 +26,10 @@ print_usage() {
 默认 --console full：终端、文件重定向和管道均输出 AISBench 详细日志。
 只看业务摘要时指定 --console summary；显式 auto 仍按TTY选择 full 或 summary。
 通过tee收集时，请在调用者Bash中先set -o pipefail。
-外部benchmark.log由调用者重定向生成；logs/automation.log保存工具流程，
-logs/aisbench/<配置名>__<模型名>.log是该任务所有轮次的完整原生汇总；
-logs/console.log保存可读实时视图：工具状态标[AUTOMATION]，原生表格整块显示，
-任务切换时显示来源；重复进度刷新合并显示，每轮原生stdout/stderr全量另存。
+脚本自动保存每个API的一份日志：outputs/default/<批次>/logs/<配置名>__<模型名>.log。
+同一API的所有场景和并发轮次连续追加，启动与结束时打印实际路径；无需另建benchmark.log。
+原生AISBench输出按原始字节完整保留，流程说明只放轮次前后，不插入原生正文。
+多API终端切换时标明来源，完整结果表整块显示；summary不影响完整日志保存。
 
 宿主机需要 Linux、Bash、Python 3.7+ 和 Docker；镜像内使用自带 Python。
 配置参考见 config.env 末尾；使用与排查说明见 automation/README.md。
