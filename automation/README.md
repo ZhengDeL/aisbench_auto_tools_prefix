@@ -1,6 +1,6 @@
 # AISBench 自动化使用与维护
 
-本说明对应 v2026.10.28，介绍配置、运行、结果判读和维护方法。日常启动入口和默认配置均在仓库根目录：`run_benchmark.sh`、`config.env`。说明中的示例和检查命令不代表对应环境已经完成验收。
+本说明对应 v2026.11.13，介绍配置、运行、结果判读和维护方法。日常启动入口和默认配置均在仓库根目录：`run_benchmark.sh`、`config.env`。说明中的示例和检查命令不代表对应环境已经完成验收。
 
 ## 目录与修改位置
 
@@ -347,11 +347,11 @@ python3 -B automation/core/aisbench_result_validation.py \
 - 配置加载失败、启动异常、容器丢失/替换、日志及磁盘错误、终端断开、取消和停止失败均有明确状态及证据，不碰其他服务。
 - 发布内容、原生文件字节和模式、公开隐私检查、本地回归结果及实机证据对应同一版本；未覆盖项明确列出。
 
-版本以 `v2026.10.28` 注释标签对应的源码为准。更换镜像、上游或被测服务后应重新验证，不能只凭其他环境的检查结果判断当前运行正常。
+版本以 `v2026.11.13` 注释标签对应的源码为准。更换镜像、上游或被测服务后应重新验证，不能只凭其他环境的检查结果判断当前运行正常。
 
 ## 更新原生仓
 
-当前锁定 [rayn-zzz/aisbench_auto_tools_prefix 提交 ac06bd6](https://github.com/rayn-zzz/aisbench_auto_tools_prefix/commit/ac06bd619726663ac8c7b0c84c9b3cdbb041b062)。本仓通过 subtree 关联原生历史，维护时选定具体新提交，再同步整个原生子树；运行时不自动跟随浮动分支。
+当前锁定 [原仓 PR #28](https://github.com/rayn-zzz/aisbench_auto_tools_prefix/pull/28) 的提交 [4c2c484](https://github.com/ZhengDeL/aisbench_auto_tools_prefix/commit/4c2c484f73aaa28c8584a8b5c5fb6574dba1ac95)，基于原仓 `main` 的 `ac06bd619726663ac8c7b0c84c9b3cdbb041b062`。该提交修复日志重复解析时的指标字典污染；发布时 PR 尚未合并到原仓 `main`。本仓通过 subtree 保留完整来源历史，原生子树与所选提交整树一致；运行时不自动跟随浮动分支。
 
 先确认工作区干净、处于升级维护分支，按需添加上游 remote（已有则省略第一条）：
 
@@ -359,11 +359,13 @@ python3 -B automation/core/aisbench_result_validation.py \
 git remote add upstream https://github.com/rayn-zzz/aisbench_auto_tools_prefix.git
 git fetch upstream main
 TARGET_UPSTREAM="$(git rev-parse upstream/main)"
-git log --oneline ac06bd619726663ac8c7b0c84c9b3cdbb041b062.."$TARGET_UPSTREAM"
+git log --oneline 4c2c484f73aaa28c8584a8b5c5fb6574dba1ac95.."$TARGET_UPSTREAM"
 git subtree merge --prefix=aisbench_auto_tools_prefix "$TARGET_UPSTREAM"
 git diff --exit-code "$TARGET_UPSTREAM^{tree}" HEAD:aisbench_auto_tools_prefix
 ```
 
 使用完整历史，不添加 `--squash`；命令含义见 [Git subtree 官方文档](https://github.com/git/git/blob/master/contrib/subtree/git-subtree.adoc)。合并后原生目录应与选定提交的整棵树一致，包含文件内容和模式。出现冲突时先查明来源；不要把自动化兼容修改留在原生目录。
+
+目前固定源来自尚未合并的 PR。原仓合并该修复前，不要把较旧的 `upstream/main` 当作升级目标；否则可能无法完成上述整树一致性检查。待原仓合并后，先确认目标提交包含该修复，再按上述步骤同步。
 
 随后在本地维护记录中更新原生提交号、文件内容和模式清单，审查原生配置、CLI 和结果接口变化，在 `core/` 适配并补充本地回归测试。更新记录不能替代原生文件的实际比对；最后重新验证目标镜像、实际服务和数值提取，保留对应上游提交号及证据。
