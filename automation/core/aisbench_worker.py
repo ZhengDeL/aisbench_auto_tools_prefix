@@ -476,6 +476,9 @@ class Worker:
                    HOST_PORT=self.values['HOST_PORT'], DEFAULT_PERFORMANCE_TEST='default_perf', OUTPUT_DIR=CONTAINER_OUTPUT,
                    POD_INFO=[s.strip() for s in self.values['POD_INFO'].split(',') if s.strip()],
                    API_KEY=self.values['API_KEY'], URL=self.values['API_URL'])
+        rank_warmup_url = self.values.get('PREFILL_RANK_WARMUP_URL', '').strip()
+        if rank_warmup_url:
+            cfg['PREFILL_RANK_WARMUP_URL'] = rank_warmup_url
         program = ('import json,pathlib,re\n' + f'p=pathlib.Path({CONTAINER_NATIVE!r})/"config.py"\n'
                    + f'values=json.loads({json.dumps(cfg, ensure_ascii=False)!r})\n'
                    + 'text=p.read_text(encoding="utf-8")\nfor key,value in values.items():\n'
