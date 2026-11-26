@@ -872,6 +872,32 @@ def _run_native_with_cache_metrics(native_script, evidence_dir, scopes=None):
         controller = _CacheMetricsCapture(namespace, evidence_dir, scopes)
         namespace['get_pod_metrics_info'] = controller.snapshot
         namespace['cal_prefix_hit_info'] = controller.calculate
+        warmup_url = namespace.get('PREFILL_RANK_WARMUP_URL', '')
+        if warmup_url:
+            from aisbench_prefill_warmup import warm_prefill_ranks
+
+            native_prepare = namespace['generate_test_dataset']
+
+            def prepare_dataset(src_file, dst_dir):
+                prepared = native_prepare(src_file, dst_dir)
+                if 'prefill_rank_warmup' in controller.report or namespace.get('test_accuracy'):
+                    return prepared
+                try:
+                    warmup = warm_prefill_ranks(
+                        warmup_url, src_file, namespace['MODEL_NAME'], namespace['dp'],
+                        api_key=namespace.get('API_KEY', ''),
+                        enable_thinking=namespace.get('enable_think', False),
+                    )
+                except Exception as error:
+                    controller.report['prefill_rank_warmup'] = {'state': 'failed', 'reason': str(error)}
+                    controller.save()
+                    raise
+                controller.report['prefill_rank_warmup'] = warmup
+                controller.save()
+                console_message(f"Prefill warmup verified routing to {len(warmup['ranks'])}/{namespace['dp']} DP ranks")
+                return prepared
+
+            namespace['generate_test_dataset'] = prepare_dataset
         controller.observe_probes()
         tree.body = [guard]
         exec(compile(tree, str(path), 'exec'), namespace)

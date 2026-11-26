@@ -77,7 +77,7 @@ bash run_benchmark.sh automation/examples/test_a.env automation/examples/test_b.
 
 未提供的参数使用代码默认值；场景中的对应字段覆盖该场景的全局默认。每份配置的内容及 SHA 在启动时冻结，运行中编辑文件只影响下一批次。配置相对路径和用户填写的相对宿主机路径按启动时工作目录解析；配置会从冻结副本加载，不应依靠 `BASH_SOURCE` 在临时位置查找相邻文件。
 
-`config.env` 末尾附有**仅作注释、不会执行**的完整参数参考，覆盖 32 个公开全局参数、场景 JSON 字段及独立摸高 CLI；两个示例末尾也保留参数注释参考。每项说明默认值、单位、作用域、覆盖、空值和示例。应区分：
+`config.env` 末尾附有**仅作注释、不会执行**的完整参数参考，覆盖公开全局参数、场景 JSON 字段及独立摸高 CLI；两个示例末尾也保留参数注释参考。每项说明默认值、单位、作用域、覆盖、空值和示例。应区分：
 
 - **代码默认值**：未配置时采用，例如 `PEAK_HARD_CAP=0`、`MAX_CONTEXT_LEN=512000`。
 - **本文件有效赋值**：公开默认文件明确设置 `PEAK_HARD_CAP=1`、`MAX_CONTEXT_LEN=133120`，场景设置 TTFT 15 秒、TPOT 60 毫秒。
@@ -117,6 +117,8 @@ bash run_benchmark.sh automation/examples/test_a.env automation/examples/test_b.
 `NPU_NUM` 是归一化吞吐分母，不自动发现硬件。按物理卡报告就填物理卡数，按芯片报告就填芯片数，并在报告注明。A3 一张物理卡含两颗 NPU 芯片，两种分母的结果不同。
 
 `POD_INFO` 是可选的后端缓存计数端点列表，例如 `192.168.1.10:9081,192.168.1.11:9081`。为空时不采集缓存计数，前缀准备和主测照常执行，也不会猜测模型服务的 `/metrics` 地址。需要采集时应填写实际提供计数的后端地址；如果后端与推理服务共用端口，也应显式填写。其数量不自动设置 `dp`；指标端点共享时，缓存计数也可能包含其他流量。
+
+如 Prefill 用单个 HTTP 端口承载内部 DP，可在该服务的 `.env` 中设置 `export PREFILL_RANK_WARMUP_URL="http://192.168.1.10:8367"`。启用 `prefix_test` 的性能用例会使用刚生成的同一份前缀数据，以 `X-data-parallel-rank` 定向到该 P 入口的所有 DP。用例的 `dp` 应与该入口暴露的 rank 数一致。定向步骤记录在 `cache_metrics.json` 的 `prefill_rank_warmup`，原生预热和主测继续通过 `API_URL`，并保留各自的计数与结果。默认留空，供每 rank 独立端口等现有配置按原方式运行。
 
 上述策略适用于 `run_benchmark.sh` 自动化入口；直接运行内层原生脚本时，仍采用原仓自身的默认行为。
 
