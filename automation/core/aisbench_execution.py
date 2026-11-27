@@ -25,6 +25,7 @@ import threading
 import time
 import types
 import uuid
+from urllib.parse import urlsplit
 
 from aisbench_result_adapter import read_last_result, read_accuracy_scope
 _ACTIVE_PROCESSES = []
@@ -404,6 +405,8 @@ def configure_dataset_profile(native_root, evidence_dir, arguments, source_root)
     integers = {"input_len": 3500, "data_num": 8192, "seed": 1, "dp": 1, "prefix_num": 1}
     parameters = {key: int(option(arguments, "--" + key, default)) for key, default in integers.items()}
     parameters["dataset_type"] = option(arguments, "--dataset_type", "normal")
+    if "--strict_cold_cache" in arguments:
+        parameters["strict_cold_cache"] = True
     ratio = str(option(arguments, "--repeat_rate", "0")).strip()
     parameters["repeat_rate"] = float(ratio[:-1]) / 100 if ratio.endswith("%") else float(ratio)
     for key in ("length_mean", "length_min", "length_max"):
@@ -870,10 +873,18 @@ def _run_native_with_cache_metrics(native_script, evidence_dir, scopes=None):
     try:
         exec(compile(tree, str(path), 'exec'), namespace)
         controller = _CacheMetricsCapture(namespace, evidence_dir, scopes)
+        if "--strict_cold_cache" in sys.argv:
+            prefill_url = namespace.get("PREFILL_RANK_WARMUP_URL", "").strip()
+            endpoints = controller.endpoints
+            prefill = urlsplit(prefill_url).netloc if prefill_url else (endpoints[0] if len(endpoints) == 1 else "")
+            if prefill not in endpoints:
+                raise ValueError("strict cold cache needs a Prefill metrics endpoint in POD_INFO")
+            controller.report["strict_cold_prefill_endpoint"] = prefill
+            namespace["_STRICT_COLD_CACHE_MANAGED"] = True
         namespace['get_pod_metrics_info'] = controller.snapshot
         namespace['cal_prefix_hit_info'] = controller.calculate
         warmup_url = namespace.get('PREFILL_RANK_WARMUP_URL', '')
-        if warmup_url:
+        if warmup_url and "--prefix_test" in sys.argv:
             from aisbench_prefill_warmup import warm_prefill_ranks
 
             native_prepare = namespace['generate_test_dataset']
@@ -934,6 +945,7 @@ def _child(native_root, evidence_dir, arguments, native_script, source_root=None
     original_run = subprocess.run
     accuracy = "--test_accuracy" in arguments
     is_prefix = option(arguments, "--dataset_type", "normal") == "prefix_cache" and "--prefix_test" in arguments
+    strict_cold = "--strict_cold_cache" in arguments
 
     def observed_run(command, *positional, **keywords):
         is_benchmark = isinstance(command, str) and re.search(r"(^|[\s;&])ais_bench\b", command)
@@ -1055,11 +1067,32 @@ def _child(native_root, evidence_dir, arguments, native_script, source_root=None
     subprocess.run = observed_run
     sys.argv = [str(native_script)] + list(arguments)
     try:
-        if not is_prefix or not _run_native_with_cache_metrics(native_script, evidence_dir, scopes):
+        instrumented = (is_prefix or strict_cold) and _run_native_with_cache_metrics(native_script, evidence_dir, scopes)
+        if not instrumented:
+            if strict_cold:
+                raise ValueError("strict cold cache requires the native cache metrics hooks")
             runpy.run_path(str(native_script), run_name="__main__")
     finally:
         subprocess.run = original_run
         atomic_json(evidence_dir / "scopes.json", scopes)
+
+
+def verify_cold_cache(scope, cache_metrics):
+    prefill = cache_metrics.get("strict_cold_prefill_endpoint", "")
+    row = next((item for item in cache_metrics.get("measurements", [])
+                if item.get("scope_id") == scope["scope_id"] and item.get("phase") == "main"), {})
+    counters = row.get("pods", {}).get(prefill, {}).get("summary", {})
+    normal, external = counters.get("normal", {}), counters.get("external", {})
+    evidence = dict(prefill_endpoint=prefill, normal=normal, external=external)
+    if row.get("state") != "complete" or not normal or not external or not normal.get("queries"):
+        evidence.update(state="unavailable", reason=row.get("reason") or "missing Prefill cache query deltas")
+    elif normal["hits"] or external["hits"]:
+        evidence.update(state="hit", reason="Prefill recorded cache hits during the strict cold scope")
+    else:
+        evidence.update(state="verified", reason="")
+    scope["strict_cold_cache"] = evidence
+    if evidence["state"] != "verified" and scope["state"] == "PASS":
+        scope.update(state="INVALID", reason=evidence["reason"])
 
 
 def execute_native(native_root, evidence_dir, arguments, *, timeout=1800, failed_req_limit=0,
@@ -1145,6 +1178,9 @@ def execute_native(native_root, evidence_dir, arguments, *, timeout=1800, failed
             scope["counts"].update(planned_source=scope.get("planned_source", "cli_unverified"),
                                    planned_verified=scope.get("planned_verified", False))
         main = [scope for scope in scopes if scope["phase"] == "main"]
+        if "--strict_cold_cache" in arguments:
+            for scope in main:
+                verify_cold_cache(scope, report.get("cache_metrics", {}))
         report.update(scopes=scopes, main_scopes=main)
         if rc or timed_out:
             report.update(state="ERROR", reason="trial timed out" if timed_out else "native process exited " + str(rc))

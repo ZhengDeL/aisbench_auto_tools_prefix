@@ -59,6 +59,10 @@ bash run_benchmark.sh ./config.env
 
 通常填写 `HOST_IP` 和 `HOST_PORT` 即可。使用 `API_URL` 时，应填写服务基址，例如 `http://192.168.1.10:8000/` 或 `http://192.168.1.10:8000/gateway/`。默认镜像会追加 `v1/chat/completions`，不要在基址中重复填写 `/v1/` 或完整聊天接口。地址与配置优先级见 [配置说明](automation/README.md#配置加载与优先级)。
 
+### 严格冷缓存场景
+
+在生成普通性能数据的 0% 前缀场景中，可设置 "strict_cold_cache" 为 true，并通过 run_benchmark.sh 启动。每条输入带有唯一前缀，每轮使用独立的 cache_salt。工具根据 Prefill 的主测增量判定冷缓存，缺少查询证据或出现命中时该轮无效。POD_INFO 含多个端点时，使用 PREFILL_RANK_WARMUP_URL 指定其中的 Prefill 端点。
+
 ## 多个服务并行测试
 
 配置文件名可以自定，例如 `dsv4.env`、`qwen.env`。每份文件都包含完整的全局参数和场景，运行时自动加载：

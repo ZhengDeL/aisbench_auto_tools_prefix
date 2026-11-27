@@ -5,6 +5,7 @@ import re
 import logging
 import subprocess
 from datetime import datetime
+from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import *
 from generate_dataset import *
@@ -30,6 +31,8 @@ def parse_arguments():
     parser.add_argument("--prefix_num", type=int, default=1, help="prefix numbers")
     parser.add_argument("--repeat_rate", type=str, default="0", help="dataset repeat rate")
     parser.add_argument("--prefix_test", action='store_true', default=False, help="test prefix dataset firstly")
+    parser.add_argument("--strict_cold_cache", action="store_true",
+                        help="Verify cold Prefill cache counters through the managed benchmark entrypoint")
     parser.add_argument("--seed", type=int, default=1, help="dataset random seed")
     parser.add_argument("--dp", type=int, default=1, help="dp size")
     parser.add_argument("--length_mean", type=int, default=None, help="gaussian mean for variable length")
@@ -50,7 +53,7 @@ def symlink_force(target, link_name):
             raise e
 
 def create_gsm8k_dataset(dataset_type, input_len, data_num, model_path, dataset_path, prefix_num, repeat_rate, seed,
-                         length_mean=None, length_std=None, length_min=None, length_max=None):
+                          length_mean=None, length_std=None, length_min=None, length_max=None, *, strict_cold_cache=False):
     if not os.path.exists(dataset_path):
         logging.warning(f"dataset work path {dataset_path} not exist. creating it automatically.")
         os.makedirs(dataset_path, exist_ok=True)
@@ -72,7 +75,8 @@ def create_gsm8k_dataset(dataset_type, input_len, data_num, model_path, dataset_
         else:
             logging.info("  length_dist=fixed")
     else:
-        dataset_name = "GSM8K-in" + str(input_len) + "-num" + str(data_num) + "-" + base_name + ".jsonl"
+        suffix = "-strict-cold" if strict_cold_cache else ""
+        dataset_name = f"GSM8K-in{input_len}-num{data_num}-{base_name}{suffix}.jsonl"
         logging.info(f"dataset_name: {dataset_name}")
         dataset_jsonl_path = os.path.join(dataset_path, dataset_name)
         prefix_jsonl_path = ""
@@ -80,8 +84,9 @@ def create_gsm8k_dataset(dataset_type, input_len, data_num, model_path, dataset_
         if not os.path.exists(dataset_jsonl_path):
             logging.warning(f"Dataset {dataset_name} is not exist. Start create dataset")
             # create_data(input_len, data_num, model_path, dataset_path)
-            prefix_jsonl_path, dataset_jsonl_path = create_multi_prefix_dataset(model_path,input_len,data_num,dataset_path,0,dp,0,seed,prefix_num,
-                                                                                 length_mean, length_std, length_min, length_max)
+            prefix_jsonl_path, dataset_jsonl_path = create_multi_prefix_dataset(
+                model_path, input_len, data_num, dataset_path, 0, dp, 0, seed, prefix_num,
+                length_mean, length_std, length_min, length_max, unique_prompts=strict_cold_cache)
             logging.info(f"Dataset {dataset_name} created.")
         else:
             logging.info(f"Dataset {dataset_name} exist.")
@@ -109,12 +114,13 @@ def save_result(request_rate, npu_num, repeat_rate):
     save_log(aisbench_log_dir, log_dir)
     save_csv(ans, filename)
 
-def modify_aisbench_api(concurrency, output_len, request_rate_param=None):
+def modify_aisbench_api(concurrency, output_len, request_rate_param=None, *, cache_salt=None):
     if request_rate_param is None:
         request_rate_param = request_rate
     file_default = open("default_api.py", 'r+')
     file_temp = open("temp_api.py", 'w+')
     logging.info("Api config file:")
+    salt_written = False
     for ss in file_default.readlines():
         tt = re.sub("model_path_for_replace", MODEL_PATH, ss)
         tt = re.sub("model_name_for_replace", MODEL_NAME, tt)
@@ -134,10 +140,15 @@ def modify_aisbench_api(concurrency, output_len, request_rate_param=None):
         if enable_think:
             generation_kwargs = generation_kwargs + ",\n\t\t\tchat_template_kwargs={\"enable_thinking\": True}"
         tt = re.sub("generation_kwargs_for_replace", generation_kwargs.expandtabs(4), tt)
+        if cache_salt and "generation_kwargs=dict(" in tt:
+            tt = tt.replace("generation_kwargs=dict(", f"generation_kwargs=dict(cache_salt={cache_salt!r}, ", 1)
+            salt_written = True
         print(tt, end='')
         file_temp.write(tt)
     file_default.close()
     file_temp.close()
+    if cache_salt and not salt_written:
+        raise ValueError("strict cold cache could not set cache_salt in the generation template")
     symlink_force(
         os.path.join(os.getcwd(), "temp_api.py"),
         os.path.join(WORK_PATH, "ais_bench/benchmark/configs/models/vllm_api/vllm_api_chat_temp.py")
@@ -303,6 +314,8 @@ def setup_logging():
 
 if __name__ == '__main__':
     args = parse_arguments()
+    if args.strict_cold_cache and not globals().get("_STRICT_COLD_CACHE_MANAGED"):
+        raise ValueError("strict cold cache requires the managed benchmark entrypoint (run_benchmark.sh)")
     input_len = args.input_len
     output_len = args.output_len
     data_num = args.data_num
@@ -384,9 +397,13 @@ if __name__ == '__main__':
         api_test_type = "VLLMCustomAPIChatStream"
         api_test_abbr = "vllm-api-stream-chat"
 
+    if args.strict_cold_cache and (dataset_type != "normal" or repeat_rate != 0 or prefix_test
+                                  or test_accuracy or dataset_path_input != "none"):
+        raise ValueError("strict cold cache requires generated normal performance data with a zero prefix ratio")
     if dataset_path_input == "none":
-        src_file_prefix,src_file_data = create_gsm8k_dataset(dataset_type, input_len, data_num, MODEL_PATH, DATASET_PATH, prefix_num, repeat_rate, seed,
-                                                              length_mean, length_std, length_min, length_max)
+        src_file_prefix, src_file_data = create_gsm8k_dataset(
+            dataset_type, input_len, data_num, MODEL_PATH, DATASET_PATH, prefix_num, repeat_rate, seed,
+            length_mean, length_std, length_min, length_max, strict_cold_cache=args.strict_cold_cache)
     else:
         # 指定数据集路径逻辑
         if not os.path.exists(dataset_path_input):
@@ -465,14 +482,18 @@ if __name__ == '__main__':
 
     else:
         logging.info(f"[开始] 全量数据集测试")
-        modify_aisbench_api(concurrency,str(output_len))
+        if not args.strict_cold_cache:
+            modify_aisbench_api(concurrency, str(output_len))
         dst_file = generate_test_dataset(src_file_data, dst_dir)
-        if test_times > 1:
-            for test_time in range(test_times):
+        for test_time in range(max(1, test_times)):
+            if test_times > 1:
                 logging.info(f"Execution rounds: {test_time + 1}")
-                subprocess.run(ais_bench_cmd, shell=True, check=True)
-        else:
+            if args.strict_cold_cache:
+                modify_aisbench_api(concurrency, str(output_len), cache_salt=uuid4().hex)
+                before = get_pod_metrics_info(POD_INFO)
             subprocess.run(ais_bench_cmd, shell=True, check=True)
+            if args.strict_cold_cache:
+                cal_prefix_hit_info(*before, *get_pod_metrics_info(POD_INFO))
         logging.info(f"[完成] 全量数据集测试完成，结果保存在aisbench_result.csv")
 
     
