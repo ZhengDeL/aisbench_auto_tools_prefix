@@ -4,6 +4,7 @@ from data_picker import *
 import os
 import random
 import torch
+from tempfile import TemporaryDirectory
 
 try:
     from tqdm import tqdm
@@ -12,7 +13,11 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def create_dataset(tokenizer_path: str, input_len: int, number: int, prefix_flag):
+def cold_prompt_prefix(index):
+    return f"#{index:08x}\n"
+
+
+def create_dataset(tokenizer_path: str, input_len: int, number: int, prefix_flag, *, unique_prompts=False):
 
     logging.info(f"加载tokenizer: {tokenizer_path}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -37,15 +42,16 @@ def create_dataset(tokenizer_path: str, input_len: int, number: int, prefix_flag
             # logging.info(f"生成数据集失败，请清空pick ids")
             break
 
-        # 根据需求调整长度：重复或截断
-        if len(tokens) >= input_len:
-            # 截断到 input_len
-            adjusted_tokens = tokens[:input_len]
-        else:
-            # 重复整个序列直到达到 input_len
-            repeat_times = (input_len + len(tokens) - 1) // len(tokens)
-            repeated_tokens = tokens * repeat_times
-            adjusted_tokens = repeated_tokens[:input_len]
+        # Put the row identity before the sampled text and keep the token budget.
+        prefix = []
+        if unique_prompts:
+            prefix = tokenizer.encode(cold_prompt_prefix(len(output_samples)), add_special_tokens=False)
+            if not prefix or len(prefix) >= input_len:
+                raise ValueError("strict cold cache input is too short for a unique prefix")
+        body_len = input_len - len(prefix)
+        if len(tokens) < body_len:
+            tokens = tokens * ((body_len + len(tokens) - 1) // len(tokens))
+        adjusted_tokens = prefix + tokens[:body_len]
 
         # 解码回文本
         adjusted_text = tokenizer.decode(adjusted_tokens, skip_special_tokens=True)
@@ -209,7 +215,7 @@ def _truncate_or_pad_text(tokenizer, text, target_len):
 
 
 def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int, save_path, prefix_flag, dp, repeat_rate, seed, prefix_num,
-                                length_mean=None, length_std=None, length_min=None, length_max=None):
+                                length_mean=None, length_std=None, length_min=None, length_max=None, *, unique_prompts=False):
     base_name = os.path.basename(os.path.normpath(tokenizer_path))
     use_variable_length = (
         (length_mean is not None and length_std is not None)
@@ -218,12 +224,13 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
 
     # ========== 普通数据集（无前缀）==========
     if prefix_flag == 0:
+        suffix = "-strict-cold" if unique_prompts else ""
         if use_variable_length:
             rng = random.Random(seed)
             real_lens = [max(1, int(sample_target_length(rng, input_len, length_mean, length_std, length_min, length_max))) for _ in range(number)]
             max_len = max(real_lens)
             # 先生成统一最大长度的文本池，再逐条截断
-            long_texts = create_dataset(tokenizer_path, max_len, number, 0)
+            long_texts = create_dataset(tokenizer_path, max_len, number, 0, unique_prompts=unique_prompts)
             if long_texts is None:
                 logging.error("生成数据集失败，请清空picked ids")
                 exit(0)
@@ -238,14 +245,21 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
             if pbar:
                 pbar.close()
             length_tag = _build_length_tag(input_len, length_mean, length_std, length_min, length_max)
-            dataset_path = os.path.join(save_path, f'GSM8K-{length_tag}-num{number}-{base_name}.jsonl')
-            write_data(dataset_path, dataset, number)
-            return "", dataset_path
         else:
-            dataset = create_dataset(tokenizer_path, input_len, number, 0)
-            dataset_path = os.path.join(save_path, f'GSM8K-in{input_len}-num{number}-{base_name}.jsonl')
+            length_tag = f"in{input_len}"
+            dataset = create_dataset(tokenizer_path, input_len, number, 0, unique_prompts=unique_prompts)
+        if unique_prompts and (not dataset or len(dataset) != number or
+                               any(not prompt.startswith(cold_prompt_prefix(index)) for index, prompt in enumerate(dataset))):
+            raise ValueError("strict cold cache dataset did not preserve every unique prompt prefix")
+        dataset_path = os.path.join(save_path, f'GSM8K-{length_tag}-num{number}-{base_name}{suffix}.jsonl')
+        if unique_prompts:
+            with TemporaryDirectory(dir=save_path) as temporary:
+                pending = os.path.join(temporary, os.path.basename(dataset_path))
+                write_data(pending, dataset, number)
+                os.replace(pending, dataset_path)
+        else:
             write_data(dataset_path, dataset, number)
-            return "", dataset_path
+        return "", dataset_path
 
     # ========== 前缀数据集 ==========
     if use_variable_length:

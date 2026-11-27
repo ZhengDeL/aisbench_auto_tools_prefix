@@ -1540,9 +1540,14 @@ def publish_native_logs(batch_path: Path, jobs: list[Job], final: bool = False) 
             if (_native_source_identity(source, output) != record['_source'] or info.st_size < record['size']
                     or (record.get('complete') and (info.st_size, info.st_mtime_ns) != record['_closed_stat'])):
                 raise LogWriteError('已收集的原生日志被替换、截断或在结束后发生修改')
-        if final:
-            if native and not all(record['complete'] for record in native):
+        if final and any(not record['complete'] for record in native):
+            if job.state not in ('failed', 'cancelled'):
                 raise LogWriteError('API 原生日志尚未结束，拒绝在原文中追加任务结尾: ' + job.alias)
+            # An interrupted child may leave no terminal evaluation. Publish
+            # the captured byte range as incomplete and keep its task status.
+            api.update(complete=False, incomplete_reason='native_output_incomplete')
+        elif final:
+            api.pop('incomplete_reason', None)
             _flush_api_events(api)
             if not api.get('_final_note'):
                 message = '任务结束：状态=' + job.state + '；退出码=' + str(job.exit_code)

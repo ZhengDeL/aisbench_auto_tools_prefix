@@ -39,7 +39,7 @@ ENV_DEFAULTS = {
     **{name: entry[0] for name, entry in PEAK_NEW_DEFAULTS.items()},
 }
 PUBLIC_ENV_NAMES = tuple(ENV_DEFAULTS)
-BOOLEAN_OPTIONS = {'prefix_test', 'enable_think', 'test_accuracy'}
+BOOLEAN_OPTIONS = {'prefix_test', 'enable_think', 'test_accuracy', 'strict_cold_cache'}
 VALUE_OPTIONS = {
     'input_len', 'output_len', 'data_num', 'concurrency', 'request_rate',
     'test_type', 'dataset', 'repeat', 'npu_num', 'dataset_type', 'prefix_num',
@@ -196,6 +196,11 @@ def build_plan(environment: dict[str, str], config_path: Path) -> dict[str, Any]
             if not 0 <= (value / 100 if ratio.endswith('%') else value) <= 1:
                 raise ValueError('repeat_rate 必须在0..1或0%..100%')
             extra['repeat_rate'] = ratio
+        if extra.get('strict_cold_cache') and (
+                extra.get('dataset_type', 'normal') != 'normal' or extra.get('prefix_test')
+                or extra.get('test_accuracy') or extra.get('dataset', 'none') != 'none'
+                or float(extra.get('repeat_rate', '0').rstrip('%')) != 0):
+            raise ValueError(f'{name}: strict_cold_cache requires generated normal performance data with a zero prefix ratio')
         for first, second in [('length_mean', 'length_std'), ('length_min', 'length_max')]:
             if (first in extra) != (second in extra):
                 raise ValueError(f'{first}和{second}必须同时配置')

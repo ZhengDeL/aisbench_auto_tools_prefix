@@ -51,6 +51,7 @@ AISBENCH_FLAG_OPTIONS = {
     "--enable_think",
     "--test_accuracy",
     "--prefix_test",
+    "--strict_cold_cache",
 }
 PEAK_SETTINGS = {
     "precision": (1, "peak_precision"),
@@ -1053,11 +1054,17 @@ class PeakSearcher:
                 selected_row = row
         return selected_row == result.metrics
 
+    def observation_key(self, concurrency):
+        # A zero confirmation request floor preserves the exploration workload.
+        # Independent confirmation always requests a fresh evaluation.
+        profile = "explore" if self.case.confirm_min_requests == 0 else self.profile
+        return profile, concurrency
+
     def evaluate(self, concurrency, fresh=False, allow_unstable=False):
         cap = self.config.auto_expand_max_concurrency
         if concurrency < self.case.floor_concurrency or (cap and concurrency > cap):
             raise ValueError("probe outside hard floor/cap")
-        key = (self.profile, concurrency)
+        key = self.observation_key(concurrency)
         if not fresh and key in self.cache:
             return self.cache[key][-1]
         for attempt in range(self.case.invalid_retries + 1):
@@ -1230,10 +1237,10 @@ class PeakSearcher:
             if success is not None and failure is not None and failure.concurrency - success.concurrency <= self.case.precision:
                 break
             middle = (lower + upper) // 2
-            cached = bool(self.cache.get((self.profile, middle)))
+            cached = bool(self.cache.get(self.observation_key(middle)))
             self.logger.info("区间二分：当前[%s,%s]，先测中点%s，端点不预设通过或失败", lower, upper, middle,
                              extra=self.decision_fields("window_probe",
-                                 message=("当前区间[" + str(lower) + "," + str(upper) + "]，复用本轮同阶段并发"
+                                 message=("当前区间[" + str(lower) + "," + str(upper) + "]，复用本场景并发"
                                           + str(middle) + "已有观测后更新区间") if cached else None,
                                  window=[lower, upper], next_concurrency=middle,
                                  next_action="reuse_observation" if cached else "probe_midpoint",
@@ -1261,10 +1268,10 @@ class PeakSearcher:
         best = success_result
         while right - left > self.case.precision:
             middle = (left + right) // 2
-            cached = bool(self.cache.get((self.profile, middle)))
+            cached = bool(self.cache.get(self.observation_key(middle)))
             self.logger.info("边界二分：已观测通过%s、失败%s，中点%s", left, right, middle,
                              extra=self.decision_fields("boundary_probe",
-                                 message=("当前边界[" + str(left) + "," + str(right) + "]，复用本轮同阶段并发"
+                                 message=("当前边界[" + str(left) + "," + str(right) + "]，复用本场景并发"
                                           + str(middle) + "已有观测后更新边界") if cached else None,
                                  window=[left, right],
                                  known_pass=left, known_fail=right, next_concurrency=middle,
@@ -1291,10 +1298,10 @@ class PeakSearcher:
         floor = self.case.floor_concurrency
         while current.concurrency > floor:
             probe = max(floor, current.concurrency // 2)
-            cached = bool(self.cache.get((self.profile, probe)))
+            cached = bool(self.cache.get(self.observation_key(probe)))
             self.logger.info("向下找通过点：已观测失败%s，半降到%s（硬下限%s）", current.concurrency, probe, floor,
                              extra=self.decision_fields("downward_probe", known_fail=current.concurrency,
-                                 message=("向下找通过点，复用本轮同阶段并发" + str(probe) + "已有观测") if cached else None,
+                                 message=("向下找通过点，复用本场景并发" + str(probe) + "已有观测") if cached else None,
                                  floor_concurrency=floor, next_concurrency=probe,
                                  next_action="reuse_observation" if cached else "probe_lower_half",
                                  observation_source="case_cache" if cached else "new_measurement"))

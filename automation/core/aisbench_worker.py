@@ -599,7 +599,7 @@ class Worker:
 
     def cache_metrics_plan(self, scene):
         arguments = scene.get('args') or scene.get('extra_args') or ()
-        if '--prefix_test' not in arguments:
+        if not {'--prefix_test', '--strict_cold_cache'}.intersection(arguments):
             return
         endpoints = [item.strip() for item in self.values['POD_INFO'].split(',') if item.strip()]
         message = (f'附加缓存指标：使用POD_INFO中的{len(endpoints)}个端点采集前后计数'
